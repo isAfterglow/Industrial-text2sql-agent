@@ -1,0 +1,10 @@
+langgraph
+langchain-openai
+sqlalchemy
+pymysql
+cryptography
+python-dotenv
+pydantic
+pydantic-settings
+sqlglot
+tabulate
