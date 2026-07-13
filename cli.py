@@ -4,13 +4,14 @@ from app.graph import graph
 
 
 WELCOME_TEXT = """
-树脂基防热材料 Text2SQL V0.2
+树脂基防热材料 Text2SQL V0.4 精简通用版
 
-输入自然语言问题，系统将：
-1. 生成只读SQL；
-2. 执行安全与质量检查；
-3. 校验或执行失败时自动修复一次；
-4. 返回实际执行SQL和数据库结果。
+流程：
+1. 根据问题和Schema生成SQL；
+2. 执行确定性安全与Schema检查；
+3. 执行轻量语义审查；
+4. 必要时自动修复一次；
+5. 执行数据库查询并返回结果。
 
 输入 exit、quit 或 q 退出。
 """.strip()
@@ -22,9 +23,13 @@ def main() -> None:
     while True:
         print("\n" + "=" * 80)
 
-        question = input(
-            "请输入问题："
-        ).strip()
+        try:
+            question = input(
+                "请输入问题："
+            ).strip()
+        except KeyboardInterrupt:
+            print("\n已退出。")
+            break
 
         if not question:
             continue
@@ -43,10 +48,7 @@ def main() -> None:
                     "question": question,
                 },
                 {
-                    # 当前流程最多只修复一次，
-                    # 20步已经远高于正常执行所需步数。
-                    # 这是额外的循环保护。
-                    "recursion_limit": 20,
+                    "recursion_limit": 24,
                 },
             )
 
@@ -57,9 +59,8 @@ def main() -> None:
 
         except GraphRecursionError:
             print(
-                "\nGraph运行超过最大步数。"
-                "请检查retry_count和条件路由，"
-                "避免出现无限修复循环。"
+                "\nGraph超过最大执行步数，"
+                "请检查重试路由。"
             )
 
         except Exception as exc:

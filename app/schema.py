@@ -1,243 +1,669 @@
+from copy import deepcopy
+import re
+from typing import Any
+
 from app.config import get_settings
 
 
-def build_schema_context() -> str:
-    """构造提供给 LLM 的人工维护 Schema 说明。"""
+def get_schema_catalog() -> dict[str, Any]:
+    """返回机器可读的数据库Schema。
+
+    表、字段、推荐别名、表粒度、关系和业务术语集中维护在这里。
+    """
 
     settings = get_settings()
 
     static_table = settings.RESIN_TABLE_STATIC
-    property_table = settings.RESIN_TABLE_MATERIAL_THERMAL_PROPERTY
-    response_table = settings.RESIN_TABLE_THERMAL_RESPONSE
+    property_table = (
+        settings.RESIN_TABLE_MATERIAL_THERMAL_PROPERTY
+    )
+    response_table = (
+        settings.RESIN_TABLE_THERMAL_RESPONSE
+    )
 
-    return f"""
-数据库类型：MySQL
+    return deepcopy(
+        {
+            "database_type": "MySQL",
+            "tables": {
+                static_table: {
+                    "description": (
+                        "材料样本的静态材料参数，"
+                        "每个sample_id只有一行。"
+                    ),
+                    "alias": "ms",
+                    "grain": "one_row_per_sample",
+                    "columns": {
+                        "sample_id": (
+                            "样本唯一编号，格式为"
+                            "sample_000001。"
+                        ),
+                        "rhov_i": "原始材料密度。",
+                        "rhoc_i": "碳化材料密度。",
+                        "porosity_v": "原始材料孔隙率。",
+                        "porosity_c": "碳化材料孔隙率。",
+                        "permeability_v": (
+                            "原始材料渗透率。"
+                        ),
+                        "permeability_c": (
+                            "碳化材料渗透率。"
+                        ),
+                    },
+                },
+                property_table: {
+                    "description": (
+                        "材料热物性和热解参数，"
+                        "每个sample_id只有一行。"
+                    ),
+                    "alias": "mtp",
+                    "grain": "one_row_per_sample",
+                    "columns": {
+                        "sample_id": "样本编号。",
+                        "kv_list": (
+                            "原始材料热导率参数。"
+                        ),
+                        "kc_list": (
+                            "碳化材料热导率参数。"
+                        ),
+                        "cpv_list": (
+                            "原始材料比热容参数。"
+                        ),
+                        "cpc_list": (
+                            "碳化材料比热容参数。"
+                        ),
+                        "pyrolysis_heat": "热解热。",
+                        "surface_emissivity": (
+                            "表面发射率。"
+                        ),
+                    },
+                },
+                response_table: {
+                    "description": (
+                        "样本的时序热响应，"
+                        "一个sample_id通常有3000个点。"
+                    ),
+                    "alias": "tr",
+                    "grain": "many_rows_per_sample",
+                    "columns": {
+                        "sample_id": "样本编号。",
+                        "point_index": (
+                            "序列点编号，通常为0到2999，"
+                            "不等同于秒。"
+                        ),
+                        "surface_temperature": (
+                            "该点的表面温度。"
+                        ),
+                        "back_temperature": (
+                            "该点的背面温度。"
+                        ),
+                        "mass": "该点的质量。",
+                    },
+                },
+            },
+            "relationships": [
+                (
+                    f"{static_table}.sample_id = "
+                    f"{property_table}.sample_id，1对1"
+                ),
+                (
+                    f"{static_table}.sample_id = "
+                    f"{response_table}.sample_id，1对多"
+                ),
+                (
+                    f"{property_table}.sample_id = "
+                    f"{response_table}.sample_id，"
+                    "可按sample_id直接连接"
+                ),
+            ],
+            # 这是数据库词汇表，不是评测题模板。
+            # Guard和Prompt共用同一份映射，避免各自维护不同含义。
+            "semantic_terms": {
+                "sample_id": [
+                    "样本编号",
+                    "样本ID",
+                    "它们的编号",
+                ],
+                "rhov_i": [
+                    "原始材料密度",
+                    "原始密度",
+                ],
+                "rhoc_i": [
+                    "碳化材料密度",
+                    "碳化密度",
+                ],
+                "porosity_v": [
+                    "原始材料孔隙率",
+                    "原始孔隙率",
+                ],
+                "porosity_c": [
+                    "碳化材料孔隙率",
+                    "碳化孔隙率",
+                ],
+                "permeability_v": [
+                    "原始材料渗透率",
+                    "原始渗透率",
+                ],
+                "permeability_c": [
+                    "碳化材料渗透率",
+                    "碳化渗透率",
+                ],
+                "kv_list": [
+                    "原始材料热导率",
+                    "原始热导率",
+                    "原始导热率",
+                ],
+                "kc_list": [
+                    "碳化材料热导率",
+                    "碳化热导率",
+                    "碳化导热率",
+                ],
+                "cpv_list": [
+                    "原始材料比热容",
+                    "原始比热容",
+                ],
+                "cpc_list": [
+                    "碳化材料比热容",
+                    "碳化比热容",
+                ],
+                "pyrolysis_heat": [
+                    "热解热",
+                ],
+                "surface_emissivity": [
+                    "表面发射率",
+                    "发射率",
+                ],
+                "point_index": [
+                    "point_index",
+                    "序列点编号",
+                    "点位编号",
+                ],
+                "surface_temperature": [
+                    "表面温度",
+                    "表温",
+                ],
+                "back_temperature": [
+                    "背面温度",
+                    "背温",
+                ],
+                "mass": [
+                    "质量",
+                ],
+            },
+            "domain_conventions": [
+                (
+                    "sample_id固定为sample_后跟6位数字，"
+                    "例如sample_000305。"
+                ),
+                (
+                    "ms、mtp、tr只是推荐别名，"
+                    "不能作为FROM或JOIN后的真实表名。"
+                ),
+                (
+                    "原始密度是rhov_i，原始渗透率是"
+                    "permeability_v，原始比热容是cpv_list；"
+                    "三者不能混用。"
+                ),
+                (
+                    "碳化密度是rhoc_i，碳化渗透率是"
+                    "permeability_c，碳化比热容是cpc_list；"
+                    "三者不能混用。"
+                ),
+                (
+                    "如果所需字段全部属于material_static，"
+                    "只查询material_static。"
+                ),
+                (
+                    "只有问题需要热导率、比热容、热解热或"
+                    "表面发射率时，才使用"
+                    "material_thermal_property。"
+                ),
+                (
+                    "只有问题涉及point_index、温度、质量、"
+                    "峰值或时序均值时，才使用thermal_response。"
+                ),
+                (
+                    "连接thermal_response会把一个样本展开为"
+                    "多条时序记录；不需要响应字段时不要连接它。"
+                ),
+                (
+                    "普通字段Top-K使用ORDER BY目标字段"
+                    "ASC或DESC并配合LIMIT N；"
+                    "不要用等于MIN/MAX表示前N条。"
+                ),
+                (
+                    "峰值表面温度使用"
+                    "MAX(surface_temperature)。"
+                ),
+                (
+                    "峰值背面温度使用"
+                    "MAX(back_temperature)。"
+                ),
+                "平均值使用AVG。",
+                (
+                    "对thermal_response做样本级聚合时，"
+                    "按sample_id分组。"
+                ),
+                (
+                    "查询时序明细时，不使用MAX、AVG"
+                    "或无意义GROUP BY。"
+                ),
+                (
+                    "查询时序明细时，应限制sample_id，"
+                    "并按point_index升序排列。"
+                ),
+            ],
+        }
+    )
 
-数据库用途：
-存储树脂基防热材料样本的静态参数、热物性参数和时序热响应。
 
-==================================================
-表一：{static_table}
-==================================================
+def get_column_owner_map() -> dict[str, set[str]]:
+    """返回真实字段到所属物理表的映射。"""
 
-作用：
-每行表示一个材料样本的静态材料参数。
+    catalog = get_schema_catalog()
+    owners: dict[str, set[str]] = {}
 
-字段：
-- sample_id：样本唯一编号，主键
-- rhov_i：原始材料密度
-- rhoc_i：碳化材料密度
-- porosity_v：原始材料孔隙率
-- porosity_c：碳化材料孔隙率
-- permeability_v：原始材料渗透率
-- permeability_c：碳化材料渗透率
+    for table_name, table_info in catalog["tables"].items():
+        for column in table_info["columns"]:
+            owners.setdefault(
+                column,
+                set(),
+            ).add(table_name)
 
-==================================================
-表二：{property_table}
-==================================================
+    return owners
 
-作用：
-每行表示一个样本的热物性和热解参数。
 
-注意：
-这张表不是外部热流、压力或加热时间等试验工况表。
+def match_question_semantic_columns(
+    question: str,
+) -> dict[str, list[str]]:
+    """从问题中提取明确出现的业务概念及其真实字段。
 
-字段：
-- sample_id：样本编号，主键，同时关联 {static_table}.sample_id
-- kv_list：原始材料热导率参数
-- kc_list：碳化材料热导率参数
-- cpv_list：原始材料比热容参数
-- cpc_list：碳化材料比热容参数
-- pyrolysis_heat：热解热
-- surface_emissivity：表面发射率
+    只匹配Schema中维护的稳定术语，不推断模糊近义词。
+    """
 
-==================================================
-表三：{response_table}
-==================================================
+    catalog = get_schema_catalog()
+    normalized = question.lower()
+    matches: dict[str, list[str]] = {}
 
-作用：
-存储每个样本的时序热响应。
-每个样本通常包含 3000 个响应点。
+    for column, terms in catalog[
+        "semantic_terms"
+    ].items():
+        matched_terms = [
+            term
+            for term in sorted(
+                terms,
+                key=len,
+                reverse=True,
+            )
+            if term.lower() in normalized
+        ]
 
-字段：
-- sample_id：样本编号，关联 {static_table}.sample_id
-- point_index：序列点编号，范围通常为 0 到 2999
-- surface_temperature：该序列点的表面温度
-- back_temperature：该序列点的背面温度
-- mass：该序列点的质量
+        if matched_terms:
+            matches[column] = matched_terms
 
-重要语义：
-- 最大表面温度：MAX(surface_temperature)
-- 最大背面温度：MAX(back_temperature)
-- 初始响应点：point_index = 0
-- 最终响应点：point_index = 2999
-- point_index 是序列点编号，不能直接称为秒或物理时间
-- 查询峰值时，应按 sample_id 分组
-- 查询完整响应曲线时，必须限制 sample_id，并按 point_index 排序
+    return matches
 
-==================================================
-表关系
-==================================================
 
-1. {property_table}.sample_id = {static_table}.sample_id
-   关系：1 对 1
+def infer_question_ranking_column(
+    question: str,
+) -> tuple[str, str] | None:
+    """推断明确Top-K或显式排序所针对的业务字段。
 
-2. {response_table}.sample_id = {static_table}.sample_id
-   关系：1 对多
+    只在字段术语紧邻“最高/最低/最大/最小”或位于
+    “按……升序/降序”之前时返回结果。
+    """
 
-正确 JOIN 示例：
+    catalog = get_schema_catalog()
+    candidates: list[
+        tuple[int, int, str, str]
+    ] = []
 
-FROM {static_table} AS ms
-JOIN {property_table} AS mtp
-    ON ms.sample_id = mtp.sample_id
+    for column, terms in catalog[
+        "semantic_terms"
+    ].items():
+        for term in terms:
+            start = 0
 
-FROM {static_table} AS ms
-JOIN {response_table} AS tr
-    ON ms.sample_id = tr.sample_id
+            while True:
+                position = question.find(
+                    term,
+                    start,
+                )
+                if position < 0:
+                    break
 
-==================================================
-SQL 生成规则
-==================================================
+                candidates.append(
+                    (
+                        position,
+                        position + len(term),
+                        column,
+                        term,
+                    )
+                )
+                start = position + 1
 
-1. 只生成一条 MySQL SELECT 查询。
-2. 禁止 INSERT、UPDATE、DELETE、DROP、ALTER、CREATE。
-3. 只能访问以上三张表。
-4. 必须使用真实字段名，不允许猜测字段。
-5. 禁止 SELECT *，应明确写出需要的字段。
-6. 默认最多返回 200 行。
-7. 查询 thermal_response 明细时，必须尽量限制 sample_id 或 point_index。
-8. 不知道字段单位时，不得在结果中自行假设单位。
-9. 不要使用数据库名前缀。
-10. 只输出 SQL，不输出 Markdown、解释或代码围栏。
+    if not candidates:
+        return None
 
-==================================================
-GROUP BY 使用注意
-==================================================
+    direction_matches = list(
+        re.finditer(
+            r"最高|最低|最大|最小|升序|降序",
+            question,
+        )
+    )
 
-只有以下情况才使用 GROUP BY：
+    for direction_match in direction_matches:
+        before = [
+            candidate
+            for candidate in candidates
+            if candidate[1] <= direction_match.start()
+        ]
 
-1. 对 thermal_response 按 sample_id 计算峰值、均值、最小值；
-2. 用户明确要求按照某字段分组统计；
-3. 一个样本的多条 thermal_response 需要聚合成一行。
+        if not before:
+            continue
 
-如果查询只涉及一行一个样本的 material_static 和
-material_thermal_property，不要使用 GROUP BY。
+        nearest = max(
+            before,
+            key=lambda item: item[1],
+        )
 
-==================================================
-使用最少必要表
-==================================================
+        # 限制距离，避免把很早出现的返回字段误当排名字段。
+        if (
+            direction_match.start()
+            - nearest[1]
+            <= 12
+        ):
+            return nearest[2], nearest[3]
 
-只连接回答问题所必需的数据表。
+    return None
 
-例如：
 
-查询每个样本的峰值背温时，只需要 thermal_response，
-不要连接 material_static 或 material_thermal_property。
 
-只有用户要求同时展示其他表中的字段时，才添加 JOIN。
-查样本原始密度时，不要连接 thermal_response，除非结果里要显示它的字段
-查某个样本峰值背温时，不要连接 material_thermal_property，除非结果里要显示它的字段
+def extract_output_request_text(
+    question: str,
+) -> str:
+    """提取用户明确描述返回字段的文本部分。"""
 
-==================================================
-一对一表不需要聚合
-==================================================
+    markers = (
+        "只返回",
+        "只显示",
+        "同时返回",
+        "并返回",
+        "返回",
+        "显示",
+        "列出",
+    )
 
-material_static 每个 sample_id 只有一行。
+    positions = [
+        (
+            question.find(marker),
+            len(marker),
+        )
+        for marker in markers
+        if question.find(marker) >= 0
+    ]
 
-material_thermal_property 每个 sample_id 也只有一行。
+    if not positions:
+        return ""
 
-查询某个样本的静态参数、热物性参数，
-或按照这些参数排序时，不要使用 MIN、MAX、GROUP BY 去重。
+    position, marker_length = min(
+        positions,
+        key=lambda item: item[0],
+    )
 
-==================================================
-时序范围查询规则
-==================================================
+    return question[
+        position + marker_length:
+    ].strip()
 
-用户查询 point_index 范围时，必须使用 WHERE 条件限制范围。
 
-例如“从0到20”表示：
+def infer_requested_output_columns(
+    question: str,
+) -> set[str]:
+    """推断用户明确要求展示的真实字段。
 
-point_index BETWEEN 0 AND 20
+    只处理明确返回表达和稳定的“全部静态材料参数”意图。
+    无法确定时返回空集合，不做强制猜测。
+    """
 
-该范围包含21个点。
+    catalog = get_schema_catalog()
 
-LIMIT 不能替代 point_index 的范围条件。
+    if "全部静态材料参数" in question:
+        static_table = next(
+            table_name
+            for table_name, info
+            in catalog["tables"].items()
+            if info["alias"] == "ms"
+        )
+        return set(
+            catalog["tables"][
+                static_table
+            ]["columns"]
+        )
 
-查询单个样本的响应明细时，必须同时：
+    output_text = extract_output_request_text(
+        question
+    )
 
-1. 使用 sample_id 过滤；
-2. 使用 point_index 过滤或合理 LIMIT；
-3. 按 point_index ASC 排序。
+    if output_text:
+        matches = match_question_semantic_columns(
+            output_text
+        )
 
-==================================================
-示例
-==================================================
+        if "对应字段" in output_text:
+            matches = match_question_semantic_columns(
+                question
+            )
 
-问题：
-查询原始材料密度最低的5个样本。
+        return set(matches)
 
-SQL：
-SELECT
-    sample_id,
-    rhov_i
-FROM material_static
-ORDER BY rhov_i ASC
-LIMIT 5;
+    # “查询样本305的热解热、发射率……”和时序区间查询：
+    # 没有显式“返回”，但列出的业务字段就是输出字段。
+    exact_sample_lookup = bool(
+        re.search(
+            r"样本\s*sample_\d{6}",
+            question,
+            flags=re.IGNORECASE,
+        )
+    )
+    has_filter_or_ranking = bool(
+        re.search(
+            r"大于|小于|不少于|不大于|之间|最高|最低|最大|最小|前\s*\d+",
+            question,
+        )
+    )
 
-解释：静态参数排序，不聚合
+    if exact_sample_lookup and not has_filter_or_ranking:
+        return set(
+            match_question_semantic_columns(
+                question
+            )
+        )
 
-问题：
-查询表面发射率最高的5个样本，同时返回原始密度。
+    # point_index区间明细的字段通常在问题主体中直接列出。
+    if (
+        exact_sample_lookup
+        and "point_index" in question.lower()
+    ):
+        return set(
+            match_question_semantic_columns(
+                question
+            )
+        )
 
-SQL：
-SELECT
-    ms.sample_id,
-    ms.rhov_i,
-    mtp.surface_emissivity
-FROM material_static AS ms
-JOIN material_thermal_property AS mtp
-    ON ms.sample_id = mtp.sample_id
-ORDER BY mtp.surface_emissivity DESC
-LIMIT 5;
+    return set()
 
-解释：一对一 JOIN，不分组
 
-问题：
-查询样本100从point_index 0到20的表面温度、背面温度和质量。
+def build_compact_sql_context(
+    question: str,
+) -> str:
+    """生成修复节点使用的精简Schema上下文。"""
 
-SQL：
-SELECT
-    sample_id,
-    point_index,
-    surface_temperature,
-    back_temperature,
-    mass
-FROM thermal_response
-WHERE sample_id = 'sample_000100'
-  AND point_index BETWEEN 0 AND 20
-ORDER BY point_index ASC
-LIMIT 21;
+    catalog = get_schema_catalog()
+    lines = [
+        "可用真实表与字段：",
+    ]
 
-解释：样本编号和点位范围
+    for table_name, info in catalog["tables"].items():
+        lines.append(
+            f"- {table_name} AS {info['alias']}: "
+            + ", ".join(info["columns"])
+        )
 
-问题：
-找出峰值背温最低的 5 个样本，并显示原始密度和表面发射率。
+    lines.extend(
+        [
+            "连接关系：",
+            *(
+                f"- {relationship}"
+                for relationship
+                in catalog["relationships"]
+            ),
+            build_question_field_hint(question),
+        ]
+    )
 
-SQL：
-SELECT
-    ms.sample_id,
-    ms.rhov_i,
-    mtp.surface_emissivity,
-    MAX(tr.back_temperature) AS peak_back_temperature
-FROM {static_table} AS ms
-JOIN {property_table} AS mtp
-    ON ms.sample_id = mtp.sample_id
-JOIN {response_table} AS tr
-    ON ms.sample_id = tr.sample_id
-GROUP BY
-    ms.sample_id,
-    ms.rhov_i,
-    mtp.surface_emissivity
-ORDER BY peak_back_temperature ASC
-LIMIT 5;
-""".strip()
+    return "\n".join(lines)
+
+def build_question_field_hint(
+    question: str,
+) -> str:
+    """生成给SQL生成器和修复器使用的确定性字段提示。"""
+
+    matches = match_question_semantic_columns(
+        question
+    )
+
+    if not matches:
+        return "未识别到需要额外提示的明确业务字段。"
+
+    owners = get_column_owner_map()
+    lines = [
+        "根据Schema确定的业务字段对应关系："
+    ]
+
+    for column, terms in matches.items():
+        owner_text = "/".join(
+            sorted(
+                owners.get(
+                    column,
+                    set(),
+                )
+            )
+        )
+        lines.append(
+            f"- {'、'.join(terms)}"
+            f" -> {owner_text}.{column}"
+        )
+
+    ranking = infer_question_ranking_column(
+        question
+    )
+    if ranking is not None:
+        lines.append(
+            f"- 当前排序/Top-K目标字段"
+            f" -> {ranking[0]}"
+        )
+
+    return "\n".join(lines)
+
+
+def build_schema_context() -> str:
+    """生成提供给LLM的Schema和稳定使用约束。
+
+    不包含评测题答案，只提供数据库事实和可迁移的SQL规则。
+    """
+
+    catalog = get_schema_catalog()
+
+    lines: list[str] = [
+        "数据库类型：MySQL",
+        "",
+        "数据库用途：",
+        (
+            "查询树脂基防热材料的静态参数、"
+            "热物性参数和时序热响应。"
+        ),
+        "",
+        "表结构：",
+    ]
+
+    for table_name, info in catalog["tables"].items():
+        grain_text = (
+            "每个样本一行"
+            if info["grain"] == "one_row_per_sample"
+            else "每个样本多行"
+        )
+
+        lines.extend(
+            [
+                "",
+                (
+                    f"[{table_name}] "
+                    f"推荐别名：{info['alias']}；"
+                    f"数据粒度：{grain_text}"
+                ),
+                info["description"],
+                "字段：",
+            ]
+        )
+
+        for column, description in info[
+            "columns"
+        ].items():
+            lines.append(
+                f"- {column}：{description}"
+            )
+
+    lines.append("\n核心业务术语与真实字段：")
+    owners = get_column_owner_map()
+
+    for column, terms in catalog[
+        "semantic_terms"
+    ].items():
+        owner_text = "/".join(
+            sorted(
+                owners.get(
+                    column,
+                    set(),
+                )
+            )
+        )
+        lines.append(
+            f"- {'、'.join(terms)}"
+            f" -> {owner_text}.{column}"
+        )
+
+    lines.append("\n表关系：")
+    for relationship in catalog["relationships"]:
+        lines.append(f"- {relationship}")
+
+    lines.append("\n稳定领域规则：")
+    for convention in catalog[
+        "domain_conventions"
+    ]:
+        lines.append(f"- {convention}")
+
+    lines.extend(
+        [
+            "",
+            "通用SQL要求：",
+            "- 只生成一条MySQL SELECT查询。",
+            "- FROM和JOIN后只能写真实表名，别名写在真实表名之后。",
+            "- 只能使用以上真实表和真实字段。",
+            "- 必须返回用户明确要求的字段。",
+            "- 不得增加用户未要求的返回字段或过滤条件。",
+            "- 只连接回答问题所需的最少数据表。",
+            "- 不得擅自增加GROUP BY或聚合函数。",
+            (
+                "- 简单排序和Top-K直接使用"
+                "ORDER BY目标字段与LIMIT，不使用IN子查询。"
+            ),
+            (
+                "- 多表查询中的同名字段必须使用"
+                "表别名限定。"
+            ),
+            "- 禁止SELECT *。",
+            (
+                "- 用户未要求单位时，不得自行添加单位。"
+            ),
+        ]
+    )
+
+    return "\n".join(lines).strip()

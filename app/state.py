@@ -2,61 +2,40 @@ from typing import Any, TypedDict
 
 
 class Text2SQLState(TypedDict, total=False):
-    """Text2SQL LangGraph共享状态。
+    """精简版Text2SQL LangGraph共享状态。"""
 
-    每个节点只返回自己修改的字段，LangGraph会将更新合并到状态中。
-    """
-
-    # ==================================================
     # 用户输入
-    # ==================================================
-
     question: str
+    normalized_question: str
 
-    # ==================================================
     # Schema
-    # ==================================================
-
     schema_context: str
 
-    # ==================================================
-    # SQL生成与修复
-    # ==================================================
-
-    # 第一次由generate_sql生成的SQL，用于调试和展示
+    # SQL
     initial_sql: str
-
-    # 当前准备校验的SQL
-    # 修复后会被新的SQL覆盖
     raw_sql: str
-
-    # 已经通过SQL Guard检查的SQL
     validated_sql: str
 
-    # 当前已经执行过多少次自动修复
-    retry_count: int
-
-    # 最近一次触发修复的错误
-    last_repair_reason: str
-
-    # ==================================================
-    # 错误信息
-    # ==================================================
-
+    # 确定性校验
     validation_error: str
+    validation_repairable: bool
+    validation_error_type: str
+
+    # 语义审查
+    review_passed: bool
+    review_reason: str
+    review_note: str
+
+    # 数据库执行
     execution_error: str
-
-    # ==================================================
-    # 查询结果
-    # ==================================================
-
     columns: list[str]
     rows: list[list[Any]]
     row_count: int
     truncated: bool
 
-    # ==================================================
-    # 最终返回
-    # ==================================================
+    # 修复控制
+    retry_count: int
+    last_repair_reason: str
 
+    # 最终输出
     final_answer: str

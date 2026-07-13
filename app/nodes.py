@@ -1,354 +1,465 @@
 import re
 from typing import Any, Literal
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import (
+    HumanMessage,
+    SystemMessage,
+)
 from tabulate import tabulate
 
 from app.config import get_settings
 from app.db import execute_readonly_query
 from app.llm import get_llm
-from app.schema import build_schema_context
+from app.schema import (
+    build_compact_sql_context,
+    build_question_field_hint,
+    build_schema_context,
+)
 from app.sql_guard import (
+    assess_deterministic_semantic_coverage,
+    build_sql_review_summary,
     clean_llm_sql,
+    normalize_sample_id_literals,
     validate_and_normalize_sql,
 )
 from app.state import Text2SQLState
 
 
 def message_content_to_text(content: Any) -> str:
-    """将不同模型可能返回的content格式统一转换成字符串。
-
-    OpenAI-compatible接口通常返回字符串，但部分模型或版本
-    可能返回内容块列表，因此这里增加一个兼容处理。
-    """
+    """兼容常见OpenAI-compatible接口的content格式。"""
 
     if isinstance(content, str):
         return content
 
     if isinstance(content, list):
-        text_parts: list[str] = []
+        parts: list[str] = []
 
         for item in content:
             if isinstance(item, str):
-                text_parts.append(item)
-                continue
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
 
-            if isinstance(item, dict):
-                text_value = item.get("text")
-
-                if isinstance(text_value, str):
-                    text_parts.append(text_value)
-
-        if text_parts:
-            return "\n".join(text_parts)
+        if parts:
+            return "\n".join(parts)
 
     return str(content)
 
 
 def normalize_sample_id_mentions(question: str) -> str:
-    """将用户输入的简写样本编号转换为数据库中的标准格式。
+    """将自然语言中的样本编号统一成sample_000000。"""
 
-    示例：
-    样本100       -> 样本 sample_000100
-    样本 7        -> 样本 sample_000007
-    sample 25     -> sample sample_000025
-    sample_id 120 -> sample_id sample_000120
-
-    已经是sample_000100格式的内容不会被重复转换。
-    """
-
-    normalized_question = question
-
-    chinese_pattern = re.compile(
+    normalized = re.sub(
         r"样本\s*(?!sample_)(\d+)\b",
-        flags=re.IGNORECASE,
-    )
-
-    normalized_question = chinese_pattern.sub(
         lambda match: (
             f"样本 sample_{int(match.group(1)):06d}"
         ),
-        normalized_question,
-    )
-
-    english_pattern = re.compile(
-        r"\b(sample|sample_id)\s*"
-        r"(?!sample_)(\d+)\b",
+        question,
         flags=re.IGNORECASE,
     )
 
-    normalized_question = english_pattern.sub(
+    return re.sub(
+        r"\b(sample|sample_id)\s*(?!sample_)(\d+)\b",
         lambda match: (
-            f"{match.group(1)} "
-            f"sample_{int(match.group(2)):06d}"
+            f"{match.group(1)} sample_{int(match.group(2)):06d}"
         ),
-        normalized_question,
+        normalized,
+        flags=re.IGNORECASE,
     )
 
-    return normalized_question
+
+def invoke_text(
+    system_prompt: str,
+    user_prompt: str,
+) -> str:
+    response = get_llm().invoke(
+        [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt),
+        ]
+    )
+
+    return message_content_to_text(
+        response.content
+    ).strip()
 
 
-def load_schema(state: Text2SQLState) -> dict[str, Any]:
-    """加载数据库Schema，并初始化本轮Graph运行状态。"""
+def parse_review_line(
+    text: str,
+) -> tuple[bool | None, str]:
+    """只接受一条PASS:原因或FAIL:原因。"""
 
+    cleaned = text.strip()
+    code_block = re.search(
+        r"```(?:text)?\s*(.*?)```",
+        cleaned,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if code_block:
+        cleaned = code_block.group(1).strip()
+
+    status_matches = list(
+        re.finditer(
+            r"(?:^|\n)\s*(PASS|FAIL)\s*(?::|：)\s*([^\n]+)",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+    )
+
+    statuses = {
+        match.group(1).upper()
+        for match in status_matches
+    }
+
+    if len(status_matches) != 1 or len(statuses) != 1:
+        return None, "审查器没有返回唯一可信的PASS/FAIL结论。"
+
+    match = status_matches[0]
+    reason = match.group(2).strip()
+
+    if not reason:
+        reason = "未提供具体原因。"
+
+    return (
+        match.group(1).upper() == "PASS",
+        reason,
+    )
+
+
+def review_complex_sql(
+    question: str,
+    schema_context: str,
+    sql: str,
+) -> tuple[bool | None, str]:
+    """仅审查确定性规则无法充分覆盖的复杂SQL。"""
+
+    summary = build_sql_review_summary(sql)
+
+    system_prompt = """
+你只负责审查一条复杂SQL是否满足用户问题。
+
+优先核对：
+1. SELECT实际返回字段；
+2. WHERE实际过滤字段和值；
+3. ORDER BY实际排序字段和方向；
+4. 聚合函数与GROUP BY；
+5. 是否因多余的一对多JOIN产生重复行。
+
+不要因为SQL写法不够简洁而判错。
+不要把ORDER BY字段误认为SELECT返回字段。
+
+只能输出一行：
+PASS: 简短原因
+或
+FAIL: 简短且具体的原因
+""".strip()
+
+    user_prompt = f"""
+数据库Schema：
+{schema_context}
+
+用户问题：
+{question}
+
+候选SQL：
+{sql}
+
+{summary}
+""".strip()
+
+    result = parse_review_line(
+        invoke_text(
+            system_prompt,
+            user_prompt,
+        )
+    )
+
+    if result[0] is not None:
+        return result
+
+    retry = invoke_text(
+        "只能输出一行PASS:原因或FAIL:原因。",
+        f"用户问题：{question}\nSQL：{sql}",
+    )
+    return parse_review_line(retry)
+
+
+def load_schema(
+    state: Text2SQLState,
+) -> dict[str, Any]:
     return {
+        "normalized_question": (
+            normalize_sample_id_mentions(
+                state["question"]
+            )
+        ),
         "schema_context": build_schema_context(),
         "initial_sql": "",
         "raw_sql": "",
         "validated_sql": "",
-        "retry_count": 0,
-        "last_repair_reason": "",
         "validation_error": "",
+        "validation_repairable": True,
+        "validation_error_type": "",
+        "review_passed": False,
+        "review_reason": "",
+        "review_note": "",
         "execution_error": "",
         "columns": [],
         "rows": [],
         "row_count": 0,
         "truncated": False,
+        "retry_count": 0,
+        "last_repair_reason": "",
         "final_answer": "",
     }
 
 
-def generate_sql(state: Text2SQLState) -> dict[str, Any]:
-    """根据用户问题和Schema首次生成SQL。
-
-    V0.2仍然不使用with_structured_output，
-    避免本地3B模型在函数调用和结构化输出方面出现类型不稳定。
-    """
-
-    original_question = state["question"]
-    normalized_question = normalize_sample_id_mentions(
-        original_question
-    )
-    schema_context = state["schema_context"]
+def generate_sql(
+    state: Text2SQLState,
+) -> dict[str, Any]:
+    """根据问题、Schema和确定性字段提示直接生成SQL。"""
 
     system_prompt = """
-你是一个专门负责树脂基防热材料数据库的Text2SQL模型。
+你是材料数据库Text2SQL生成器。
 
-你的唯一任务是：
-根据用户问题和数据库Schema，生成一条可以在MySQL执行的只读SELECT查询。
+生成一条MySQL只读SELECT查询。
 
-必须遵守以下规则：
-
-1. 只输出SQL，不输出Markdown代码围栏。
-2. 不输出解释、分析过程或多个候选SQL。
-3. 只能使用Schema中存在的表和字段。
-4. 禁止INSERT、UPDATE、DELETE、DROP、ALTER、CREATE等写操作。
-5. 只连接回答问题必需的数据表。
-6. 只返回用户明确要求的字段，不要擅自增加字段。
-7. 简单Top-K查询直接使用ORDER BY和LIMIT，不要使用IN子查询。
-8. “最高”或“最大”通常使用DESC。
-9. “最低”或“最小”通常使用ASC。
-10. 查询峰值表温时使用MAX(surface_temperature)。
-11. 查询峰值背温时使用MAX(back_temperature)。
-12. thermal_response是一对多表，聚合响应数据时按sample_id分组。
-13. material_static和material_thermal_property都是一条样本一行，
-    不要为了去重而使用GROUP BY。
-14. point_index是序列点编号，不是物理时间。
-15. 用户要求某段point_index范围时，必须使用WHERE范围条件，
-    LIMIT不能代替point_index范围。
+要求：
+1. 只输出SQL；
+2. 使用Schema中的真实表名和真实字段；
+3. ms、mtp、tr只能作为真实表名之后的别名；
+4. 严格使用提供的业务字段对应关系；
+5. 只返回用户要求的字段，只使用必要数据表；
+6. 不增加用户未要求的LIKE、IS NOT NULL或其他过滤；
+7. 普通Top-K使用ORDER BY目标字段加LIMIT；
+8. 峰值使用MAX并按sample_id分组；
+9. 时序明细不聚合；
+10. 禁止SELECT *、写操作和跨库查询。
 """.strip()
+
+    question = state["normalized_question"]
+    field_hint = build_question_field_hint(
+        question
+    )
 
     user_prompt = f"""
-以下是数据库Schema、字段语义和SQL示例：
+数据库Schema：
+{state["schema_context"]}
 
-{schema_context}
+用户问题：
+{question}
 
-用户原始问题：
-{original_question}
+{field_hint}
 
-规范化后的问题：
-{normalized_question}
-
-请只输出一条MySQL SELECT查询。
+只输出一条完整SQL。
 """.strip()
 
-    response = get_llm().invoke(
-        [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt),
-        ]
+    sql = normalize_sample_id_literals(
+        clean_llm_sql(
+            invoke_text(
+                system_prompt,
+                user_prompt,
+            )
+        )
     )
-
-    raw_content = message_content_to_text(
-        response.content
-    )
-
-    generated_sql = clean_llm_sql(raw_content)
 
     return {
-        "initial_sql": generated_sql,
-        "raw_sql": generated_sql,
+        "initial_sql": sql,
+        "raw_sql": sql,
         "validated_sql": "",
         "validation_error": "",
+        "review_passed": False,
+        "review_reason": "",
+        "review_note": "",
         "execution_error": "",
     }
 
 
-def validate_sql(state: Text2SQLState) -> dict[str, Any]:
-    """调用SQL Guard进行安全检查和质量检查。
-
-    SQL Guard同时检查：
-    - 是否只读
-    - 是否访问白名单表
-    - 是否跨库
-    - 返回字段是否正确
-    - 是否存在冗余字段或JOIN
-    - Top-K排序字段和方向是否正确
-    - GROUP BY和聚合是否合理
-    """
-
+def validate_sql(
+    state: Text2SQLState,
+) -> dict[str, Any]:
     settings = get_settings()
 
     result = validate_and_normalize_sql(
         sql=state.get("raw_sql", ""),
-        question=state["question"],
         allowed_tables=set(
             settings.allowed_tables
         ),
         max_rows=settings.SQL_MAX_ROWS,
+        question=state["normalized_question"],
     )
 
     if not result.valid:
         return {
             "validation_error": result.error,
-            "execution_error": "",
+            "validation_repairable": result.repairable,
+            "validation_error_type": result.error_type,
             "validated_sql": "",
+            "execution_error": "",
         }
 
     return {
         "validation_error": "",
-        "execution_error": "",
+        "validation_repairable": True,
+        "validation_error_type": "",
         "validated_sql": result.sql,
+        "execution_error": "",
     }
 
 
-def repair_sql(state: Text2SQLState) -> dict[str, Any]:
-    """根据SQL Guard或数据库返回的错误自动修复SQL。
+def review_sql(
+    state: Text2SQLState,
+) -> dict[str, Any]:
+    """基础SQL由确定性Guard放行，复杂SQL才调用一次LLM审查。"""
 
-    修复节点不会绕过SQL Guard。
-    修复后的SQL必须重新进入validate_sql节点完整校验。
-    """
-
-    current_sql = state.get("raw_sql", "")
-    schema_context = state["schema_context"]
-    question = state["question"]
-
-    validation_error = state.get(
-        "validation_error",
-        "",
-    )
-    execution_error = state.get(
-        "execution_error",
-        "",
+    covered, coverage_reason = (
+        assess_deterministic_semantic_coverage(
+            question=state[
+                "normalized_question"
+            ],
+            sql=state["validated_sql"],
+        )
     )
 
-    repair_reason = (
-        validation_error
-        or execution_error
-        or "未提供具体错误信息"
+    if covered:
+        return {
+            "review_passed": True,
+            "review_reason": (
+                "确定性语义检查通过。"
+            ),
+            "review_note": coverage_reason,
+        }
+
+    passed, reason = review_complex_sql(
+        question=state[
+            "normalized_question"
+        ],
+        schema_context=state[
+            "schema_context"
+        ],
+        sql=state["validated_sql"],
     )
 
-    current_retry_count = state.get(
-        "retry_count",
-        0,
+    if passed is None:
+        return {
+            "review_passed": False,
+            "review_reason": (
+                "复杂SQL语义审查未能返回可信结论。"
+            ),
+            "review_note": "review_unavailable",
+        }
+
+    return {
+        "review_passed": passed,
+        "review_reason": reason,
+        "review_note": "llm_review",
+    }
+
+
+def repair_sql(
+    state: Text2SQLState,
+) -> dict[str, Any]:
+    """只根据可信的Guard、数据库或一次语义审查错误重写SQL。"""
+
+    if state.get("validation_error"):
+        source = "确定性Guard"
+        reason = state["validation_error"]
+        bad_sql = state.get("raw_sql", "")
+    elif state.get("execution_error"):
+        source = "数据库执行"
+        reason = state["execution_error"]
+        bad_sql = (
+            state.get("validated_sql")
+            or state.get("raw_sql", "")
+        )
+    else:
+        source = "复杂SQL语义审查"
+        reason = state.get(
+            "review_reason",
+            "语义不一致",
+        )
+        bad_sql = (
+            state.get("validated_sql")
+            or state.get("raw_sql", "")
+        )
+
+    next_retry_count = (
+        state.get("retry_count", 0) + 1
     )
-    next_retry_count = current_retry_count + 1
+    question = state["normalized_question"]
+    compact_context = (
+        build_compact_sql_context(
+            question
+        )
+    )
 
     system_prompt = """
-你是一个SQL修复器，负责修复树脂基防热材料数据库的MySQL SELECT查询。
+你是MySQL SQL修复器。
 
-你会收到：
-1. 用户原始问题；
-2. 数据库Schema；
-3. 当前错误SQL；
-4. SQL Guard或数据库给出的具体错误。
-
-你的任务不是解释错误，而是重新生成一条更简单、更准确的SQL。
-
-必须遵守：
-
-1. 只输出一条MySQL SELECT查询。
-2. 不要输出Markdown代码围栏。
-3. 不要输出解释、分析过程或多个候选SQL。
-4. 必须解决错误信息中指出的全部问题。
-5. 只能使用Schema中存在的表和字段。
-6. 只连接回答问题所必需的数据表。
-7. 只返回用户明确要求的字段。
-8. 简单Top-K使用ORDER BY和LIMIT，不使用IN子查询。
-9. 排序必须针对用户要求比较的字段。
-10. “最高/最大”使用DESC，“最低/最小”使用ASC。
-11. 峰值表温使用MAX(surface_temperature)。
-12. 峰值背温使用MAX(back_temperature)。
-13. 访问thermal_response并做样本级聚合时，按sample_id分组。
-14. 不要使用无意义的GROUP BY。
-15. 不要尝试绕过SQL Guard。
-16. 不得生成任何写入、删除或修改数据库的操作。
+只输出一条完整SELECT SQL。
+根据明确错误修复原SQL，不要解释，不要复制错误结构。
+必须使用真实表名、真实字段和最少必要表。
+不得用AS别名伪装错误字段。
+普通Top-K使用ORDER BY目标字段加LIMIT。
+峰值使用MAX并按sample_id分组。
 """.strip()
 
     user_prompt = f"""
-数据库Schema和业务语义：
-
-{schema_context}
+{compact_context}
 
 用户问题：
-
 {question}
 
-当前错误SQL：
+错误来源：{source}
+错误原因：
+{reason}
 
-{current_sql}
+错误SQL：
+{bad_sql}
 
-校验或执行错误：
-
-{repair_reason}
-
-这是第{next_retry_count}次修复。
-
-请重新生成一条完整、简洁、准确的MySQL SELECT查询。
-只输出SQL。
+请从零输出修复后的完整SQL。
 """.strip()
 
-    response = get_llm().invoke(
-        [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt),
-        ]
+    repaired_sql = normalize_sample_id_literals(
+        clean_llm_sql(
+            invoke_text(
+                system_prompt,
+                user_prompt,
+            )
+        )
     )
-
-    raw_content = message_content_to_text(
-        response.content
-    )
-
-    repaired_sql = clean_llm_sql(raw_content)
 
     return {
-        # 用修复后的SQL覆盖当前待校验SQL
         "raw_sql": repaired_sql,
-
-        # 修复后必须重新校验，因此清空旧的validated_sql
         "validated_sql": "",
-
-        # 记录已经修复过多少次，防止无限循环
         "retry_count": next_retry_count,
-
-        # 保存触发本次修复的原因，便于最终调试
-        "last_repair_reason": repair_reason,
-
-        # 清空旧错误，等待下一次validate_sql或execute_sql产生新结果
+        "last_repair_reason": (
+            f"{source}: {reason}"
+        ),
         "validation_error": "",
+        "validation_repairable": True,
+        "validation_error_type": "",
+        "review_passed": False,
+        "review_reason": "",
+        "review_note": "",
         "execution_error": "",
+        "columns": [],
+        "rows": [],
+        "row_count": 0,
+        "truncated": False,
     }
 
 
-def execute_sql(state: Text2SQLState) -> dict[str, Any]:
-    """执行已经通过SQL Guard的只读SQL。"""
-
+def execute_sql(
+    state: Text2SQLState,
+) -> dict[str, Any]:
     settings = get_settings()
-    validated_sql = state["validated_sql"]
 
     try:
-        query_result = execute_readonly_query(
-            sql=validated_sql,
+        result = execute_readonly_query(
+            sql=state["validated_sql"],
             max_rows=settings.SQL_MAX_ROWS,
         )
     except Exception as exc:
@@ -364,7 +475,7 @@ def execute_sql(state: Text2SQLState) -> dict[str, Any]:
 
     return {
         "execution_error": "",
-        **query_result,
+        **result,
     }
 
 
@@ -372,13 +483,10 @@ def shorten_cell(
     value: Any,
     max_length: int = 100,
 ) -> Any:
-    """缩短终端中的超长字段，避免表格格式被破坏。"""
-
     if value is None:
         return None
 
     text = str(value)
-
     if len(text) <= max_length:
         return value
 
@@ -388,222 +496,186 @@ def shorten_cell(
 def format_result(
     state: Text2SQLState,
 ) -> dict[str, Any]:
-    """将成功执行的SQL和查询结果格式化为终端文本。"""
-
-    columns = state.get("columns", [])
     rows = state.get("rows", [])
-    sql = state.get("validated_sql", "")
-    truncated = state.get("truncated", False)
-    retry_count = state.get("retry_count", 0)
+    columns = state.get("columns", [])
 
-    if not rows:
-        result_text = (
-            "查询执行成功，但没有返回符合条件的数据。"
-        )
-    else:
-        display_rows = [
-            [
-                shorten_cell(value)
-                for value in row
-            ]
-            for row in rows
-        ]
-
+    if rows:
         result_text = tabulate(
-            display_rows,
+            [
+                [
+                    shorten_cell(value)
+                    for value in row
+                ]
+                for row in rows
+            ],
             headers=columns,
             tablefmt="github",
             stralign="left",
             numalign="right",
         )
-
-    if retry_count > 0:
-        repair_notice = (
-            f"本次SQL经过 {retry_count} 次自动修复后执行成功。\n\n"
-        )
     else:
-        repair_notice = (
-            "本次SQL首次生成即通过校验。\n\n"
+        result_text = (
+            "查询执行成功，但没有返回符合条件的数据。"
+        )
+
+    retry_count = state.get("retry_count", 0)
+    execution_notice = (
+        f"本次SQL经过{retry_count}次自动修复后执行成功。"
+        if retry_count > 0
+        else "本次SQL首次生成后执行成功。"
+    )
+
+    review_section = ""
+    if state.get("review_reason"):
+        review_section = (
+            "\n\n语义校验："
+            + state["review_reason"]
+        )
+
+    if (
+        state.get("review_note")
+        and state.get("review_note")
+        not in {
+            "llm_review",
+            "review_unavailable",
+        }
+    ):
+        review_section += (
+            "\n校验说明："
+            + state["review_note"]
         )
 
     truncate_notice = ""
-
-    if truncated:
+    if state.get("truncated", False):
         truncate_notice = (
-            "\n\n注意：查询结果超过最大返回行数，"
-            f"当前只展示前 "
-            f"{get_settings().SQL_MAX_ROWS} 行。"
+            "\n\n注意：结果超过最大返回行数，"
+            f"当前只展示前{get_settings().SQL_MAX_ROWS}行。"
         )
 
-    final_answer = f"""
+    return {
+        "final_answer": f"""
 查询执行成功。
 
-{repair_notice}实际执行 SQL：
+{execution_notice}
+
+实际执行 SQL：
 
 ```sql
-{sql}
+{state["validated_sql"]}
+```
+
 查询结果：
 
-{result_text}{truncate_notice}
+{result_text}{truncate_notice}{review_section}
 """.strip()
-
-    return {
-        "final_answer": final_answer,
     }
-    
+
+
 def format_error(
     state: Text2SQLState,
-    ) -> dict[str, Any]:
-    """格式化最终仍未通过校验或执行失败的结果。"""
-
-    validation_error = state.get(
-        "validation_error",
-        "",
-    )
-    execution_error = state.get(
-        "execution_error",
-        "",
-    )
-
-    final_error = (
-        validation_error
-        or execution_error
+) -> dict[str, Any]:
+    error = (
+        state.get("validation_error")
+        or state.get("execution_error")
+        or state.get("review_reason")
         or "未知错误"
     )
 
-    initial_sql = state.get(
-        "initial_sql",
-        "",
-    )
-    current_sql = state.get(
-        "raw_sql",
-        "",
-    )
-    retry_count = state.get(
-        "retry_count",
-        0,
-    )
-    last_repair_reason = state.get(
-        "last_repair_reason",
-        "",
-    )
-
-    if retry_count > 0:
-        retry_description = (
-            f"系统已经自动修复 {retry_count} 次，"
-            "但修复后的SQL仍未通过检查或执行。"
-        )
-    else:
-        retry_description = (
-            "该错误不满足自动修复条件，"
-            "或者尚未执行自动修复。"
-        )
-
     if (
-        initial_sql
-        and current_sql
-        and initial_sql != current_sql
+        state.get("validation_error_type")
+        == "policy"
     ):
-        sql_history = f"""
-
-    首次生成 SQL：
-
-    {initial_sql}
-
-    最后一次修复 SQL：
-
-    {current_sql}
-
-    """.strip()
+        description = (
+            "该请求违反只读、白名单或跨库安全策略，"
+            "系统不会尝试改写。"
+        )
+    elif state.get("retry_count", 0) > 0:
+        description = (
+            "系统已经自动修复一次，"
+            "但仍未通过确定性校验、复杂语义审查或数据库执行。"
+        )
     else:
-        sql_history = f"""
-        模型生成的 SQL：
-
-        {current_sql or initial_sql or "未生成SQL"}
-
-        """.strip()
-
-    repair_reason_text = ""
-
-    if last_repair_reason:
-        repair_reason_text = f"""
-
-        触发最近一次修复的错误：
-
-        {last_repair_reason}
-        """
-
-    final_answer = f"""
-
-    本次查询没有成功执行。
-
-    {retry_description}
-
-    最终错误信息：
-    
-    {final_error}
-    {sql_history}
-    {repair_reason_text}
-    """.strip()
+        description = (
+            "本次查询未能生成可执行结果。"
+        )
 
     return {
-        "final_answer": final_answer,
+        "final_answer": f"""
+本次查询没有成功执行。
+
+{description}
+
+错误信息：
+
+{error}
+
+首次SQL：
+
+```sql
+{state.get("initial_sql") or "未生成SQL"}
+```
+
+最后SQL：
+
+```sql
+{state.get("raw_sql") or "未生成SQL"}
+```
+""".strip()
     }
-    
+
+
 def route_after_validation(
     state: Text2SQLState,
-    ) -> Literal["execute", "repair", "error"]:
-    """根据SQL Guard结果选择执行、修复或结束。
-    只有校验失败且修复次数未达到上限时，
-    才能进入repair_sql。
-    """
+) -> Literal["review", "repair", "error"]:
+    if not state.get("validation_error"):
+        return "review"
 
-    validation_error = state.get(
-        "validation_error",
-        "",
-    )
-
-    if not validation_error:
-        return "execute"
-
-    settings = get_settings()
-    retry_count = state.get(
-        "retry_count",
-        0,
-    )
+    if not state.get(
+        "validation_repairable",
+        True,
+    ):
+        return "error"
 
     if (
-        retry_count
-        < settings.SQL_MAX_REPAIR_ATTEMPTS
+        state.get("retry_count", 0)
+        < get_settings().SQL_MAX_REPAIR_ATTEMPTS
     ):
         return "repair"
 
     return "error"
+
+
+def route_after_review(
+    state: Text2SQLState,
+) -> Literal["execute", "repair", "error"]:
+    if state.get("review_passed", False):
+        return "execute"
+
+    if (
+        state.get("review_note")
+        == "review_unavailable"
+    ):
+        return "error"
+
+    if (
+        state.get("retry_count", 0)
+        < get_settings().SQL_MAX_REPAIR_ATTEMPTS
+    ):
+        return "repair"
+
+    return "error"
+
 
 def route_after_execution(
     state: Text2SQLState,
-    ) -> Literal["success", "repair", "error"]:
-    """根据数据库执行结果选择成功、修复或结束。"""
-
-    execution_error = state.get(
-        "execution_error",
-        "",
-    )
-
-    if not execution_error:
+) -> Literal["success", "repair", "error"]:
+    if not state.get("execution_error"):
         return "success"
 
-    settings = get_settings()
-    retry_count = state.get(
-        "retry_count",
-        0,
-    )
-
     if (
-        retry_count
-        < settings.SQL_MAX_REPAIR_ATTEMPTS
+        state.get("retry_count", 0)
+        < get_settings().SQL_MAX_REPAIR_ATTEMPTS
     ):
         return "repair"
 
     return "error"
-
