@@ -1360,16 +1360,29 @@ def build_query_spec(
     filters, consumed_numbers = _extract_simple_filters(question)
     limit = extract_requested_limit_from_question(question)
 
+    partial_order_by: dict[str, str] | None = None
+    if ranking is not None:
+        direction = _ranking_direction(question)
+        if direction is not None:
+            partial_order_by = {
+                "kind": "column",
+                "column": ranking[0],
+                "direction": direction,
+            }
+
+    # 即使问题仍需进入RSL，也保留已经可靠识别出的局部约束。
+    # eligible=False只表示不能由确定性编译器完整生成SQL，
+    # 不代表LIMIT、排序字段、返回字段等可信信息应被丢弃。
     result: dict[str, Any] = {
         "eligible": False,
         "mode": "rsl",
         "query_type": "complex_or_uncertain",
         "table": "",
-        "select_columns": [],
+        "select_columns": sorted(requested_outputs),
         "filters": filters,
         "where_filters": filters,
         "having_filters": [],
-        "order_by": None,
+        "order_by": partial_order_by,
         "limit": limit,
         "sample_ids": sample_ids,
         "strict_projection": strict_projection,
@@ -1433,6 +1446,22 @@ def build_query_spec(
         candidate_tables.update(owners.get(column, set()))
 
     if len(candidate_tables) != 1:
+        # 多表问题继续进入RSL，但保留已经确定的查询类型与字段角色，
+        # 供Guard和Trace使用。这里不生成固定SQL，也不改变RSL路由。
+        if len(candidate_tables) > 1:
+            if ranking is not None and limit is not None:
+                result["query_type"] = "multi_table_topk"
+            elif filters:
+                result["query_type"] = "multi_table_filter"
+            else:
+                result["query_type"] = "multi_table_projection"
+
+            result["scalar_columns"] = sorted(business_columns)
+            result["scalar_tables"] = sorted(candidate_tables)
+            result["reason"] = (
+                "已识别多表字段、返回字段、排序和数量约束，"
+                "但SQL连接结构仍交由RSL双候选生成。"
+            )
         return result
 
     table_name = next(iter(candidate_tables))

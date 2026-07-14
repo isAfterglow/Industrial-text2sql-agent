@@ -13,7 +13,7 @@ from app.trace import (
 
 
 WELCOME_TEXT = """
-树脂基防热材料 Text2SQL V0.6.3 时序规划版
+树脂基防热材料 Text2SQL V0.6.4 Guard约束一致性版
 
 流程：
 1. 规范化问题，统一解析数值并构建静态QuerySpec或TemporalQuerySpec；

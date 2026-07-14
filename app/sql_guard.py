@@ -14,6 +14,7 @@ from app.schema import (
     infer_question_ranking_column,
     infer_requested_output_columns,
     extract_numeric_literals,
+    extract_requested_limit_from_question,
     normalize_numeric_literal,
     is_strict_projection_request,
     match_question_semantic_columns,
@@ -617,23 +618,25 @@ def normalize_redundant_predicates(
 def extract_requested_limit(
     question: str,
 ) -> int | None:
-    """提取用户明确要求的最大返回数量。"""
+    """提取用户明确要求的最大返回数量。
 
-    patterns = (
-        r"最多(?:返回)?\s*(\d+)\s*条",
-        r"(?:最高|最大|最低|最小)(?:的)?\s*(\d+)\s*(?:个|条|项|组)?",
-        r"(?:前|top\s*)\s*(\d+)\s*(?:个|条|项|组)?",
-    )
+    保留该函数作为Guard内部兼容入口，但实际只调用Schema层的
+    统一解析器，避免Planner与Guard对“哪8个样本”等问法理解不一致。
+    """
 
-    for pattern in patterns:
-        match = re.search(
-            pattern,
-            question,
-            flags=re.IGNORECASE,
-        )
-        if match:
-            return int(match.group(1))
+    return extract_requested_limit_from_question(question)
 
+
+def _query_spec_limit(
+    query_spec: dict | None,
+) -> int | None:
+    """从部分或完整QuerySpec读取可信LIMIT。"""
+
+    if not query_spec:
+        return None
+    value = query_spec.get("limit")
+    if isinstance(value, int) and value > 0:
+        return value
     return None
 
 
@@ -658,9 +661,13 @@ def _question_numbers_without_sample_id(
 def _query_spec_expected_numbers(
     query_spec: dict | None,
 ) -> dict[str, str]:
-    """从可信QuerySpec读取期望数值，避免再次猜测自然语言。"""
+    """从部分或完整QuerySpec读取期望数值。
 
-    if not query_spec or not query_spec.get("eligible"):
+    RSL模式下的QuerySpec虽然eligible=False，但其中已经识别出的
+    filters与limit仍是可信约束，Guard必须继续使用。
+    """
+
+    if not query_spec:
         return {}
 
     expected: dict[str, str] = {}
@@ -729,11 +736,9 @@ def validate_question_numeric_values(
     if not expected:
         return []
 
-    requested_limit = extract_requested_limit(question)
-    if query_spec and query_spec.get("eligible"):
-        spec_limit = query_spec.get("limit")
-        if isinstance(spec_limit, int) and spec_limit > 0:
-            requested_limit = spec_limit
+    requested_limit = _query_spec_limit(query_spec)
+    if requested_limit is None:
+        requested_limit = extract_requested_limit(question)
 
     actual = _sql_clause_numeric_values(
         tree,
@@ -1000,13 +1005,17 @@ def validate_unrequested_restrictive_limit(
     tree: exp.Select,
     question: str,
     max_rows: int,
+    query_spec: dict | None = None,
 ) -> list[str]:
     """禁止模型把无数量要求的集合查询擅自缩减为少量记录。
 
     指定sample_id的查询允许LIMIT 1；系统默认资源上限由Guard最后统一添加。
     """
 
-    if extract_requested_limit(question) is not None:
+    requested_limit = _query_spec_limit(query_spec)
+    if requested_limit is None:
+        requested_limit = extract_requested_limit(question)
+    if requested_limit is not None:
         return []
     if extract_requested_sample_ids(question):
         return []
@@ -2663,6 +2672,7 @@ def validate_and_normalize_sql(
                     tree,
                     question,
                     max_rows,
+                    query_spec=query_spec,
                 )
             )
         errors.extend(
@@ -2692,11 +2702,9 @@ def validate_and_normalize_sql(
             error_type="schema",
         )
 
-    requested_limit = (
-        extract_requested_limit(question)
-        if question
-        else None
-    )
+    requested_limit = _query_spec_limit(query_spec)
+    if requested_limit is None and question:
+        requested_limit = extract_requested_limit(question)
 
     if requested_limit is not None:
         set_limit(
