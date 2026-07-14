@@ -35,7 +35,7 @@ def get_schema_catalog() -> dict[str, Any]:
                     "columns": {
                         "sample_id": (
                             "样本唯一编号，格式为"
-                            "sample_000001。"
+                            "sample_加6位十进制数字。"
                         ),
                         "rhov_i": "原始材料密度。",
                         "rhoc_i": "碳化材料密度。",
@@ -190,8 +190,7 @@ def get_schema_catalog() -> dict[str, Any]:
             },
             "domain_conventions": [
                 (
-                    "sample_id固定为sample_后跟6位数字，"
-                    "例如sample_000305。"
+                    "sample_id固定为sample_后跟6位十进制数字。"
                 ),
                 (
                     "ms、mtp、tr只是推荐别名，"
@@ -253,6 +252,108 @@ def get_schema_catalog() -> dict[str, Any]:
             ],
         }
     )
+
+
+
+
+SAMPLE_ID_PATTERNS = (
+    # 规范sample_id、非补零sample_id，数字后允许直接接中文。
+    re.compile(
+        r"(?<![A-Za-z0-9_])sample_(\d{1,6})(?!\d)",
+        flags=re.IGNORECASE,
+    ),
+    # 中文样本编号、带空格编号和规范sample_id。
+    re.compile(
+        r"样本(?:编号|ID|id)?\s*[:：#=-]?\s*"
+        r"(?:sample_)?(\d{1,6})(?!\d)",
+        flags=re.IGNORECASE,
+    ),
+    # sample 305、sample_id=305。
+    re.compile(
+        r"(?<![A-Za-z0-9_])(?:sample|sample_id)"
+        r"\s*[:：#=-]?\s*(?:sample_)?"
+        r"(\d{1,6})(?!\d)",
+        flags=re.IGNORECASE,
+    ),
+)
+
+
+def extract_requested_sample_ids(
+    question: str,
+) -> set[str]:
+    """提取用户明确指定的样本编号。
+
+    支持数字后直接跟中文，例如：
+    - 样本305的全部参数
+    - 样本481碳化密度
+    - 规范sample_id后直接跟中文
+
+    不使用Unicode ``\\b`` 判断数字结束位置，
+    避免中文字符被视为单词字符而导致匹配失败。
+    """
+
+    if not question:
+        return set()
+
+    numbers: set[int] = set()
+
+    for pattern in SAMPLE_ID_PATTERNS:
+        for match in pattern.finditer(question):
+            numbers.add(
+                int(match.group(1))
+            )
+
+    return {
+        f"sample_{number:06d}"
+        for number in numbers
+    }
+
+
+def remove_requested_sample_mentions(
+    question: str,
+) -> str:
+    """删除问题中的明确样本编号片段。
+
+    用于普通数值一致性检查，避免把“样本305”中的305
+    当成密度、数量或point_index等业务数值。
+    """
+
+    cleaned = question
+
+    for pattern in SAMPLE_ID_PATTERNS:
+        cleaned = pattern.sub(
+            " ",
+            cleaned,
+        )
+
+    return cleaned
+
+
+
+def normalize_question_sample_ids(
+    question: str,
+) -> str:
+    """把问题中的明确样本编号统一成规范sample_id。
+
+    所有样本识别入口共用 ``SAMPLE_ID_PATTERNS``，
+    避免生成节点、Schema提示和Guard使用不同正则。
+
+    例如自然语言中的“样本 + 数字”会规范为
+    ``sample_`` 加六位十进制数字；未指定样本的问题保持不变。
+    """
+
+    normalized = question
+
+    for pattern in SAMPLE_ID_PATTERNS:
+        normalized = pattern.sub(
+            lambda match: (
+                f"sample_{int(match.group(1)):06d}"
+            ),
+            normalized,
+        )
+
+    return normalized
+
 
 
 def get_column_owner_map() -> dict[str, set[str]]:
@@ -457,10 +558,8 @@ def infer_requested_output_columns(
     # “查询样本305的热解热、发射率……”和时序区间查询：
     # 没有显式“返回”，但列出的业务字段就是输出字段。
     exact_sample_lookup = bool(
-        re.search(
-            r"样本\s*sample_\d{6}",
-            question,
-            flags=re.IGNORECASE,
+        extract_requested_sample_ids(
+            question
         )
     )
     has_filter_or_ranking = bool(
@@ -491,51 +590,241 @@ def infer_requested_output_columns(
     return set()
 
 
-def build_compact_sql_context(
+
+def infer_explicit_full_table_request(
     question: str,
-) -> str:
-    """生成修复节点使用的精简Schema上下文。"""
+) -> str | None:
+    """识别用户明确点名白名单表并请求全部数据/字段的意图。
+
+    只接受Schema中存在的真实表名，不从模糊自然语言猜表。
+    """
 
     catalog = get_schema_catalog()
-    lines = [
-        "可用真实表与字段：",
+
+    full_data_intent = bool(
+        re.search(
+            r"全部数据|所有数据|全部记录|所有记录|"
+            r"全部字段|所有字段|完整数据|完整记录",
+            question,
+            flags=re.IGNORECASE,
+        )
+    )
+    if not full_data_intent:
+        return None
+
+    lowered = question.lower()
+
+    for table_name in catalog["tables"]:
+        if table_name.lower() in lowered:
+            return table_name
+
+    return None
+
+
+def infer_relevant_tables(
+    question: str,
+) -> set[str]:
+    """根据问题中的稳定字段语义推断生成SQL所需的最少表集合。
+
+    只使用Schema词汇表和明确表名，不根据评测题整句做特判。
+    无法可靠推断时返回空集合，由调用方回退到完整Schema。
+    """
+
+    catalog = get_schema_catalog()
+    owners = get_column_owner_map()
+    tables: set[str] = set()
+
+    explicit_full_table = (
+        infer_explicit_full_table_request(
+            question
+        )
+    )
+    if explicit_full_table is not None:
+        return {explicit_full_table}
+
+    lowered = question.lower()
+    for table_name in catalog["tables"]:
+        if table_name.lower() in lowered:
+            tables.add(table_name)
+
+    if re.search(
+        r"全部静态材料参数|全部静态参数|"
+        r"所有静态材料参数|所有静态参数",
+        question,
+    ):
+        static_table = next(
+            table_name
+            for table_name, info
+            in catalog["tables"].items()
+            if info["alias"] == "ms"
+        )
+        tables.add(static_table)
+
+    semantic_matches = (
+        match_question_semantic_columns(
+            question
+        )
+    )
+    for column in semantic_matches:
+        # sample_id是三张表共有的连接键，不用于决定业务表。
+        # 真正相关表由用户询问的业务字段或明确表名决定。
+        if column == "sample_id":
+            continue
+
+        tables.update(
+            owners.get(column, set())
+        )
+
+    return tables
+
+
+def build_generation_schema_context(
+    question: str,
+) -> str:
+    """生成SQL生成器使用的裁剪Schema。
+
+    简单单表问题只展示相关表；跨表问题只展示必要表和关系。
+    无法可靠推断时回退到完整Schema，避免遗漏未知意图。
+    """
+
+    catalog = get_schema_catalog()
+    relevant_tables = infer_relevant_tables(
+        question
+    )
+
+    if not relevant_tables:
+        return build_schema_context()
+
+    lines: list[str] = [
+        "数据库类型：MySQL",
+        "仅可使用以下与当前问题相关的真实表：",
     ]
 
     for table_name, info in catalog["tables"].items():
+        if table_name not in relevant_tables:
+            continue
+
+        grain_text = (
+            "每个样本一行"
+            if info["grain"] == "one_row_per_sample"
+            else "每个样本多行时序记录"
+        )
         lines.append(
-            f"- {table_name} AS {info['alias']}: "
-            + ", ".join(info["columns"])
+            f"[{table_name}] 推荐别名：{info['alias']}；"
+            f"粒度：{grain_text}"
+        )
+        for column, description in info[
+            "columns"
+        ].items():
+            lines.append(
+                f"- {column}：{description}"
+            )
+
+    relationships = [
+        relationship
+        for relationship in catalog[
+            "relationships"
+        ]
+        if sum(
+            table_name in relationship
+            for table_name in relevant_tables
+        ) >= 2
+    ]
+    if relationships:
+        lines.append("必要连接关系：")
+        lines.extend(
+            f"- {relationship}"
+            for relationship in relationships
         )
 
     lines.extend(
         [
-            "连接关系：",
-            *(
-                f"- {relationship}"
-                for relationship
-                in catalog["relationships"]
-            ),
             build_question_field_hint(question),
+            "生成约束：",
+            "- 只使用以上必要表。",
+            "- 普通样本级Top-K直接使用目标字段ORDER BY和LIMIT。",
+            "- 一行一个样本的字段Top-K不得使用MAX或无意义GROUP BY。",
+            "- 时序峰值才使用MAX并按sample_id分组。",
+            "- 用户未指定样本时不得添加固定sample_id过滤。",
+            "- 禁止SELECT *，必须显式返回字段。",
         ]
     )
 
     return "\n".join(lines)
 
+
+def build_compact_sql_context(
+    question: str,
+) -> str:
+    """生成修复节点使用的精简且按问题裁剪的Schema上下文。"""
+
+    catalog = get_schema_catalog()
+    relevant_tables = infer_relevant_tables(
+        question
+    )
+
+    if not relevant_tables:
+        relevant_tables = set(
+            catalog["tables"]
+        )
+
+    lines = [
+        "当前问题允许使用的真实表与字段：",
+    ]
+
+    for table_name, info in catalog["tables"].items():
+        if table_name not in relevant_tables:
+            continue
+
+        lines.append(
+            f"- {table_name} AS {info['alias']} "
+            f"({info['grain']}): "
+            + ", ".join(info["columns"])
+        )
+
+    relationships = [
+        relationship
+        for relationship in catalog[
+            "relationships"
+        ]
+        if sum(
+            table_name in relationship
+            for table_name in relevant_tables
+        ) >= 2
+    ]
+    if relationships:
+        lines.append("连接关系：")
+        lines.extend(
+            f"- {relationship}"
+            for relationship in relationships
+        )
+
+    lines.append(
+        build_question_field_hint(question)
+    )
+
+    return "\n".join(lines)
+
+
+
 def build_question_field_hint(
     question: str,
 ) -> str:
-    """生成给SQL生成器和修复器使用的确定性字段提示。"""
+    """生成给SQL生成器和修复器使用的确定性提示。"""
 
     matches = match_question_semantic_columns(
         question
     )
+    sample_ids = extract_requested_sample_ids(
+        question
+    )
 
-    if not matches:
-        return "未识别到需要额外提示的明确业务字段。"
+    if not matches and not sample_ids:
+        return "未识别到需要额外提示的明确业务字段或样本编号。"
 
     owners = get_column_owner_map()
     lines = [
-        "根据Schema确定的业务字段对应关系："
+        "根据Schema确定的业务字段和样本约束："
     ]
 
     for column, terms in matches.items():
@@ -550,6 +839,15 @@ def build_question_field_hint(
         lines.append(
             f"- {'、'.join(terms)}"
             f" -> {owner_text}.{column}"
+        )
+
+    if sample_ids:
+        lines.append(
+            "- 指定样本必须使用sample_id等值过滤"
+            " -> "
+            + ", ".join(
+                sorted(sample_ids)
+            )
         )
 
     ranking = infer_question_ranking_column(

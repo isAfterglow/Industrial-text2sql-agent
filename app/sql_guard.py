@@ -6,12 +6,70 @@ from sqlglot import exp
 from sqlglot.errors import ParseError
 
 from app.schema import (
+    extract_requested_sample_ids,
     get_column_owner_map,
     get_schema_catalog,
+    infer_explicit_full_table_request,
     infer_question_ranking_column,
     infer_requested_output_columns,
     match_question_semantic_columns,
+    remove_requested_sample_mentions,
 )
+
+
+
+SYSTEM_SCHEMA_PATTERN = re.compile(
+    r"\b(?:mysql|information_schema|performance_schema|sys)"
+    r"\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\b",
+    flags=re.IGNORECASE,
+)
+
+QUESTION_DANGEROUS_PATTERN = re.compile(
+    r"""
+    \b(
+        INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|
+        TRUNCATE|REPLACE|MERGE|CALL|GRANT|REVOKE|
+        LOAD_FILE|SLEEP|BENCHMARK
+    )\b
+    |INTO\s+OUTFILE
+    |INTO\s+DUMPFILE
+    """,
+    flags=re.IGNORECASE | re.VERBOSE,
+)
+
+
+def validate_question_policy(
+    question: str,
+) -> str | None:
+    """直接检查用户请求本身的只读和白名单边界。"""
+
+    if not question:
+        return None
+
+    if SYSTEM_SCHEMA_PATTERN.search(question):
+        return (
+            "用户请求访问MySQL系统Schema或跨库对象，"
+            "不在允许的数据表白名单内。"
+        )
+
+    if QUESTION_DANGEROUS_PATTERN.search(question):
+        return (
+            "用户请求包含写操作、危险函数或文件读取操作，"
+            "只读查询系统不会执行。"
+        )
+
+    if re.search(
+        r"删除|清空|写入|插入|更新.+(?:数据|记录|表)|"
+        r"创建.+表|删除.+表",
+        question,
+        flags=re.IGNORECASE,
+    ):
+        return (
+            "用户请求包含数据写入或破坏性操作，"
+            "只读查询系统不会执行。"
+        )
+
+    return None
 
 
 FORBIDDEN_PATTERN = re.compile(
@@ -224,6 +282,85 @@ def _extract_output_request_text(
     ]
 
 
+
+def validate_explicit_full_table_request(
+    tree: exp.Select,
+    question: str,
+) -> list[str]:
+    """校验明确点名白名单表的全部数据/全部字段请求。"""
+
+    requested_table = (
+        infer_explicit_full_table_request(
+            question
+        )
+    )
+    if requested_table is None:
+        return []
+
+    catalog = get_schema_catalog()
+    expected_columns = set(
+        catalog["tables"][
+            requested_table
+        ]["columns"]
+    )
+    selected_columns = (
+        _top_level_selected_columns(
+            tree
+        )
+    )
+    used_tables = {
+        table.name
+        for table in tree.find_all(exp.Table)
+    }
+
+    errors: list[str] = []
+
+    if used_tables != {requested_table}:
+        errors.append(
+            "用户明确要求查询表"
+            f"{requested_table}的全部数据，"
+            "SQL只能使用该表，不能加入其他数据表或子查询。"
+        )
+
+    missing = expected_columns - selected_columns
+    if missing:
+        errors.append(
+            "用户要求该表全部数据，但顶层SELECT缺少字段："
+            + ", ".join(sorted(missing))
+            + "。"
+        )
+
+    extra = selected_columns - expected_columns
+    if extra:
+        errors.append(
+            "顶层SELECT包含不属于目标表的字段："
+            + ", ".join(sorted(extra))
+            + "。"
+        )
+
+    if tree.args.get("where") is not None:
+        errors.append(
+            "用户要求全部数据，SQL不应添加WHERE过滤条件。"
+        )
+
+    if tree.args.get("group") is not None:
+        errors.append(
+            "用户要求原始明细数据，SQL不应添加GROUP BY。"
+        )
+
+    if any(
+        nearest_select(aggregate) is tree
+        for aggregate in tree.find_all(
+            exp.AggFunc
+        )
+    ):
+        errors.append(
+            "用户要求原始明细数据，SQL不应使用聚合函数。"
+        )
+
+    return errors
+
+
 def validate_question_field_semantics(
     tree: exp.Select,
     question: str,
@@ -324,8 +461,16 @@ def validate_question_field_semantics(
     }
     expected_columns = set(matches)
 
+    explicit_full_table = (
+        infer_explicit_full_table_request(
+            question
+        )
+    )
+
     if (
         response_table in used_tables
+        and explicit_full_table
+        != response_table
         and not (
             expected_columns
             & response_columns
@@ -491,11 +636,14 @@ def extract_requested_limit(
 def _question_numbers_without_sample_id(
     question: str,
 ) -> set[str]:
-    cleaned = re.sub(
-        r"sample_\d{6}",
-        "",
-        question,
-        flags=re.IGNORECASE,
+    """提取业务数值，但排除明确的样本编号。
+
+    样本编号解析与Schema提示、sample_id过滤检查共用
+    同一套规则，避免不同模块对“样本305”理解不一致。
+    """
+
+    cleaned = remove_requested_sample_mentions(
+        question
     )
 
     return {
@@ -505,6 +653,7 @@ def _question_numbers_without_sample_id(
             cleaned,
         )
     }
+
 
 
 def validate_question_numeric_values(
@@ -563,6 +712,216 @@ def validate_question_numeric_values(
         ]
 
     return []
+
+
+
+def _normalize_sample_literal(
+    expression: exp.Expression,
+) -> str | None:
+    """把SQL中的样本字面量规范为sample_000000。"""
+
+    expression = _unwrap_parentheses(
+        expression
+    )
+
+    if not isinstance(
+        expression,
+        exp.Literal,
+    ):
+        return None
+
+    raw = str(expression.this).strip()
+
+    match = re.fullmatch(
+        r"(?:sample_)?(\d+)",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+
+    return (
+        f"sample_{int(match.group(1)):06d}"
+    )
+
+
+def extract_fixed_sample_ids_from_sql(
+    tree: exp.Select,
+) -> set[str]:
+    """提取SQL条件中明确固定的sample_id。
+
+    只识别：
+    - sample_id = '<规范sample_id>'
+    - '<规范sample_id>' = sample_id
+    - sample_id IN ('<规范sample_id>', ...)
+    """
+
+    sample_ids: set[str] = set()
+
+    for equality in tree.find_all(exp.EQ):
+        left = _unwrap_parentheses(
+            equality.this
+        )
+        right = _unwrap_parentheses(
+            equality.expression
+        )
+
+        if (
+            isinstance(left, exp.Column)
+            and left.name == "sample_id"
+        ):
+            sample_id = (
+                _normalize_sample_literal(
+                    right
+                )
+            )
+            if sample_id is not None:
+                sample_ids.add(sample_id)
+
+        if (
+            isinstance(right, exp.Column)
+            and right.name == "sample_id"
+        ):
+            sample_id = (
+                _normalize_sample_literal(
+                    left
+                )
+            )
+            if sample_id is not None:
+                sample_ids.add(sample_id)
+
+    for in_expression in tree.find_all(
+        exp.In
+    ):
+        left = _unwrap_parentheses(
+            in_expression.this
+        )
+
+        if (
+            not isinstance(left, exp.Column)
+            or left.name != "sample_id"
+        ):
+            continue
+
+        for item in in_expression.expressions:
+            sample_id = (
+                _normalize_sample_literal(
+                    item
+                )
+            )
+            if sample_id is not None:
+                sample_ids.add(sample_id)
+
+    return sample_ids
+
+
+
+def extract_sample_id_like_patterns(
+    tree: exp.Select,
+) -> set[str]:
+    """提取sample_id LIKE后面的字符串模式。
+
+    固定样本查询不允许使用LIKE，因为下划线在SQL LIKE中
+    是单字符通配符，不能保证等值匹配。
+    """
+
+    patterns: set[str] = set()
+
+    for like_expression in tree.find_all(
+        exp.Like
+    ):
+        left = _unwrap_parentheses(
+            like_expression.this
+        )
+        right = _unwrap_parentheses(
+            like_expression.expression
+        )
+
+        if (
+            isinstance(left, exp.Column)
+            and left.name == "sample_id"
+            and isinstance(right, exp.Literal)
+            and right.is_string
+        ):
+            patterns.add(
+                str(right.this)
+            )
+
+    return patterns
+
+
+def validate_requested_sample_filters(
+    tree: exp.Select,
+    question: str,
+) -> list[str]:
+    """检查明确样本编号是否落实为可靠的SQL过滤条件。
+
+    可靠形式：
+    - sample_id = '<规范sample_id>'
+    - sample_id IN ('<规范sample_id>', ...)
+
+    不接受LIKE作为固定样本等值过滤。
+    """
+
+    expected = extract_requested_sample_ids(
+        question
+    )
+    actual = extract_fixed_sample_ids_from_sql(
+        tree
+    )
+    like_patterns = (
+        extract_sample_id_like_patterns(
+            tree
+        )
+    )
+
+    errors: list[str] = []
+
+    if like_patterns:
+        if expected:
+            errors.append(
+                "固定样本过滤不能使用LIKE；"
+                "sample_id中的下划线在LIKE中是通配符。"
+                "请删除LIKE谓词，并使用用户指定sample_id的"
+                "等值或IN条件。"
+            )
+        else:
+            errors.append(
+                "用户没有指定任何样本，但SQL加入了"
+                "sample_id LIKE固定过滤。"
+                "请删除整个sample_id LIKE谓词，"
+                "不得改成等值、IN、另一个编号或其他LIKE条件。"
+            )
+
+    if expected:
+        missing = expected - actual
+        if missing:
+            errors.append(
+                "用户明确指定了样本"
+                + ", ".join(sorted(missing))
+                + "，但SQL没有使用对应的"
+                "sample_id等值或IN过滤条件。"
+            )
+
+        unexpected = actual - expected
+        if unexpected:
+            errors.append(
+                "SQL加入了与用户指定样本不一致的"
+                "固定sample_id过滤："
+                + ", ".join(sorted(unexpected))
+                + "。"
+            )
+
+    elif actual:
+        errors.append(
+            "SQL加入了用户未指定的固定sample_id过滤："
+            + ", ".join(sorted(actual))
+            + "。请删除整个固定sample_id过滤谓词；"
+            "不得改成IN、LIKE、另一个编号或其他固定样本条件。"
+        )
+
+    return errors
+
 
 
 def validate_unrequested_predicates(
@@ -1063,6 +1422,108 @@ def _remove_nonaggregate_group(
         select.set("group", None)
 
 
+
+def _is_one_row_per_sample_table(
+    table_name: str,
+) -> bool:
+    catalog = get_schema_catalog()
+    info = catalog["tables"].get(
+        table_name
+    )
+    return bool(
+        info
+        and info["grain"]
+        == "one_row_per_sample"
+    )
+
+
+def _has_only_redundant_sample_group(
+    select: exp.Select,
+) -> bool:
+    """判断GROUP BY是否仅为一行一个样本表上的sample_id。"""
+
+    group = select.args.get("group")
+    if group is None:
+        return False
+
+    group_columns = [
+        column
+        for expression in group.expressions
+        for column in expression.find_all(
+            exp.Column
+        )
+        if nearest_select(column) is select
+    ]
+    if (
+        not group_columns
+        or any(
+            column.name != "sample_id"
+            for column in group_columns
+        )
+    ):
+        return False
+
+    direct_tables = set(
+        _direct_table_aliases(
+            select
+        ).values()
+    )
+    return (
+        len(direct_tables) == 1
+        and all(
+            _is_one_row_per_sample_table(
+                table_name
+            )
+            for table_name in direct_tables
+        )
+        and not _has_direct_aggregate(select)
+        and select.args.get("having") is None
+    )
+
+
+def _unwrap_passthrough_topk_select(
+    select: exp.Select,
+) -> exp.Select:
+    """解开仅转发派生表结果的单层SELECT。"""
+
+    if (
+        select.args.get("where") is not None
+        or select.args.get("group") is not None
+        or select.args.get("having") is not None
+        or select.args.get("order") is not None
+        or select.args.get("limit") is not None
+        or len(select.expressions) != 1
+    ):
+        return select
+
+    projection_column = next(
+        select.expressions[0].find_all(
+            exp.Column
+        ),
+        None,
+    )
+    if (
+        projection_column is None
+        or projection_column.name
+        != "sample_id"
+    ):
+        return select
+
+    from_clause = select.args.get("from")
+    if from_clause is None:
+        return select
+
+    source = from_clause.this
+    if not isinstance(source, exp.Subquery):
+        return select
+
+    inner = _subquery_select(source)
+    if inner is None:
+        return select
+
+    return inner
+
+
 def _normalize_in_topk(
     tree: exp.Select,
     predicate: exp.Expression,
@@ -1075,14 +1536,29 @@ def _normalize_in_topk(
     if not isinstance(predicate, exp.In):
         return False
 
-    inner = _subquery_select(
+    wrapper_inner = _subquery_select(
         predicate.args.get("query")
     )
-    if inner is None:
+    if wrapper_inner is None:
         return False
 
+    inner = _unwrap_passthrough_topk_select(
+        wrapper_inner
+    )
     inner_order = inner.args.get("order")
     inner_limit = get_limit_value(inner)
+
+    has_group = (
+        inner.args.get("group")
+        is not None
+    )
+    redundant_group = (
+        _has_only_redundant_sample_group(
+            inner
+        )
+        if has_group
+        else False
+    )
 
     if (
         inner_order is None
@@ -1090,10 +1566,16 @@ def _normalize_in_topk(
         or inner_limit != count
         or inner.args.get("where") is not None
         or inner.args.get("having") is not None
-        or inner.args.get("group") is not None
+        or (
+            has_group
+            and not redundant_group
+        )
         or _has_direct_aggregate(inner)
     ):
         return False
+
+    if redundant_group:
+        inner.set("group", None)
 
     outer_column = _unwrap_parentheses(
         predicate.this
@@ -1323,6 +1805,55 @@ def validate_mysql_limit_in_subquery(
     return errors
 
 
+
+def _top_level_predicate_expressions(
+    tree: exp.Select,
+) -> list[exp.Expression]:
+    """返回顶层WHERE、HAVING与JOIN ON条件。"""
+
+    predicates: list[exp.Expression] = []
+
+    where = tree.args.get("where")
+    if where is not None:
+        predicates.append(where.this)
+
+    having = tree.args.get("having")
+    if having is not None:
+        predicates.append(having.this)
+
+    for join in tree.args.get(
+        "joins",
+        [],
+    ):
+        on_expression = join.args.get("on")
+        if on_expression is not None:
+            predicates.append(on_expression)
+
+    return predicates
+
+
+def has_top_level_point_index_filter(
+    tree: exp.Select,
+) -> bool:
+    """检查顶层查询是否在任意谓词中限制point_index。"""
+
+    for predicate in (
+        _top_level_predicate_expressions(
+            tree
+        )
+    ):
+        if any(
+            column.name == "point_index"
+            and nearest_select(column) is tree
+            for column in predicate.find_all(
+                exp.Column
+            )
+        ):
+            return True
+
+    return False
+
+
 def check_simple_topk_shape(
     question: str,
     sql: str,
@@ -1434,24 +1965,74 @@ def check_simple_topk_shape(
                 "但SQL顶层ORDER BY没有使用该真实字段。",
             )
 
+        if not requires_aggregation:
+            catalog = get_schema_catalog()
+            owners = get_column_owner_map()
+            owner_tables = owners.get(
+                expected_ranking_column,
+                set(),
+            )
+            sample_level_field = any(
+                catalog["tables"][table_name][
+                    "grain"
+                ] == "one_row_per_sample"
+                for table_name in owner_tables
+            )
+
+            if sample_level_field:
+                direct_aggregates = [
+                    aggregate
+                    for aggregate
+                    in tree.find_all(
+                        exp.AggFunc
+                    )
+                    if nearest_select(
+                        aggregate
+                    ) is tree
+                ]
+                if direct_aggregates:
+                    return (
+                        False,
+                        "普通样本级字段Top-K不应使用聚合函数；"
+                        "请直接按目标字段ORDER BY并LIMIT。",
+                    )
+
+                if tree.args.get("group") is not None:
+                    return (
+                        False,
+                        "普通样本级字段Top-K不应使用GROUP BY；"
+                        "请直接按目标字段ORDER BY并LIMIT。",
+                    )
+
+                selected_columns = (
+                    _top_level_selected_columns(
+                        tree
+                    )
+                )
+                if "sample_id" not in selected_columns:
+                    return (
+                        False,
+                        "样本级Top-K必须返回sample_id，"
+                        "以标识每条排名结果。",
+                    )
+
     if requires_aggregation:
-        where = tree.args.get("where")
         if (
             "峰值" in question
-            and where is not None
-            and any(
-                column.name
-                == "point_index"
-                for column
-                in where.find_all(
-                    exp.Column
-                )
+            and not re.search(
+                r"point_index|序列点|点位",
+                question,
+                flags=re.IGNORECASE,
+            )
+            and has_top_level_point_index_filter(
+                tree
             )
         ):
             return (
                 False,
-                "峰值必须基于完整响应序列使用MAX聚合，"
-                "不能用固定point_index代替峰值。",
+                "峰值必须基于完整响应序列使用MAX聚合；"
+                "用户未要求点位范围时，"
+                "WHERE、JOIN ON或HAVING中都不能限制point_index。",
             )
         direct_aggregates = [
             aggregate
@@ -1522,15 +2103,26 @@ def assess_deterministic_semantic_coverage(
         )
     )
 
+    explicit_full_table = (
+        infer_explicit_full_table_request(
+            question
+        )
+    )
+
     if (
         not semantic_matches
         and "全部静态材料参数"
         not in question
+        and explicit_full_table is None
     ):
         return False, "问题缺少可确定映射的业务字段。"
 
     semantic_errors = (
-        validate_question_field_semantics(
+        validate_explicit_full_table_request(
+            tree,
+            question,
+        )
+        + validate_question_field_semantics(
             tree,
             question,
         )
@@ -1748,7 +2340,18 @@ def validate_and_normalize_sql(
     max_rows: int,
     question: str = "",
 ) -> SQLValidationResult:
-    """只执行确定性的安全、Schema和资源检查。"""
+    """执行确定性的安全、Schema和基础语义检查。"""
+
+    policy_error = validate_question_policy(
+        question
+    )
+    if policy_error is not None:
+        return SQLValidationResult(
+            valid=False,
+            error=policy_error,
+            repairable=False,
+            error_type="policy",
+        )
 
     cleaned_sql = normalize_sample_id_literals(
         clean_llm_sql(sql)
@@ -1896,6 +2499,12 @@ def validate_and_normalize_sql(
 
     if question:
         errors.extend(
+            validate_explicit_full_table_request(
+                tree,
+                question,
+            )
+        )
+        errors.extend(
             validate_question_field_semantics(
                 tree,
                 question,
@@ -1913,6 +2522,23 @@ def validate_and_normalize_sql(
                 question,
             )
         )
+        errors.extend(
+            validate_requested_sample_filters(
+                tree,
+                question,
+            )
+        )
+
+        topk_passed, topk_reason = (
+            check_simple_topk_shape(
+                question=question,
+                sql=tree.sql(
+                    dialect="mysql"
+                ),
+            )
+        )
+        if topk_passed is False:
+            errors.append(topk_reason)
 
     errors = list(dict.fromkeys(errors))
 

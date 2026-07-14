@@ -12,8 +12,11 @@ from app.db import execute_readonly_query
 from app.llm import get_llm
 from app.schema import (
     build_compact_sql_context,
+    build_generation_schema_context,
     build_question_field_hint,
     build_schema_context,
+    extract_requested_sample_ids,
+    normalize_question_sample_ids,
 )
 from app.sql_guard import (
     assess_deterministic_semantic_coverage,
@@ -21,6 +24,7 @@ from app.sql_guard import (
     clean_llm_sql,
     normalize_sample_id_literals,
     validate_and_normalize_sql,
+    validate_question_policy,
 )
 from app.state import Text2SQLState
 
@@ -46,28 +50,6 @@ def message_content_to_text(content: Any) -> str:
             return "\n".join(parts)
 
     return str(content)
-
-
-def normalize_sample_id_mentions(question: str) -> str:
-    """将自然语言中的样本编号统一成sample_000000。"""
-
-    normalized = re.sub(
-        r"样本\s*(?!sample_)(\d+)\b",
-        lambda match: (
-            f"样本 sample_{int(match.group(1)):06d}"
-        ),
-        question,
-        flags=re.IGNORECASE,
-    )
-
-    return re.sub(
-        r"\b(sample|sample_id)\s*(?!sample_)(\d+)\b",
-        lambda match: (
-            f"{match.group(1)} sample_{int(match.group(2)):06d}"
-        ),
-        normalized,
-        flags=re.IGNORECASE,
-    )
 
 
 def invoke_text(
@@ -191,7 +173,7 @@ def load_schema(
 ) -> dict[str, Any]:
     return {
         "normalized_question": (
-            normalize_sample_id_mentions(
+            normalize_question_sample_ids(
                 state["question"]
             )
         ),
@@ -233,20 +215,47 @@ def generate_sql(
 4. 严格使用提供的业务字段对应关系；
 5. 只返回用户要求的字段，只使用必要数据表；
 6. 不增加用户未要求的LIKE、IS NOT NULL或其他过滤；
-7. 普通Top-K使用ORDER BY目标字段加LIMIT；
-8. 峰值使用MAX并按sample_id分组；
-9. 时序明细不聚合；
-10. 禁止SELECT *、写操作和跨库查询。
+7. 普通样本级Top-K直接返回sample_id和所需字段，使用ORDER BY目标字段加LIMIT，不使用MAX、GROUP BY或IN子查询；
+8. 只有一个样本多行的时序峰值才使用MAX并按sample_id分组；
+9. 峰值查询不得用固定point_index代替完整序列峰值；
+10. 时序明细不聚合；
+11. 用户明确指定样本编号时，必须使用对应sample_id等值或IN过滤；
+12. 用户没有指定样本编号时，禁止添加任何固定sample_id过滤；
+13. 固定样本查询禁止使用LIKE；
+14. 用户明确请求某个白名单表全部数据时，只查询该表并显式列出全部字段；
+15. 禁止SELECT *、写操作和跨库查询。
 """.strip()
 
     question = state["normalized_question"]
+
+    # 危险请求不调用LLM，下一节点由Guard返回policy错误。
+    if validate_question_policy(
+        question
+    ) is not None:
+        return {
+            "initial_sql": "",
+            "raw_sql": "",
+            "validated_sql": "",
+            "validation_error": "",
+            "review_passed": False,
+            "review_reason": "",
+            "review_note": "",
+            "execution_error": "",
+        }
+
     field_hint = build_question_field_hint(
         question
     )
 
+    generation_context = (
+        build_generation_schema_context(
+            question
+        )
+    )
+
     user_prompt = f"""
 数据库Schema：
-{state["schema_context"]}
+{generation_context}
 
 用户问题：
 {question}
@@ -358,6 +367,120 @@ def review_sql(
     }
 
 
+def build_explicit_repair_action(
+    question: str,
+    reason: str,
+) -> str:
+    """把高可信Guard错误转换为简短、明确的修复动作。"""
+
+    requested_samples = (
+        extract_requested_sample_ids(
+            question
+        )
+    )
+
+    if (
+        "用户未指定的固定sample_id过滤" in reason
+        or (
+            "用户没有指定任何样本" in reason
+            and "sample_id" in reason
+        )
+    ):
+        return (
+            "用户没有指定任何样本。"
+            "删除整个固定sample_id过滤谓词；"
+            "不要改成IN、LIKE、其他样本编号或其他固定样本条件。"
+        )
+
+    if (
+        "固定样本过滤不能使用LIKE" in reason
+        and requested_samples
+    ):
+        return (
+            "删除sample_id LIKE谓词，"
+            "改为用户指定sample_id的等值或IN条件："
+            + ", ".join(
+                sorted(requested_samples)
+            )
+            + "。"
+        )
+
+    if (
+        "用户明确指定了样本" in reason
+        and "没有使用对应的sample_id" in reason
+        and requested_samples
+    ):
+        return (
+            "加入用户指定sample_id的等值或IN过滤："
+            + ", ".join(
+                sorted(requested_samples)
+            )
+            + "。不得使用LIKE。"
+        )
+
+    if (
+        "IN子查询中使用LIMIT" in reason
+        or "Top-K查询缺少顶层ORDER BY" in reason
+    ):
+        return (
+            "这是普通Top-K结构错误。"
+            "丢弃IN子查询、派生表包装和无意义GROUP BY，"
+            "从正确字段所属的最少表重新生成："
+            "顶层SELECT返回sample_id及用户要求字段，"
+            "顶层ORDER BY目标字段并使用正确LIMIT。"
+        )
+
+    if (
+        "字段归属错误" in reason
+        or "未知字段" in reason
+    ):
+        return (
+            "根据确定性字段提示重新选择真实字段所属表。"
+            "不要沿用原SQL中的错误表或嵌套子查询；"
+            "使用包含目标字段的最少必要表重新生成。"
+        )
+
+    if "多个来源中存在" in reason:
+        return (
+            "为所有可能歧义的字段添加正确表别名；"
+            "如果这是普通Top-K，优先改写成单层ORDER BY加LIMIT，"
+            "不要保留不必要的派生表JOIN。"
+        )
+
+    if (
+        "不能限制point_index" in reason
+        or "固定point_index代替峰值" in reason
+    ):
+        return (
+            "删除WHERE、JOIN ON和HAVING中的固定point_index条件，"
+            "在完整thermal_response序列上按sample_id分组并使用MAX。"
+        )
+
+    if "全部数据" in reason:
+        return (
+            "用户明确请求白名单表全部数据。"
+            "只查询该目标表，显式列出该表全部字段，"
+            "删除WHERE、GROUP BY、聚合和其他表JOIN。"
+        )
+
+    if (
+        "普通样本级字段Top-K" in reason
+        or "样本级Top-K必须返回sample_id" in reason
+    ):
+        return (
+            "这是每个样本一行字段的普通Top-K。"
+            "返回sample_id及用户要求字段，"
+            "直接按目标字段ORDER BY并LIMIT；"
+            "删除MAX、GROUP BY和子查询。"
+        )
+
+    return (
+        "只修复错误原因中明确指出的问题，"
+        "使用正确字段所属的最少必要表，"
+        "不要增加用户未要求的过滤、字段或数据表。"
+    )
+
+
 def repair_sql(
     state: Text2SQLState,
 ) -> dict[str, Any]:
@@ -394,6 +517,12 @@ def repair_sql(
             question
         )
     )
+    repair_action = (
+        build_explicit_repair_action(
+            question=question,
+            reason=reason,
+        )
+    )
 
     system_prompt = """
 你是MySQL SQL修复器。
@@ -402,8 +531,10 @@ def repair_sql(
 根据明确错误修复原SQL，不要解释，不要复制错误结构。
 必须使用真实表名、真实字段和最少必要表。
 不得用AS别名伪装错误字段。
-普通Top-K使用ORDER BY目标字段加LIMIT。
-峰值使用MAX并按sample_id分组。
+普通样本级Top-K返回sample_id，直接使用目标字段ORDER BY和LIMIT，不使用MAX、GROUP BY或IN子查询。
+只有时序峰值才使用MAX并按sample_id分组，且不得固定point_index。
+用户明确指定样本编号时，必须使用对应sample_id等值或IN过滤，禁止LIKE。
+用户没有指定样本编号时，禁止保留或新增任何固定sample_id过滤。
 """.strip()
 
     user_prompt = f"""
@@ -415,6 +546,9 @@ def repair_sql(
 错误来源：{source}
 错误原因：
 {reason}
+
+必须执行的修复动作：
+{repair_action}
 
 错误SQL：
 {bad_sql}
