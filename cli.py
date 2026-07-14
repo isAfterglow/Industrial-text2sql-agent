@@ -13,16 +13,18 @@ from app.trace import (
 
 
 WELCOME_TEXT = """
-树脂基防热材料 Text2SQL V0.5 可观测版
+树脂基防热材料 Text2SQL V0.6.3 时序规划版
 
 流程：
-1. 规范化问题并进行动态Schema裁剪；
-2. 根据问题和裁剪Schema生成SQL；
-3. 执行确定性安全、Schema与基础语义检查；
-4. 必要时进行轻量语义审查；
-5. 必要时自动修复一次；
-6. 执行数据库查询并返回结果；
-7. 输出每个节点的关键输入、输出和耗时，并写入JSONL日志。
+1. 规范化问题，统一解析数值并构建静态QuerySpec或TemporalQuerySpec；
+2. 可确定的静态查询、时序明细和标准时序聚合走确定性SQL快路径；
+3. 无法完整规划的复杂查询进入RSL-SQL-inspired双候选链路；
+4. 完整Schema生成SQL1，并进行正向/反向Schema Linking；
+5. 置信度过滤反向噪声，形成表级和列级稳健裁剪Schema；
+6. 裁剪Schema生成SQL2，并通过Guard与结构评分选择候选；
+7. 执行统一安全、Schema、投影、数值、Top-K和聚合校验；
+8. 必要时轻量语义审查并最多自动修复一次；
+9. 执行数据库查询，输出节点输入、输出、耗时和JSONL日志。
 
 默认日志：
 - logs/node_events.jsonl：每次节点执行记录；

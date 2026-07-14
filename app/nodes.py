@@ -1,6 +1,10 @@
 import re
 from typing import Any, Literal
 
+import sqlglot
+from sqlglot import exp
+from sqlglot.errors import ParseError
+
 from langchain_core.messages import (
     HumanMessage,
     SystemMessage,
@@ -12,10 +16,13 @@ from app.db import execute_readonly_query
 from app.llm import get_llm
 from app.schema import (
     build_compact_sql_context,
-    build_generation_schema_context,
+    build_query_spec,
+    compile_query_spec_sql,
     build_question_field_hint,
+    build_robust_schema_linking,
     build_schema_context,
     extract_requested_sample_ids,
+    extract_sql_schema_elements,
     infer_relevant_tables,
     normalize_question_sample_ids,
 )
@@ -132,6 +139,8 @@ def review_complex_sql(
 
 不要因为SQL写法不够简洁而判错。
 不要把ORDER BY字段误认为SELECT返回字段。
+不得要求增加用户问题中没有出现的数值、过滤条件或业务约束。
+如果SQL已经完整包含用户明确给出的条件，不得自行补充“>0”等条件。
 
 只能输出一行：
 PASS: 简短原因
@@ -179,6 +188,36 @@ def load_schema(
             )
         ),
         "schema_context": build_schema_context(),
+        "query_spec": {},
+        "query_plan_mode": "",
+        "query_plan_reason": "",
+        "deterministic_sql": "",
+        "full_schema_context": "",
+        "full_generator_raw_output": "",
+        "full_sql": "",
+        "forward_schema_tables": [],
+        "forward_schema_columns": [],
+        "backward_schema_tables": [],
+        "backward_schema_columns": [],
+        "accepted_backward_tables": [],
+        "rejected_backward_tables": [],
+        "robust_schema_context": "",
+        "robust_schema_tables": [],
+        "robust_schema_columns": [],
+        "pruned_generator_raw_output": "",
+        "pruned_sql": "",
+        "candidate_full_valid": False,
+        "candidate_full_normalized_sql": "",
+        "candidate_full_error": "",
+        "candidate_full_error_type": "",
+        "candidate_full_score": 0.0,
+        "candidate_pruned_valid": False,
+        "candidate_pruned_normalized_sql": "",
+        "candidate_pruned_error": "",
+        "candidate_pruned_error_type": "",
+        "candidate_pruned_score": 0.0,
+        "selected_candidate": "",
+        "candidate_selection_reason": "",
         "generation_schema_context": "",
         "generation_relevant_tables": [],
         "field_hint": "",
@@ -210,13 +249,81 @@ def load_schema(
     }
 
 
-def generate_sql(
+def build_query_plan(
     state: Text2SQLState,
 ) -> dict[str, Any]:
-    """根据问题、Schema和确定性字段提示直接生成SQL。"""
+    """构建基础查询QuerySpec，决定快路径或RSL路径。"""
 
-    system_prompt = """
+    spec = build_query_spec(
+        state["normalized_question"]
+    )
+    deterministic_sql = (
+        compile_query_spec_sql(spec)
+        if spec.get("eligible")
+        else ""
+    )
+    return {
+        "query_spec": spec,
+        "query_plan_mode": spec.get("mode", "rsl"),
+        "query_plan_reason": spec.get("reason", ""),
+        "deterministic_sql": deterministic_sql,
+    }
+
+
+def route_after_query_plan(
+    state: Text2SQLState,
+) -> Literal["simple", "rsl"]:
+    if (
+        state.get("query_plan_mode") == "deterministic"
+        and state.get("deterministic_sql")
+    ):
+        return "simple"
+    return "rsl"
+
+
+def generate_simple_sql(
+    state: Text2SQLState,
+) -> dict[str, Any]:
+    """将可信QuerySpec编译结果送入统一Guard。"""
+
+    sql = state.get("deterministic_sql", "")
+    return {
+        "selected_candidate": "deterministic",
+        "candidate_selection_reason": state.get(
+            "query_plan_reason", "基础查询确定性快路径。"
+        ),
+        "generator_raw_output": "",
+        "initial_sql": sql,
+        "raw_sql": sql,
+        "validated_sql": "",
+        "validation_error": "",
+        "validation_repairable": True,
+        "validation_error_type": "",
+        "review_called": False,
+        "review_passed": False,
+        "review_reason": "",
+        "review_note": "",
+        "review_input_summary": "",
+        "execution_error": "",
+    }
+
+
+def _generation_system_prompt(
+    candidate_mode: str,
+) -> str:
+    mode_instruction = (
+        "当前提供的是完整Schema。先保证字段和表选择正确，"
+        "仍然只使用回答问题所需的最少数据表。"
+        if candidate_mode == "full"
+        else
+        "当前提供的是正向与反向Schema Linking合并后的稳健裁剪Schema。"
+        "严格限制在该Schema中生成更聚焦的候选SQL。"
+    )
+
+    return f"""
 你是材料数据库Text2SQL生成器。
+
+{mode_instruction}
 
 生成一条MySQL只读SELECT查询。
 
@@ -235,41 +342,21 @@ def generate_sql(
 12. 用户没有指定样本编号时，禁止添加任何固定sample_id过滤；
 13. 固定样本查询禁止使用LIKE；
 14. 用户明确请求某个白名单表全部数据时，只查询该表并显式列出全部字段；
-15. 禁止SELECT *、写操作和跨库查询。
+15. 禁止SELECT *、写操作和跨库查询；
+16. 科学计数法是一个完整数值，例如2e-12不得拆成2和12；
+17. 用户没有要求数量时，不得自行添加LIMIT 1或其他限制性LIMIT，系统会统一添加资源上限。
 """.strip()
 
-    question = state["normalized_question"]
 
-    # 危险请求不调用LLM，下一节点由Guard返回policy错误。
-    if validate_question_policy(
-        question
-    ) is not None:
-        return {
-            "initial_sql": "",
-            "raw_sql": "",
-            "validated_sql": "",
-            "validation_error": "",
-            "review_called": False,
-            "review_passed": False,
-            "review_reason": "",
-            "review_note": "",
-            "review_input_summary": "",
-            "execution_error": "",
-        }
-
-    field_hint = build_question_field_hint(
-        question
-    )
-
-    generation_context = (
-        build_generation_schema_context(
-            question
-        )
-    )
-
+def _generate_candidate_sql(
+    question: str,
+    schema_context: str,
+    field_hint: str,
+    candidate_mode: str,
+) -> tuple[str, str]:
     user_prompt = f"""
 数据库Schema：
-{generation_context}
+{schema_context}
 
 用户问题：
 {question}
@@ -279,27 +366,390 @@ def generate_sql(
 只输出一条完整SQL。
 """.strip()
 
-    generator_raw_output = invoke_text(
-        system_prompt,
+    raw_output = invoke_text(
+        _generation_system_prompt(
+            candidate_mode
+        ),
         user_prompt,
     )
-    sql = normalize_sample_id_literals(
-        clean_llm_sql(
-            generator_raw_output
-        )
+    cleaned_sql = normalize_sample_id_literals(
+        clean_llm_sql(raw_output)
+    )
+    return raw_output, cleaned_sql
+
+
+def generate_full_sql(
+    state: Text2SQLState,
+) -> dict[str, Any]:
+    """使用完整Schema生成第一条候选SQL。"""
+
+    question = state["normalized_question"]
+    if validate_question_policy(question) is not None:
+        return {
+            "full_schema_context": state.get(
+                "schema_context", ""
+            ),
+            "full_generator_raw_output": "",
+            "full_sql": "",
+        }
+
+    field_hint = build_question_field_hint(
+        question
+    )
+    full_context = state["schema_context"]
+    raw_output, sql = _generate_candidate_sql(
+        question=question,
+        schema_context=full_context,
+        field_hint=field_hint,
+        candidate_mode="full",
     )
 
     return {
-        "generation_schema_context": generation_context,
-        "generation_relevant_tables": sorted(
-            infer_relevant_tables(question)
-        ),
         "field_hint": field_hint,
-        "generator_raw_output": generator_raw_output,
-        "initial_sql": sql,
-        "raw_sql": sql,
+        "full_schema_context": full_context,
+        "full_generator_raw_output": raw_output,
+        "full_sql": sql,
+    }
+
+
+def build_robust_schema(
+    state: Text2SQLState,
+) -> dict[str, Any]:
+    """将问题正向链接与SQL1反向链接合并为稳健裁剪Schema。"""
+
+    linking = build_robust_schema_linking(
+        question=state["normalized_question"],
+        preliminary_sql=state.get(
+            "full_sql", ""
+        ),
+    )
+
+    return {
+        "forward_schema_tables": linking[
+            "forward_tables"
+        ],
+        "forward_schema_columns": linking[
+            "forward_columns"
+        ],
+        "backward_schema_tables": linking[
+            "backward_tables"
+        ],
+        "backward_schema_columns": linking[
+            "backward_columns"
+        ],
+        "accepted_backward_tables": linking[
+            "accepted_backward_tables"
+        ],
+        "rejected_backward_tables": linking[
+            "rejected_backward_tables"
+        ],
+        "robust_schema_context": linking[
+            "context"
+        ],
+        "robust_schema_tables": linking[
+            "robust_tables"
+        ],
+        "robust_schema_columns": linking[
+            "robust_columns"
+        ],
+        # 保留V0.5可观测字段兼容性
+        "generation_schema_context": linking[
+            "context"
+        ],
+        "generation_relevant_tables": linking[
+            "robust_tables"
+        ],
+    }
+
+
+def generate_pruned_sql(
+    state: Text2SQLState,
+) -> dict[str, Any]:
+    """使用稳健裁剪Schema生成第二条候选SQL。"""
+
+    question = state["normalized_question"]
+    if validate_question_policy(question) is not None:
+        return {
+            "pruned_generator_raw_output": "",
+            "pruned_sql": "",
+        }
+
+    raw_output, sql = _generate_candidate_sql(
+        question=question,
+        schema_context=state[
+            "robust_schema_context"
+        ],
+        field_hint=state.get(
+            "field_hint", ""
+        ),
+        candidate_mode="pruned",
+    )
+
+    return {
+        "pruned_generator_raw_output": raw_output,
+        "pruned_sql": sql,
+    }
+
+
+def _sql_complexity_metrics(
+    sql: str,
+) -> dict[str, int]:
+    try:
+        tree = sqlglot.parse_one(
+            sql,
+            read="mysql",
+        )
+    except ParseError:
+        return {
+            "joins": 99,
+            "subqueries": 99,
+            "groups": 99,
+            "aggregates": 99,
+            "tables": 99,
+        }
+
+    return {
+        "joins": len(
+            list(tree.find_all(exp.Join))
+        ),
+        "subqueries": len(
+            list(tree.find_all(exp.Subquery))
+        ),
+        "groups": len(
+            list(tree.find_all(exp.Group))
+        ),
+        "aggregates": len(
+            list(tree.find_all(exp.AggFunc))
+        ),
+        "tables": len(
+            list(tree.find_all(exp.Table))
+        ),
+    }
+
+
+def _canonical_sql(sql: str) -> str:
+    try:
+        return sqlglot.parse_one(
+            sql,
+            read="mysql",
+        ).sql(dialect="mysql")
+    except ParseError:
+        return sql.strip()
+
+
+def _evaluate_candidate(
+    label: str,
+    sql: str,
+    question: str,
+    query_spec: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    settings = get_settings()
+    result = validate_and_normalize_sql(
+        sql=sql,
+        allowed_tables=set(
+            settings.allowed_tables
+        ),
+        max_rows=settings.SQL_MAX_ROWS,
+        question=question,
+        query_spec=query_spec,
+    )
+
+    if not result.valid:
+        severity = {
+            "policy": 1000.0,
+            "generation": 220.0,
+            "syntax": 200.0,
+            "schema": 150.0,
+            "semantic": 120.0,
+            "resource": 100.0,
+        }.get(result.error_type, 130.0)
+        error_lines = max(
+            1,
+            result.error.count("\n") + 1,
+        )
+        return {
+            "label": label,
+            "valid": False,
+            "normalized_sql": "",
+            "error": result.error,
+            "error_type": result.error_type,
+            "repairable": result.repairable,
+            "score": -severity - error_lines,
+            "covered": False,
+            "coverage_reason": "",
+            "tables": [],
+            "columns": [],
+            "metrics": _sql_complexity_metrics(sql),
+        }
+
+    normalized_sql = result.sql
+    covered, coverage_reason = (
+        assess_deterministic_semantic_coverage(
+            question=question,
+            sql=normalized_sql,
+        )
+    )
+    used_tables, used_columns = (
+        extract_sql_schema_elements(
+            normalized_sql
+        )
+    )
+    expected_tables = infer_relevant_tables(
+        question
+    )
+    metrics = _sql_complexity_metrics(
+        normalized_sql
+    )
+
+    score = 100.0
+    if covered:
+        score += 15.0
+
+    if expected_tables:
+        if used_tables == expected_tables:
+            score += 10.0
+        elif expected_tables.issubset(
+            used_tables
+        ):
+            score += 4.0
+        else:
+            score -= 12.0 * len(
+                expected_tables - used_tables
+            )
+        score -= 5.0 * len(
+            used_tables - expected_tables
+        )
+
+    score -= 1.5 * metrics["joins"]
+    score -= 3.0 * metrics["subqueries"]
+    score -= 0.5 * metrics["groups"]
+    score -= 0.25 * metrics["aggregates"]
+
+    # 分数完全相同时，稳健裁剪候选作为轻微、可解释的tie-break。
+    if label == "pruned":
+        score += 0.1
+
+    return {
+        "label": label,
+        "valid": True,
+        "normalized_sql": normalized_sql,
+        "error": "",
+        "error_type": "",
+        "repairable": True,
+        "score": round(score, 3),
+        "covered": covered,
+        "coverage_reason": coverage_reason,
+        "tables": sorted(used_tables),
+        "columns": sorted(used_columns),
+        "metrics": metrics,
+    }
+
+
+def select_sql_candidate(
+    state: Text2SQLState,
+) -> dict[str, Any]:
+    """先用Guard淘汰，再用确定性覆盖与复杂度选择候选。"""
+
+    question = state["normalized_question"]
+    full_eval = _evaluate_candidate(
+        label="full",
+        sql=state.get("full_sql", ""),
+        question=question,
+        query_spec=state.get("query_spec"),
+    )
+    pruned_eval = _evaluate_candidate(
+        label="pruned",
+        sql=state.get("pruned_sql", ""),
+        question=question,
+        query_spec=state.get("query_spec"),
+    )
+
+    if full_eval["valid"] and not pruned_eval["valid"]:
+        selected = full_eval
+        reason = "仅完整Schema候选通过确定性Guard。"
+    elif pruned_eval["valid"] and not full_eval["valid"]:
+        selected = pruned_eval
+        reason = "仅稳健裁剪Schema候选通过确定性Guard。"
+    elif full_eval["valid"] and pruned_eval["valid"]:
+        if _canonical_sql(
+            full_eval["normalized_sql"]
+        ) == _canonical_sql(
+            pruned_eval["normalized_sql"]
+        ):
+            selected = pruned_eval
+            reason = (
+                "两个候选规范化后等价，选择稳健裁剪Schema候选。"
+            )
+        elif (
+            full_eval["score"]
+            > pruned_eval["score"]
+        ):
+            selected = full_eval
+            reason = (
+                "两个候选均通过Guard，完整Schema候选的"
+                "确定性覆盖与结构评分更高。"
+            )
+        else:
+            selected = pruned_eval
+            reason = (
+                "两个候选均通过Guard，稳健裁剪Schema候选的"
+                "确定性覆盖与结构评分更高或并列。"
+            )
+    else:
+        # 两条都失败时，只选择错误风险较低的一条进入既有一次修复。
+        if full_eval["score"] > pruned_eval["score"]:
+            selected = full_eval
+        else:
+            selected = pruned_eval
+        reason = (
+            "两个候选均未通过Guard，选择错误严重度较低的候选"
+            "进入现有一次修复链路。"
+        )
+
+    selected_label = selected["label"]
+    selected_original_sql = (
+        state.get("full_sql", "")
+        if selected_label == "full"
+        else state.get("pruned_sql", "")
+    )
+    selected_sql = (
+        selected["normalized_sql"]
+        if selected["valid"]
+        else selected_original_sql
+    )
+
+    return {
+        "candidate_full_valid": full_eval["valid"],
+        "candidate_full_normalized_sql": full_eval[
+            "normalized_sql"
+        ],
+        "candidate_full_error": full_eval["error"],
+        "candidate_full_error_type": full_eval[
+            "error_type"
+        ],
+        "candidate_full_score": full_eval["score"],
+        "candidate_pruned_valid": pruned_eval["valid"],
+        "candidate_pruned_normalized_sql": pruned_eval[
+            "normalized_sql"
+        ],
+        "candidate_pruned_error": pruned_eval["error"],
+        "candidate_pruned_error_type": pruned_eval[
+            "error_type"
+        ],
+        "candidate_pruned_score": pruned_eval["score"],
+        "selected_candidate": selected_label,
+        "candidate_selection_reason": reason,
+        "generator_raw_output": (
+            state.get("full_generator_raw_output", "")
+            if selected_label == "full"
+            else state.get("pruned_generator_raw_output", "")
+        ),
+        "initial_sql": selected_sql,
+        "raw_sql": selected_sql,
         "validated_sql": "",
         "validation_error": "",
+        "validation_repairable": True,
+        "validation_error_type": "",
         "review_called": False,
         "review_passed": False,
         "review_reason": "",
@@ -307,6 +757,7 @@ def generate_sql(
         "review_input_summary": "",
         "execution_error": "",
     }
+
 
 
 def validate_sql(
@@ -321,6 +772,7 @@ def validate_sql(
         ),
         max_rows=settings.SQL_MAX_ROWS,
         question=state["normalized_question"],
+        query_spec=state.get("query_spec"),
     )
 
     if not result.valid:
@@ -352,6 +804,7 @@ def review_sql(
                 "normalized_question"
             ],
             sql=state["validated_sql"],
+            query_spec=state.get("query_spec"),
         )
     )
 
@@ -512,6 +965,8 @@ def build_explicit_repair_action(
         "只修复错误原因中明确指出的问题，"
         "使用正确字段所属的最少必要表，"
         "不要增加用户未要求的过滤、字段或数据表。"
+        "科学计数法必须作为一个完整数值保留，"
+        "不得把指数部分解释成LIMIT或其他条件。"
     )
 
 
@@ -547,7 +1002,8 @@ def repair_sql(
     )
     question = state["normalized_question"]
     compact_context = (
-        build_compact_sql_context(
+        state.get("robust_schema_context")
+        or build_compact_sql_context(
             question
         )
     )
@@ -566,7 +1022,9 @@ def repair_sql(
 必须使用真实表名、真实字段和最少必要表。
 不得用AS别名伪装错误字段。
 普通样本级Top-K返回sample_id，直接使用目标字段ORDER BY和LIMIT，不使用MAX、GROUP BY或IN子查询。
-只有时序峰值才使用MAX并按sample_id分组，且不得固定point_index。
+标准时序查询必须区分“样本内聚合”和“聚合结果排名”：峰值使用MAX，平均值使用AVG，均按sample_id分组；“峰值最低”仍是MAX后ASC排序。
+最终值表示每个样本最大point_index对应的记录，不能用MIN或MAX(目标值)替代。
+指定样本的point_index明细查询直接使用sample_id和point_index条件，不使用聚合。
 用户明确指定样本编号时，必须使用对应sample_id等值或IN过滤，禁止LIKE。
 用户没有指定样本编号时，禁止保留或新增任何固定sample_id过滤。
 """.strip()
@@ -603,6 +1061,11 @@ def repair_sql(
     return {
         "raw_sql": repaired_sql,
         "validated_sql": "",
+        "selected_candidate": "repair",
+        "candidate_selection_reason": (
+            state.get("candidate_selection_reason", "")
+            + " 修复器基于已选候选重写SQL。"
+        ).strip(),
         "retry_count": next_retry_count,
         "last_repair_reason": (
             f"{source}: {reason}"

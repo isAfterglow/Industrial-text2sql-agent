@@ -6,12 +6,16 @@ from sqlglot import exp
 from sqlglot.errors import ParseError
 
 from app.schema import (
+    compile_query_spec_sql,
     extract_requested_sample_ids,
     get_column_owner_map,
     get_schema_catalog,
     infer_explicit_full_table_request,
     infer_question_ranking_column,
     infer_requested_output_columns,
+    extract_numeric_literals,
+    normalize_numeric_literal,
+    is_strict_projection_request,
     match_question_semantic_columns,
     remove_requested_sample_mentions,
 )
@@ -414,15 +418,15 @@ def validate_question_field_semantics(
                 question
             )
         )
-        allowed_selected = set(
-            requested_outputs
-        ) | {"sample_id"}
-
-        # 排名字段即使未明确要求展示，返回它也不属于无关字段。
-        if ranking_info is not None:
-            allowed_selected.add(
-                ranking_info[0]
-            )
+        strict_projection = is_strict_projection_request(
+            question
+        )
+        allowed_selected = set(requested_outputs)
+        if not strict_projection:
+            allowed_selected.add("sample_id")
+            # 非严格投影时，排名字段可作为解释性结果返回。
+            if ranking_info is not None:
+                allowed_selected.add(ranking_info[0])
 
         unrelated_selected = (
             selected_columns
@@ -635,84 +639,124 @@ def extract_requested_limit(
 
 def _question_numbers_without_sample_id(
     question: str,
-) -> set[str]:
-    """提取业务数值，但排除明确的样本编号。
+) -> dict[str, str]:
+    """提取业务数值并排除样本编号。
 
-    样本编号解析与Schema提示、sample_id过滤检查共用
-    同一套规则，避免不同模块对“样本305”理解不一致。
+    返回“规范值 -> 原始写法”，科学计数法保持为单个数值。
     """
 
-    cleaned = remove_requested_sample_mentions(
-        question
-    )
-
-    return {
-        number.lstrip("+")
-        for number in re.findall(
-            r"(?<![A-Za-z_])[-+]?\d+(?:\.\d+)?",
-            cleaned,
+    cleaned = remove_requested_sample_mentions(question)
+    result: dict[str, str] = {}
+    for raw in extract_numeric_literals(cleaned):
+        result.setdefault(
+            normalize_numeric_literal(raw),
+            raw,
         )
-    }
+    return result
 
+
+def _query_spec_expected_numbers(
+    query_spec: dict | None,
+) -> dict[str, str]:
+    """从可信QuerySpec读取期望数值，避免再次猜测自然语言。"""
+
+    if not query_spec or not query_spec.get("eligible"):
+        return {}
+
+    expected: dict[str, str] = {}
+    for item in query_spec.get("filters", []):
+        for key in ("value", "value2"):
+            value = item.get(key)
+            if value is None:
+                continue
+            expected.setdefault(
+                normalize_numeric_literal(value),
+                str(value),
+            )
+
+    limit = query_spec.get("limit")
+    if isinstance(limit, int) and limit > 0:
+        expected.setdefault(
+            normalize_numeric_literal(limit),
+            str(limit),
+        )
+    return expected
+
+
+def _sql_clause_numeric_values(
+    tree: exp.Select,
+    include_limit: bool,
+) -> dict[str, str]:
+    """从WHERE/HAVING及可选LIMIT提取SQL数值。"""
+
+    actual: dict[str, str] = {}
+    clause_names = ["where", "having"]
+    if include_limit:
+        clause_names.append("limit")
+
+    for clause_name in clause_names:
+        clause = tree.args.get(clause_name)
+        if clause is None:
+            continue
+
+        for literal in clause.find_all(exp.Literal):
+            if not literal.is_number:
+                continue
+            raw = str(literal.this)
+            parent = literal.parent
+            if isinstance(parent, exp.Neg) and parent.this is literal:
+                raw = "-" + raw
+            canonical = normalize_numeric_literal(raw)
+            actual.setdefault(canonical, raw)
+
+    return actual
 
 
 def validate_question_numeric_values(
     tree: exp.Select,
     question: str,
+    query_spec: dict | None = None,
 ) -> list[str]:
-    """检查SQL条件和LIMIT中的数值是否来自用户问题。"""
+    """检查SQL条件和用户明确LIMIT中的数值一致性。
 
-    expected_numbers = (
-        _question_numbers_without_sample_id(
-            question
-        )
-    )
+    优先使用可信QuerySpec；否则使用统一科学计数法解析器。
+    """
 
-    if not expected_numbers:
+    expected = _query_spec_expected_numbers(query_spec)
+    if not expected:
+        expected = _question_numbers_without_sample_id(question)
+
+    if not expected:
         return []
 
-    actual_numbers: set[str] = set()
+    requested_limit = extract_requested_limit(question)
+    if query_spec and query_spec.get("eligible"):
+        spec_limit = query_spec.get("limit")
+        if isinstance(spec_limit, int) and spec_limit > 0:
+            requested_limit = spec_limit
 
-    clause_names = [
-        "where",
-        "having",
-    ]
-    if extract_requested_limit(question) is not None:
-        clause_names.append("limit")
+    actual = _sql_clause_numeric_values(
+        tree,
+        include_limit=requested_limit is not None,
+    )
 
-    for clause_name in clause_names:
-        clause = tree.args.get(
-            clause_name
-        )
-        if clause is None:
-            continue
-
-        for literal in clause.find_all(
-            exp.Literal
-        ):
-            if literal.is_number:
-                actual_numbers.add(
-                    str(literal.this).lstrip("+")
-                )
-
-    missing = expected_numbers - actual_numbers
+    missing = set(expected) - set(actual)
     if missing:
         return [
             "用户问题中的数值没有完整体现在SQL条件或LIMIT中："
-            + ", ".join(sorted(missing))
+            + ", ".join(expected[value] for value in sorted(missing))
             + "。"
         ]
 
-    unexpected = actual_numbers - expected_numbers
+    unexpected = set(actual) - set(expected)
     if unexpected:
         return [
             "SQL加入了用户问题中未出现的数值条件："
-            + ", ".join(sorted(unexpected))
+            + ", ".join(actual[value] for value in sorted(unexpected))
             + "。"
         ]
 
     return []
-
 
 
 def _normalize_sample_literal(
@@ -950,6 +994,32 @@ def validate_unrequested_predicates(
         ]
 
     return []
+
+
+def validate_unrequested_restrictive_limit(
+    tree: exp.Select,
+    question: str,
+    max_rows: int,
+) -> list[str]:
+    """禁止模型把无数量要求的集合查询擅自缩减为少量记录。
+
+    指定sample_id的查询允许LIMIT 1；系统默认资源上限由Guard最后统一添加。
+    """
+
+    if extract_requested_limit(question) is not None:
+        return []
+    if extract_requested_sample_ids(question):
+        return []
+
+    actual_limit = get_limit_value(tree)
+    if actual_limit is None or actual_limit >= max_rows:
+        return []
+
+    return [
+        "用户没有要求限制返回数量，但SQL擅自加入了"
+        f"LIMIT {actual_limit}，会改变结果集合。请删除该LIMIT，"
+        "由系统统一添加资源保护上限。"
+    ]
 
 def build_table_columns() -> dict[str, set[str]]:
     catalog = get_schema_catalog()
@@ -2059,9 +2129,52 @@ def check_simple_topk_shape(
 
 
 
+
+def validate_query_spec_exact_shape(
+    tree: exp.Select,
+    question: str,
+    query_spec: dict | None,
+) -> list[str]:
+    """对高置信QuerySpec校验确定性编译结构。
+
+    该规则只用于eligible=True的确定性路径，不约束RSL候选。
+    它比较SQL AST而不是匹配完整自然语言或固定测试题。
+    """
+
+    if not query_spec or not query_spec.get("eligible"):
+        return []
+    expected_sql = compile_query_spec_sql(query_spec)
+    if not expected_sql:
+        return ["QuerySpec已标记为确定性，但没有生成期望SQL。"]
+    try:
+        expected = sqlglot.parse_one(expected_sql, read="mysql")
+    except ParseError as exc:
+        return [f"确定性QuerySpec编译结果无法解析：{exc}"]
+    if not isinstance(expected, exp.Select):
+        return ["确定性QuerySpec没有编译为SELECT。"]
+
+    normalize_declared_table_aliases(expected)
+    normalize_redundant_predicates(expected)
+    normalize_common_topk_sql(expected, question)
+
+    actual_tree = tree.copy()
+    # Guard会在用户未指定数量时统一补资源保护LIMIT。
+    # 该LIMIT不属于业务QuerySpec，比较结构时忽略。
+    if query_spec.get("limit") is None:
+        actual_tree.set("limit", None)
+    actual_sql = actual_tree.sql(dialect="mysql", pretty=False)
+    expected_normalized = expected.sql(dialect="mysql", pretty=False)
+    if actual_sql != expected_normalized:
+        return [
+            "SQL与高置信QuerySpec的确定性查询结构不一致。"
+            "请按QuerySpec重新编译，不要增加、删除或改写查询层级。"
+        ]
+    return []
+
 def assess_deterministic_semantic_coverage(
     question: str,
     sql: str,
+    query_spec: dict | None = None,
 ) -> tuple[bool, str]:
     """判断当前SQL是否已被确定性规则充分覆盖。
 
@@ -2078,6 +2191,17 @@ def assess_deterministic_semantic_coverage(
 
     if not isinstance(tree, exp.Select):
         return False, "不是普通SELECT。"
+
+    if query_spec and query_spec.get("eligible"):
+        spec_errors = validate_query_spec_exact_shape(
+            tree, question, query_spec
+        )
+        if spec_errors:
+            return False, spec_errors[0]
+        return True, (
+            "SQL与高置信QuerySpec的确定性编译结构一致，"
+            "无需再次调用LLM语义审查。"
+        )
 
     if len(list(tree.find_all(exp.Select))) != 1:
         return False, "包含子查询或多层SELECT。"
@@ -2339,6 +2463,7 @@ def validate_and_normalize_sql(
     allowed_tables: set[str],
     max_rows: int,
     question: str = "",
+    query_spec: dict | None = None,
 ) -> SQLValidationResult:
     """执行确定性的安全、Schema和基础语义检查。"""
 
@@ -2504,22 +2629,47 @@ def validate_and_normalize_sql(
                 question,
             )
         )
-        errors.extend(
-            validate_question_field_semantics(
-                tree,
-                question,
+        if query_spec and query_spec.get("eligible"):
+            errors.extend(
+                validate_query_spec_exact_shape(
+                    tree, question, query_spec
+                )
             )
-        )
+        else:
+            errors.extend(
+                validate_question_field_semantics(
+                    tree,
+                    question,
+                )
+            )
+            topk_passed, topk_reason = (
+                check_simple_topk_shape(
+                    question=question,
+                    sql=tree.sql(dialect="mysql"),
+                )
+            )
+            if topk_passed is False:
+                errors.append(topk_reason)
+
         errors.extend(
             validate_unrequested_predicates(
                 tree,
                 question,
             )
         )
+        if not (query_spec and query_spec.get("eligible")):
+            errors.extend(
+                validate_unrequested_restrictive_limit(
+                    tree,
+                    question,
+                    max_rows,
+                )
+            )
         errors.extend(
             validate_question_numeric_values(
                 tree,
                 question,
+                query_spec=query_spec,
             )
         )
         errors.extend(
@@ -2528,17 +2678,6 @@ def validate_and_normalize_sql(
                 question,
             )
         )
-
-        topk_passed, topk_reason = (
-            check_simple_topk_shape(
-                question=question,
-                sql=tree.sql(
-                    dialect="mysql"
-                ),
-            )
-        )
-        if topk_passed is False:
-            errors.append(topk_reason)
 
     errors = list(dict.fromkeys(errors))
 

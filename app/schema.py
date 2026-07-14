@@ -1,8 +1,55 @@
 from copy import deepcopy
+from decimal import Decimal, InvalidOperation
 import re
 from typing import Any
 
+import sqlglot
+from sqlglot import exp
+from sqlglot.errors import ParseError
+
 from app.config import get_settings
+
+
+# 统一的数值词法规则。整个项目只使用这一份定义，避免把
+# 2e-12错误拆成2和12，或把9E-14错误拆成9和14。
+NUMERIC_LITERAL_PATTERN = (
+    r"[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))"
+    r"(?:[eE][+-]?\d+)?"
+)
+NUMERIC_LITERAL_RE = re.compile(
+    rf"(?<![A-Za-z0-9_])({NUMERIC_LITERAL_PATTERN})(?![A-Za-z0-9_])"
+)
+
+
+def extract_numeric_literals(text: str) -> list[str]:
+    """按完整数值字面量提取整数、小数和科学计数法。"""
+
+    if not text:
+        return []
+    return [match.group(1) for match in NUMERIC_LITERAL_RE.finditer(text)]
+
+
+def parse_decimal_literal(value: object) -> Decimal | None:
+    """把数值字面量转换为Decimal，格式差异不影响比较。"""
+
+    try:
+        return Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def normalize_numeric_literal(value: object) -> str:
+    """返回适合日志和集合比较的规范数值字符串。"""
+
+    number = parse_decimal_literal(value)
+    if number is None:
+        return str(value).strip()
+    if number == 0:
+        return "0"
+    normalized = number.normalize()
+    if -6 <= normalized.adjusted() <= 20:
+        return format(normalized, "f")
+    return str(normalized)
 
 
 def get_schema_catalog() -> dict[str, Any]:
@@ -470,7 +517,7 @@ def infer_question_ranking_column(
         if (
             direction_match.start()
             - nearest[1]
-            <= 12
+            <= 32
         ):
             return nearest[2], nearest[3]
 
@@ -751,6 +798,1166 @@ def build_generation_schema_context(
     )
 
     return "\n".join(lines)
+
+
+
+
+def is_strict_projection_request(
+    question: str,
+) -> bool:
+    """用户是否明确要求只返回/只显示指定字段。"""
+
+    return bool(
+        re.search(
+            r"只返回|只显示|仅返回|仅显示",
+            question,
+        )
+    )
+
+
+def extract_requested_limit_from_question(
+    question: str,
+) -> int | None:
+    """提取明确的Top-K或最多返回数量。"""
+
+    patterns = (
+        r"(?:最高|最低|最大|最小)(?:的)?\s*(\d+)\s*个",
+        r"前\s*(\d+)\s*(?:个|条)?",
+        r"最多(?:返回)?\s*(\d+)\s*(?:个|条)?",
+        r"(?:限制|limit)\s*(?:为|=)?\s*(\d+)",
+        r"(\d+)\s*个样本",
+    )
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            question,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _ordered_columns_for_table(
+    table_name: str,
+    columns: set[str],
+) -> list[str]:
+    catalog = get_schema_catalog()
+    table_columns = catalog["tables"][table_name]["columns"]
+    ordered = [
+        column
+        for column in table_columns
+        if column in columns
+    ]
+    if "sample_id" in ordered:
+        ordered.remove("sample_id")
+        ordered.insert(0, "sample_id")
+    return ordered
+
+
+def _semantic_term_occurrences(
+    question: str,
+) -> list[tuple[str, str]]:
+    catalog = get_schema_catalog()
+    occurrences: list[tuple[str, str]] = []
+    for column, terms in catalog["semantic_terms"].items():
+        for term in sorted(terms, key=len, reverse=True):
+            if term in question:
+                occurrences.append((column, term))
+    return occurrences
+
+
+def _extract_simple_filters(
+    question: str,
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """提取可确定的单表数值过滤，并返回已消费数字。
+
+    支持整数、小数和科学计数法，例如2e-12、9E-14。
+    """
+
+    filters: list[dict[str, Any]] = []
+    consumed_numbers: set[str] = set()
+    seen: set[tuple[str, str, str, str]] = set()
+
+    comparison_patterns = (
+        (r"大于等于|不小于|至少|不少于", ">="),
+        (r"小于等于|不大于|至多|不超过", "<="),
+        (r"大于|高于|超过", ">"),
+        (r"小于|低于", "<"),
+    )
+
+    number_group = rf"({NUMERIC_LITERAL_PATTERN})"
+
+    for column, term in _semantic_term_occurrences(question):
+        if column == "sample_id":
+            continue
+
+        escaped = re.escape(term)
+        between = re.search(
+            escaped
+            + r"\s*(?:在)?\s*"
+            + number_group
+            + r"\s*(?:到|至|~|～)\s*"
+            + number_group
+            + r"\s*(?:之间)?",
+            question,
+            flags=re.IGNORECASE,
+        )
+        if between:
+            low, high = between.group(1), between.group(2)
+            low_key = normalize_numeric_literal(low)
+            high_key = normalize_numeric_literal(high)
+            key = (column, "BETWEEN", low_key, high_key)
+            if key not in seen:
+                filters.append(
+                    {
+                        "column": column,
+                        "operator": "BETWEEN",
+                        "value": low,
+                        "value2": high,
+                    }
+                )
+                seen.add(key)
+                consumed_numbers.update({low_key, high_key})
+            continue
+
+        matched_comparison = False
+        for operator_pattern, operator in comparison_patterns:
+            match = re.search(
+                escaped
+                + r"\s*(?:为|是)?\s*(?:"
+                + operator_pattern
+                + r")\s*"
+                + number_group,
+                question,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                value = match.group(1)
+                value_key = normalize_numeric_literal(value)
+                key = (column, operator, value_key, "")
+                if key not in seen:
+                    filters.append(
+                        {
+                            "column": column,
+                            "operator": operator,
+                            "value": value,
+                        }
+                    )
+                    seen.add(key)
+                    consumed_numbers.add(value_key)
+                matched_comparison = True
+                break
+
+        if matched_comparison:
+            continue
+
+        equality = re.search(
+            escaped
+            + r"\s*(?:等于|等於|为|是|=)\s*"
+            + number_group,
+            question,
+            flags=re.IGNORECASE,
+        )
+        if equality:
+            value = equality.group(1)
+            value_key = normalize_numeric_literal(value)
+            key = (column, "=", value_key, "")
+            if key not in seen:
+                filters.append(
+                    {
+                        "column": column,
+                        "operator": "=",
+                        "value": value,
+                    }
+                )
+                seen.add(key)
+                consumed_numbers.add(value_key)
+
+    return filters, consumed_numbers
+
+
+def _response_table_info() -> tuple[str, dict[str, Any]]:
+    """返回时序响应表名及其Schema信息。"""
+
+    catalog = get_schema_catalog()
+    for table_name, info in catalog["tables"].items():
+        if info["grain"] == "many_rows_per_sample":
+            return table_name, info
+    raise ValueError("Schema中没有many_rows_per_sample时序表。")
+
+
+def _ranking_direction(question: str) -> str | None:
+    """提取结果排名或显式排序方向。"""
+
+    if re.search(r"最低|最小|升序|从低到高", question):
+        return "ASC"
+    if re.search(r"最高|最大|降序|从高到低", question):
+        return "DESC"
+    return None
+
+
+def _metric_alias(column: str, aggregation: str) -> str:
+    prefixes = {
+        "MAX": "peak",
+        "AVG": "avg",
+        "MIN": "min",
+        "SUM": "sum",
+        "FINAL": "final",
+    }
+    return f"{prefixes[aggregation]}_{column}"
+
+
+def _near_term(
+    question: str,
+    term: str,
+    pattern: str,
+    radius: int = 14,
+) -> bool:
+    """判断聚合/时点词是否出现在字段术语附近。"""
+
+    start = 0
+    while True:
+        position = question.find(term, start)
+        if position < 0:
+            return False
+        left = max(0, position - radius)
+        right = min(len(question), position + len(term) + radius)
+        if re.search(pattern, question[left:right]):
+            return True
+        start = position + 1
+
+
+def _infer_temporal_metrics(
+    question: str,
+) -> list[dict[str, str]]:
+    """识别标准时序指标及其聚合角色。
+
+    对每个字段选择距离最近的聚合/时点词，避免
+    “峰值背面温度和最终质量”把背温误判为FINAL。
+    """
+
+    _, response_info = _response_table_info()
+    matches = match_question_semantic_columns(question)
+    catalog = get_schema_catalog()
+    cue_patterns = (
+        ("FINAL", r"最终|最后(?:一个)?(?:点|时刻)?|末时刻|终点"),
+        ("AVG", r"平均|均值"),
+        ("MAX", r"峰值|最大值|最大质量|最高值"),
+        ("MIN", r"最小值|最低值"),
+    )
+    metrics: list[dict[str, str]] = []
+
+    for column in response_info["columns"]:
+        if column in {"sample_id", "point_index"} or column not in matches:
+            continue
+
+        best: tuple[int, int, str] | None = None
+        for term in catalog["semantic_terms"].get(column, []):
+            start = 0
+            while True:
+                position = question.find(term, start)
+                if position < 0:
+                    break
+                term_start = position
+                term_end = position + len(term)
+                clause_left = max(
+                    question.rfind("，", 0, term_start),
+                    question.rfind("。", 0, term_start),
+                    question.rfind("？", 0, term_start),
+                    question.rfind("；", 0, term_start),
+                    -1,
+                ) + 1
+                clause_end_candidates = [
+                    value for value in (
+                        question.find("，", term_end),
+                        question.find("。", term_end),
+                        question.find("？", term_end),
+                        question.find("；", term_end),
+                    ) if value >= 0
+                ]
+                clause_right = min(clause_end_candidates) if clause_end_candidates else len(question)
+                clause = question[clause_left:clause_right]
+                offset = clause_left
+
+                for priority, (aggregation, pattern) in enumerate(cue_patterns):
+                    for cue in re.finditer(pattern, clause):
+                        cue_start = offset + cue.start()
+                        cue_end = offset + cue.end()
+                        if cue_end <= term_start:
+                            distance = term_start - cue_end
+                        elif cue_start >= term_end:
+                            distance = cue_start - term_end
+                        else:
+                            distance = 0
+                        # 超过12个字符通常已属于另一个字段短语。
+                        if distance > 12:
+                            continue
+                        candidate = (distance, priority, aggregation)
+                        if best is None or candidate < best:
+                            best = candidate
+                start = position + 1
+
+        aggregation = best[2] if best is not None else None
+        if aggregation is None and re.search(r"每个样本", question):
+            if re.search(r"平均|均值", question):
+                aggregation = "AVG"
+            elif re.search(r"峰值|最大值|最大质量", question):
+                aggregation = "MAX"
+            elif re.search(r"最小值", question):
+                aggregation = "MIN"
+
+        if aggregation is not None:
+            metrics.append(
+                {
+                    "column": column,
+                    "aggregation": aggregation,
+                    "alias": _metric_alias(column, aggregation),
+                }
+            )
+
+    unique: dict[tuple[str, str], dict[str, str]] = {}
+    for metric in metrics:
+        unique[(metric["column"], metric["aggregation"])] = metric
+    return list(unique.values())
+
+def _all_question_numbers_consumed(
+    question: str,
+    consumed_numbers: set[str],
+    limit: int | None,
+) -> bool:
+    cleaned = remove_requested_sample_mentions(question)
+    all_numbers = {
+        normalize_numeric_literal(value)
+        for value in extract_numeric_literals(cleaned)
+    }
+    consumed = {
+        normalize_numeric_literal(value)
+        for value in consumed_numbers
+    }
+    if limit is not None:
+        consumed.add(normalize_numeric_literal(limit))
+    return not (all_numbers - consumed)
+
+
+def _build_temporal_query_spec(
+    question: str,
+    matches: dict[str, list[str]],
+    requested_outputs: set[str],
+    ranking: tuple[str, str] | None,
+    sample_ids: list[str],
+    strict_projection: bool,
+    filters: list[dict[str, Any]],
+    consumed_numbers: set[str],
+    limit: int | None,
+) -> dict[str, Any] | None:
+    """构建标准时序查询计划。
+
+    支持：
+    1. 指定样本的point_index明细/区间/前N点；
+    2. 每样本MAX/AVG/MIN后Top-K；
+    3. 样本级标量字段排名并返回时序聚合；
+    4. 最终point_index对应值；
+    5. 标量WHERE与时序聚合HAVING的组合。
+    """
+
+    catalog = get_schema_catalog()
+    owners = get_column_owner_map()
+    response_table, response_info = _response_table_info()
+    response_columns = set(response_info["columns"])
+    response_value_columns = response_columns - {"sample_id", "point_index"}
+    metrics = _infer_temporal_metrics(question)
+    metric_by_column = {
+        metric["column"]: metric
+        for metric in metrics
+    }
+
+    matched_columns = set(matches)
+    mentioned_response = matched_columns & response_columns
+    has_point_language = bool(
+        re.search(r"point_index|序列点|点位|前\s*\d+\s*个序列点", question, re.I)
+    )
+
+    # A. 指定样本的时序明细切片。
+    if sample_ids and mentioned_response and not metrics:
+        unsupported = matched_columns - response_columns
+        if unsupported:
+            return None
+
+        point_filters = [
+            item for item in filters
+            if item["column"] == "point_index"
+        ]
+        non_point_filters = [
+            item for item in filters
+            if item["column"] != "point_index"
+        ]
+        if non_point_filters:
+            return None
+
+        first_n_points = bool(
+            re.search(r"前\s*\d+\s*个(?:序列点|点位|点)", question)
+        )
+        if not point_filters and not first_n_points and not has_point_language:
+            return None
+        if not _all_question_numbers_consumed(
+            question, consumed_numbers, limit
+        ):
+            return None
+
+        if requested_outputs:
+            selected = set(requested_outputs) & response_columns
+        else:
+            selected = set(mentioned_response)
+        if not strict_projection:
+            selected.update({"sample_id", "point_index"})
+        elif "point_index" in requested_outputs:
+            selected.add("point_index")
+
+        selected -= set(metric_by_column)
+        if not selected:
+            return None
+
+        return {
+            "eligible": True,
+            "mode": "deterministic",
+            "query_type": "response_detail",
+            "table": response_table,
+            "select_columns": _ordered_columns_for_table(response_table, selected),
+            "filters": point_filters,
+            "where_filters": point_filters,
+            "having_filters": [],
+            "order_by": {
+                "kind": "column",
+                "column": "point_index",
+                "direction": "DESC" if re.search(r"point_index.{0,12}降序", question, re.I) else "ASC",
+            },
+            "limit": limit if first_n_points else None,
+            "sample_ids": sample_ids,
+            "strict_projection": strict_projection,
+            "temporal_metrics": [],
+            "scalar_columns": [],
+            "scalar_tables": [],
+            "confidence": 1.0,
+            "reason": "指定样本、响应字段、point_index条件和排序均可确定，使用时序明细快路径。",
+        }
+
+    # B. 每样本时序聚合及跨表样本级排名。
+    if not metrics:
+        return None
+
+    if re.search(r"占比|比例|中位数|方差|标准差|变化率", question):
+        return None
+
+    ranking_column = ranking[0] if ranking is not None else None
+    ranking_direction = _ranking_direction(question)
+    if limit is not None and (ranking_column is None or ranking_direction is None):
+        return None
+
+    business_columns = matched_columns - {"sample_id", "point_index"}
+    scalar_columns = business_columns - response_value_columns
+    scalar_columns.update(requested_outputs - response_columns - {"sample_id", "point_index"})
+    if ranking_column and ranking_column not in response_columns:
+        scalar_columns.add(ranking_column)
+
+    scalar_tables: set[str] = set()
+    for column in scalar_columns:
+        column_owners = owners.get(column, set())
+        if len(column_owners) != 1:
+            return None
+        owner = next(iter(column_owners))
+        if catalog["tables"][owner]["grain"] != "one_row_per_sample":
+            return None
+        scalar_tables.add(owner)
+
+    where_filters: list[dict[str, Any]] = []
+    having_filters: list[dict[str, Any]] = []
+    for item in filters:
+        column = item["column"]
+        if column in metric_by_column:
+            having_filters.append(item)
+        elif column in response_value_columns:
+            # 原始时序行过滤与“每样本聚合”语义容易混淆，保守回退。
+            return None
+        else:
+            where_filters.append(item)
+
+    if not _all_question_numbers_consumed(question, consumed_numbers, limit):
+        return None
+
+    selected_scalar: set[str] = set()
+    if requested_outputs:
+        selected_scalar.update(requested_outputs - response_columns - {"sample_id", "point_index"})
+    if ranking_column and ranking_column not in response_columns and not strict_projection:
+        selected_scalar.add(ranking_column)
+
+    metric_columns = {metric["column"] for metric in metrics}
+    selected_metrics = [
+        metric for metric in metrics
+        if (
+            not requested_outputs
+            or metric["column"] in requested_outputs
+            or metric["column"] == ranking_column
+            or not strict_projection
+        )
+    ]
+    if not selected_metrics:
+        selected_metrics = metrics
+
+    ranking_spec: dict[str, str] | None = None
+    if ranking_column is not None and ranking_direction is not None:
+        if ranking_column in metric_by_column:
+            ranking_spec = {
+                "kind": "metric",
+                "column": ranking_column,
+                "alias": metric_by_column[ranking_column]["alias"],
+                "direction": ranking_direction,
+            }
+        elif ranking_column in scalar_columns:
+            ranking_spec = {
+                "kind": "scalar",
+                "column": ranking_column,
+                "direction": ranking_direction,
+            }
+        else:
+            return None
+
+    return {
+        "eligible": True,
+        "mode": "deterministic",
+        "query_type": "per_sample_temporal_aggregate",
+        "table": response_table,
+        "select_columns": ["sample_id"],
+        "filters": filters,
+        "where_filters": where_filters,
+        "having_filters": having_filters,
+        "order_by": ranking_spec,
+        "limit": limit,
+        "sample_ids": sample_ids,
+        "strict_projection": strict_projection,
+        "temporal_metrics": selected_metrics,
+        "all_temporal_metrics": metrics,
+        "scalar_columns": sorted(selected_scalar),
+        "scalar_tables": sorted(scalar_tables),
+        "confidence": 1.0,
+        "reason": "时序字段的聚合角色、样本分组、排名字段和方向均可确定，使用标准时序查询快路径。",
+    }
+
+
+def build_query_spec(
+    question: str,
+) -> dict[str, Any]:
+    """构造静态与标准时序查询的结构化中间表示。"""
+
+    catalog = get_schema_catalog()
+    owners = get_column_owner_map()
+    matches = match_question_semantic_columns(question)
+    requested_outputs = infer_requested_output_columns(question)
+    ranking = infer_question_ranking_column(question)
+    sample_ids = sorted(extract_requested_sample_ids(question))
+    explicit_full_table = infer_explicit_full_table_request(question)
+    strict_projection = is_strict_projection_request(question)
+    filters, consumed_numbers = _extract_simple_filters(question)
+    limit = extract_requested_limit_from_question(question)
+
+    result: dict[str, Any] = {
+        "eligible": False,
+        "mode": "rsl",
+        "query_type": "complex_or_uncertain",
+        "table": "",
+        "select_columns": [],
+        "filters": filters,
+        "where_filters": filters,
+        "having_filters": [],
+        "order_by": None,
+        "limit": limit,
+        "sample_ids": sample_ids,
+        "strict_projection": strict_projection,
+        "temporal_metrics": [],
+        "scalar_columns": [],
+        "scalar_tables": [],
+        "confidence": 0.0,
+        "reason": "问题包含尚未结构化的多表、聚合、时序或模糊语义。",
+    }
+
+    if explicit_full_table is not None:
+        columns = set(catalog["tables"][explicit_full_table]["columns"])
+        result.update(
+            {
+                "eligible": True,
+                "mode": "deterministic",
+                "query_type": "full_table",
+                "table": explicit_full_table,
+                "select_columns": _ordered_columns_for_table(explicit_full_table, columns),
+                "confidence": 1.0,
+                "reason": "用户明确点名白名单表并请求全部数据。",
+            }
+        )
+        return result
+
+    temporal = _build_temporal_query_spec(
+        question=question,
+        matches=matches,
+        requested_outputs=requested_outputs,
+        ranking=ranking,
+        sample_ids=sample_ids,
+        strict_projection=strict_projection,
+        filters=filters,
+        consumed_numbers=consumed_numbers,
+        limit=limit,
+    )
+    if temporal is not None:
+        return temporal
+
+    # 其他明确复杂算子继续交给RSL。
+    if re.search(r"峰值|平均|均值|每个样本|分组|占比|比例|最终|最后一个点", question):
+        return result
+
+    response_columns = {
+        column
+        for table_name, info in catalog["tables"].items()
+        if info["grain"] == "many_rows_per_sample"
+        for column in info["columns"]
+    } - {"sample_id"}
+    if set(matches) & response_columns:
+        return result
+
+    business_columns = set(matches) - {"sample_id"}
+    business_columns.update(requested_outputs - {"sample_id"})
+    business_columns.update(item["column"] for item in filters)
+    if ranking is not None:
+        business_columns.add(ranking[0])
+
+    candidate_tables: set[str] = set()
+    for column in business_columns:
+        candidate_tables.update(owners.get(column, set()))
+
+    if len(candidate_tables) != 1:
+        return result
+
+    table_name = next(iter(candidate_tables))
+    if catalog["tables"][table_name]["grain"] != "one_row_per_sample":
+        return result
+
+    query_type = "single_table_filter"
+    order_by: dict[str, str] | None = None
+    if ranking is not None and limit is not None:
+        query_type = "single_table_topk"
+        direction = "DESC" if re.search(r"最高|最大|降序|从高到低", question) else "ASC"
+        order_by = {"kind": "column", "column": ranking[0], "direction": direction}
+    elif ranking is not None or re.search(r"最高|最低|最大|最小|前\s*\d+", question):
+        return result
+    elif sample_ids:
+        query_type = "exact_sample"
+
+    if not filters and not sample_ids and query_type != "single_table_topk":
+        return result
+
+    if not _all_question_numbers_consumed(question, consumed_numbers, limit):
+        return result
+
+    if requested_outputs:
+        selected = set(requested_outputs)
+    elif query_type == "single_table_topk" and ranking is not None:
+        selected = {"sample_id", ranking[0]}
+    elif query_type == "exact_sample":
+        selected = {"sample_id"} | business_columns
+    else:
+        selected = {"sample_id"} | business_columns
+
+    if not strict_projection:
+        selected.add("sample_id")
+    if not selected:
+        return result
+    if any(
+        column != "sample_id" and table_name not in owners.get(column, set())
+        for column in selected
+    ):
+        return result
+
+    result.update(
+        {
+            "eligible": True,
+            "mode": "deterministic",
+            "query_type": query_type,
+            "table": table_name,
+            "select_columns": _ordered_columns_for_table(table_name, selected),
+            "order_by": order_by,
+            "confidence": 1.0,
+            "reason": "字段归属、单表粒度、过滤、排序和数量均可确定，使用基础查询确定性快路径。",
+        }
+    )
+    return result
+
+
+def _qualified_column(column: str, table_name: str) -> str:
+    alias = get_schema_catalog()["tables"][table_name]["alias"]
+    return f"{alias}.{column}"
+
+
+def _column_owner(column: str) -> str:
+    owners = get_column_owner_map().get(column, set())
+    if len(owners) != 1:
+        raise ValueError(f"字段{column}没有唯一所属表。")
+    return next(iter(owners))
+
+
+def _compile_predicate(
+    item: dict[str, Any],
+    column_sql: str,
+) -> str:
+    operator = item["operator"]
+    if operator == "BETWEEN":
+        return f"{column_sql} BETWEEN {item['value']} AND {item['value2']}"
+    return f"{column_sql} {operator} {item['value']}"
+
+
+def _final_metrics_subquery(
+    response_table: str,
+    metrics: list[dict[str, str]],
+) -> str:
+    projections = ["final_row.sample_id"]
+    for metric in metrics:
+        projections.append(
+            f"final_row.{metric['column']} AS {metric['alias']}"
+        )
+    return (
+        "SELECT " + ", ".join(projections) + " "
+        f"FROM {response_table} AS final_row "
+        "JOIN ("
+        f"SELECT sample_id, MAX(point_index) AS max_point_index FROM {response_table} GROUP BY sample_id"
+        ") AS final_idx ON final_row.sample_id = final_idx.sample_id "
+        "AND final_row.point_index = final_idx.max_point_index"
+    )
+
+
+def compile_query_spec_sql(
+    query_spec: dict[str, Any],
+) -> str:
+    """把可信静态或时序QuerySpec确定性编译为MySQL SELECT。"""
+
+    if not query_spec.get("eligible"):
+        return ""
+
+    catalog = get_schema_catalog()
+    query_type = query_spec.get("query_type")
+
+    if query_type == "response_detail":
+        table_name = str(query_spec["table"])
+        alias = catalog["tables"][table_name]["alias"]
+        select_sql = ", ".join(
+            f"{alias}.{column}" for column in query_spec["select_columns"]
+        )
+        parts = [f"SELECT {select_sql}", f"FROM {table_name} AS {alias}"]
+        predicates: list[str] = []
+        sample_ids = list(query_spec.get("sample_ids", []))
+        if len(sample_ids) == 1:
+            predicates.append(f"{alias}.sample_id = '{sample_ids[0]}'")
+        elif sample_ids:
+            values = ", ".join(f"'{value}'" for value in sample_ids)
+            predicates.append(f"{alias}.sample_id IN ({values})")
+        for item in query_spec.get("where_filters", []):
+            predicates.append(_compile_predicate(item, f"{alias}.{item['column']}"))
+        if predicates:
+            parts.append("WHERE " + " AND ".join(predicates))
+        order_by = query_spec.get("order_by")
+        if order_by:
+            parts.append(
+                f"ORDER BY {alias}.{order_by['column']} {order_by['direction']}"
+            )
+        limit = query_spec.get("limit")
+        if isinstance(limit, int) and limit > 0:
+            parts.append(f"LIMIT {limit}")
+        return " ".join(parts)
+
+    if query_type == "per_sample_temporal_aggregate":
+        response_table = str(query_spec["table"])
+        scalar_tables = list(query_spec.get("scalar_tables", []))
+        scalar_columns = list(query_spec.get("scalar_columns", []))
+        metrics = list(query_spec.get("temporal_metrics", []))
+        all_metrics = list(query_spec.get("all_temporal_metrics", metrics))
+        final_metrics = [item for item in all_metrics if item["aggregation"] == "FINAL"]
+        row_metrics = [item for item in all_metrics if item["aggregation"] != "FINAL"]
+        selected_keys = {(item["column"], item["aggregation"]) for item in metrics}
+
+        final_ref = {
+            item["column"]: f"fv.{item['alias']}"
+            for item in final_metrics
+        }
+        if row_metrics:
+            base_sample = "tr.sample_id"
+            from_part = f"FROM {response_table} AS tr"
+        elif final_metrics:
+            base_sample = "fv.sample_id"
+            from_part = f"FROM ({_final_metrics_subquery(response_table, final_metrics)}) AS fv"
+        else:
+            return ""
+
+        join_parts: list[str] = []
+        if row_metrics and final_metrics:
+            join_parts.append(
+                f"JOIN ({_final_metrics_subquery(response_table, final_metrics)}) AS fv "
+                "ON tr.sample_id = fv.sample_id"
+            )
+        for table_name in scalar_tables:
+            alias = catalog["tables"][table_name]["alias"]
+            join_parts.append(
+                f"JOIN {table_name} AS {alias} ON {base_sample} = {alias}.sample_id"
+            )
+
+        select_parts = [base_sample]
+        group_parts = [base_sample]
+        for column in scalar_columns:
+            owner = _column_owner(column)
+            expression = _qualified_column(column, owner)
+            select_parts.append(expression)
+            group_parts.append(expression)
+
+        for metric in all_metrics:
+            if (metric["column"], metric["aggregation"]) not in selected_keys:
+                continue
+            if metric["aggregation"] == "FINAL":
+                expression = final_ref[metric["column"]]
+                select_parts.append(f"{expression} AS {metric['alias']}")
+                if row_metrics:
+                    group_parts.append(expression)
+            else:
+                select_parts.append(
+                    f"{metric['aggregation']}(tr.{metric['column']}) AS {metric['alias']}"
+                )
+
+        parts = ["SELECT " + ", ".join(select_parts), from_part]
+        parts.extend(join_parts)
+
+        where_predicates: list[str] = []
+        sample_ids = list(query_spec.get("sample_ids", []))
+        if len(sample_ids) == 1:
+            where_predicates.append(f"{base_sample} = '{sample_ids[0]}'")
+        elif sample_ids:
+            values = ", ".join(f"'{value}'" for value in sample_ids)
+            where_predicates.append(f"{base_sample} IN ({values})")
+        for item in query_spec.get("where_filters", []):
+            owner = _column_owner(item["column"])
+            where_predicates.append(
+                _compile_predicate(item, _qualified_column(item["column"], owner))
+            )
+        # FINAL指标的条件属于最终值派生表，不是HAVING。
+        metric_lookup = {item["column"]: item for item in all_metrics}
+        for item in query_spec.get("having_filters", []):
+            metric = metric_lookup[item["column"]]
+            if metric["aggregation"] == "FINAL":
+                where_predicates.append(
+                    _compile_predicate(item, final_ref[item["column"]])
+                )
+        if where_predicates:
+            parts.append("WHERE " + " AND ".join(where_predicates))
+
+        if row_metrics:
+            parts.append("GROUP BY " + ", ".join(dict.fromkeys(group_parts)))
+
+        having_predicates: list[str] = []
+        for item in query_spec.get("having_filters", []):
+            metric = metric_lookup[item["column"]]
+            if metric["aggregation"] == "FINAL":
+                continue
+            having_predicates.append(
+                _compile_predicate(
+                    item,
+                    f"{metric['aggregation']}(tr.{item['column']})",
+                )
+            )
+        if having_predicates:
+            parts.append("HAVING " + " AND ".join(having_predicates))
+
+        order_by = query_spec.get("order_by")
+        if order_by:
+            if order_by["kind"] == "metric":
+                expression = order_by["alias"]
+            else:
+                owner = _column_owner(order_by["column"])
+                expression = _qualified_column(order_by["column"], owner)
+            parts.append(f"ORDER BY {expression} {order_by['direction']}")
+        limit = query_spec.get("limit")
+        if isinstance(limit, int) and limit > 0:
+            parts.append(f"LIMIT {limit}")
+        return " ".join(parts)
+
+    table_name = str(query_spec["table"])
+    alias = catalog["tables"][table_name]["alias"]
+    select_columns = list(query_spec["select_columns"])
+    if not select_columns:
+        return ""
+    select_sql = ", ".join(f"{alias}.{column}" for column in select_columns)
+    parts = [f"SELECT {select_sql}", f"FROM {table_name} AS {alias}"]
+    predicates: list[str] = []
+    sample_ids = list(query_spec.get("sample_ids", []))
+    if len(sample_ids) == 1:
+        predicates.append(f"{alias}.sample_id = '{sample_ids[0]}'")
+    elif len(sample_ids) > 1:
+        values = ", ".join(f"'{sample_id}'" for sample_id in sample_ids)
+        predicates.append(f"{alias}.sample_id IN ({values})")
+    for item in query_spec.get("filters", []):
+        predicates.append(_compile_predicate(item, f"{alias}.{item['column']}"))
+    if predicates:
+        parts.append("WHERE " + " AND ".join(predicates))
+    order_by = query_spec.get("order_by")
+    if order_by:
+        parts.append(f"ORDER BY {alias}.{order_by['column']} {order_by['direction']}")
+    limit = query_spec.get("limit")
+    if isinstance(limit, int) and limit > 0:
+        parts.append(f"LIMIT {limit}")
+    return " ".join(parts)
+
+def infer_forward_schema_elements(
+    question: str,
+) -> tuple[set[str], set[str]]:
+    """从用户问题正向识别相关表和字段。"""
+
+    owners = get_column_owner_map()
+    columns = set(
+        match_question_semantic_columns(
+            question
+        )
+    )
+    columns.update(
+        infer_requested_output_columns(
+            question
+        )
+    )
+
+    ranking = infer_question_ranking_column(
+        question
+    )
+    if ranking is not None:
+        columns.add(ranking[0])
+
+    if (
+        extract_requested_sample_ids(question)
+        or re.search(
+            r"样本|sample_id|sample_",
+            question,
+            flags=re.IGNORECASE,
+        )
+    ):
+        columns.add("sample_id")
+
+    tables = infer_relevant_tables(question)
+    for column in columns:
+        if column == "sample_id":
+            continue
+        tables.update(
+            owners.get(column, set())
+        )
+
+    return tables, columns
+
+
+def extract_sql_schema_elements(
+    sql: str,
+) -> tuple[set[str], set[str]]:
+    """从初步SQL反向提取真实表和Schema字段。"""
+
+    if not sql:
+        return set(), set()
+
+    catalog = get_schema_catalog()
+    physical_tables = set(
+        catalog["tables"]
+    )
+    alias_to_table = {
+        info["alias"]: table_name
+        for table_name, info
+        in catalog["tables"].items()
+    }
+    valid_columns = set(
+        get_column_owner_map()
+    )
+
+    try:
+        tree = sqlglot.parse_one(
+            sql,
+            read="mysql",
+        )
+    except ParseError:
+        return set(), set()
+
+    tables: set[str] = set()
+    for table in tree.find_all(exp.Table):
+        name = table.name
+        if name in physical_tables:
+            tables.add(name)
+        elif name in alias_to_table:
+            tables.add(alias_to_table[name])
+
+    columns = {
+        column.name
+        for column in tree.find_all(exp.Column)
+        if column.name in valid_columns
+    }
+
+    return tables, columns
+
+
+def _relationships_for_tables(
+    tables: set[str],
+) -> list[str]:
+    catalog = get_schema_catalog()
+    return [
+        relationship
+        for relationship in catalog[
+            "relationships"
+        ]
+        if sum(
+            table_name in relationship
+            for table_name in tables
+        ) >= 2
+    ]
+
+
+def build_schema_context_for_tables(
+    question: str,
+    tables: set[str],
+    highlighted_columns: set[str] | None = None,
+) -> str:
+    """为SQL2构建严格的表级和列级裁剪Schema。"""
+
+    catalog = get_schema_catalog()
+    owners = get_column_owner_map()
+    selected_tables = {
+        table_name
+        for table_name in tables
+        if table_name in catalog["tables"]
+    }
+    if not selected_tables:
+        return build_schema_context()
+
+    requested_columns = set(highlighted_columns or set())
+    explicit_full_table = infer_explicit_full_table_request(question)
+    lines: list[str] = [
+        "数据库类型：MySQL",
+        "稳健Schema Linking后允许使用的真实表和必要字段：",
+    ]
+
+    for table_name, info in catalog["tables"].items():
+        if table_name not in selected_tables:
+            continue
+        if explicit_full_table == table_name:
+            allowed_columns = set(info["columns"])
+        else:
+            allowed_columns = {
+                column
+                for column in requested_columns
+                if column in info["columns"]
+                and table_name in owners.get(column, set())
+            }
+            allowed_columns.add("sample_id")
+
+        grain_text = (
+            "每个样本一行"
+            if info["grain"] == "one_row_per_sample"
+            else "每个样本多行时序记录"
+        )
+        lines.append(
+            f"[{table_name}] 推荐别名：{info['alias']}；粒度：{grain_text}"
+        )
+        for column, description in info["columns"].items():
+            if column in allowed_columns:
+                lines.append(f"- {column}：{description}")
+
+    relationships = _relationships_for_tables(selected_tables)
+    if relationships:
+        lines.append("必要连接关系：")
+        lines.extend(f"- {item}" for item in relationships)
+
+    lines.extend(
+        [
+            build_question_field_hint(question),
+            "生成约束：",
+            "- 只能使用以上列出的表和字段。",
+            "- 不得因为sample_id是公共连接键而引入无关表。",
+            "- 普通样本级Top-K直接ORDER BY目标字段并LIMIT。",
+            "- 一行一个样本的字段Top-K不使用MAX、GROUP BY或IN子查询。",
+            "- 只有时序峰值才使用MAX并按sample_id分组。",
+            "- 禁止SELECT *，必须严格遵守用户返回字段要求。",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_robust_schema_linking(
+    question: str,
+    preliminary_sql: str,
+) -> dict[str, Any]:
+    """置信度感知地合并正向与反向Schema Linking。"""
+
+    catalog = get_schema_catalog()
+    owners = get_column_owner_map()
+    forward_tables, forward_columns = infer_forward_schema_elements(question)
+    backward_tables, backward_columns = extract_sql_schema_elements(preliminary_sql)
+    explicit_full_table = infer_explicit_full_table_request(question)
+
+    accepted_backward_tables: set[str] = set()
+    rejected_backward_tables: set[str] = set()
+    forward_business_columns = set(forward_columns) - {"sample_id"}
+
+    if explicit_full_table is not None:
+        robust_tables = {explicit_full_table}
+        robust_columns = set(catalog["tables"][explicit_full_table]["columns"])
+    elif forward_business_columns and forward_tables:
+        # 正向业务字段链接完整时，以其为高置信主干。
+        robust_tables = set(forward_tables)
+        robust_columns = set(forward_columns)
+        for table_name in backward_tables:
+            owns_needed_column = any(
+                table_name in owners.get(column, set())
+                for column in forward_business_columns
+            )
+            if table_name in forward_tables or owns_needed_column:
+                accepted_backward_tables.add(table_name)
+            else:
+                rejected_backward_tables.add(table_name)
+        robust_tables.update(accepted_backward_tables)
+    else:
+        # 正向链接不足时，才使用SQL1中的有效字段作为补充召回。
+        robust_columns = set(forward_columns)
+        for column in backward_columns:
+            if column == "sample_id":
+                continue
+            owner_tables = owners.get(column, set())
+            if owner_tables:
+                robust_columns.add(column)
+                accepted_backward_tables.update(owner_tables)
+        robust_tables = set(forward_tables) | accepted_backward_tables
+        rejected_backward_tables = set(backward_tables) - robust_tables
+
+    if len(robust_tables) > 1 or re.search(
+        r"样本|sample_id|sample_",
+        question,
+        flags=re.IGNORECASE,
+    ):
+        robust_columns.add("sample_id")
+
+    if not robust_tables:
+        robust_tables = set(catalog["tables"])
+        robust_columns = set(backward_columns) or {"sample_id"}
+
+    context = build_schema_context_for_tables(
+        question=question,
+        tables=robust_tables,
+        highlighted_columns=robust_columns,
+    )
+
+    return {
+        "forward_tables": sorted(forward_tables),
+        "forward_columns": sorted(forward_columns),
+        "backward_tables": sorted(backward_tables),
+        "backward_columns": sorted(backward_columns),
+        "accepted_backward_tables": sorted(accepted_backward_tables),
+        "rejected_backward_tables": sorted(rejected_backward_tables),
+        "robust_tables": sorted(robust_tables),
+        "robust_columns": sorted(robust_columns),
+        "context": context,
+    }
 
 
 def build_compact_sql_context(

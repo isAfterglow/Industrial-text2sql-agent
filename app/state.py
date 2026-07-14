@@ -3,19 +3,59 @@ from typing import Annotated, Any, TypedDict
 
 
 class Text2SQLState(TypedDict, total=False):
-    """Text2SQL LangGraph共享状态，包含V0.5可观测字段。"""
+    """Text2SQL LangGraph共享状态，包含V0.6双Schema候选字段。"""
 
     # 用户输入
     question: str
     normalized_question: str
 
-    # Schema
+    # 基础Schema与字段提示
     schema_context: str
-    generation_schema_context: str
-    generation_relevant_tables: list[str]
     field_hint: str
 
-    # SQL生成
+    # 基础查询QuerySpec与确定性快路径
+    query_spec: dict[str, Any]
+    query_plan_mode: str
+    query_plan_reason: str
+    deterministic_sql: str
+
+    # RSL-SQL-inspired：完整Schema候选
+    full_schema_context: str
+    full_generator_raw_output: str
+    full_sql: str
+
+    # 正向、反向与稳健Schema Linking
+    forward_schema_tables: list[str]
+    forward_schema_columns: list[str]
+    backward_schema_tables: list[str]
+    backward_schema_columns: list[str]
+    accepted_backward_tables: list[str]
+    rejected_backward_tables: list[str]
+    robust_schema_context: str
+    robust_schema_tables: list[str]
+    robust_schema_columns: list[str]
+
+    # RSL-SQL-inspired：稳健裁剪Schema候选
+    pruned_generator_raw_output: str
+    pruned_sql: str
+
+    # 双候选Guard评估与选择
+    candidate_full_valid: bool
+    candidate_full_normalized_sql: str
+    candidate_full_error: str
+    candidate_full_error_type: str
+    candidate_full_score: float
+    candidate_pruned_valid: bool
+    candidate_pruned_normalized_sql: str
+    candidate_pruned_error: str
+    candidate_pruned_error_type: str
+    candidate_pruned_score: float
+    selected_candidate: str
+    candidate_selection_reason: str
+
+    # 兼容后续既有节点
+    generation_schema_context: str
+    generation_relevant_tables: list[str]
     generator_raw_output: str
     initial_sql: str
     raw_sql: str

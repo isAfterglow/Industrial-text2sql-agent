@@ -160,8 +160,22 @@ def summarize_node_input(
             "question": common["question"],
         }
 
-    if node_name == "generate_sql":
-        return common
+    if node_name in {
+        "build_query_plan",
+        "generate_simple_sql",
+        "generate_full_sql",
+        "build_robust_schema",
+        "generate_pruned_sql",
+        "select_sql_candidate",
+    }:
+        return {
+            **common,
+            "full_sql": state.get("full_sql", ""),
+            "pruned_sql": state.get("pruned_sql", ""),
+            "robust_schema_tables": state.get(
+                "robust_schema_tables", []
+            ),
+        }
 
     if node_name == "validate_sql":
         return {
@@ -258,28 +272,98 @@ def summarize_node_output(
             ),
         }
 
-    if node_name == "generate_sql":
+    if node_name == "build_query_plan":
         return {
-            "generation_relevant_tables": output.get(
-                "generation_relevant_tables",
-                [],
+            "query_plan_mode": output.get("query_plan_mode", ""),
+            "query_plan_reason": output.get("query_plan_reason", ""),
+            "query_spec": output.get("query_spec", {}),
+            "deterministic_sql": output.get("deterministic_sql", ""),
+        }
+
+    if node_name == "generate_simple_sql":
+        return {
+            "selected_candidate": output.get("selected_candidate", ""),
+            "selected_sql": output.get("raw_sql", ""),
+            "candidate_selection_reason": output.get(
+                "candidate_selection_reason", ""
             ),
-            "field_hint": output.get(
-                "field_hint",
-                "",
+        }
+
+    if node_name == "generate_full_sql":
+        return {
+            "field_hint": output.get("field_hint", ""),
+            "full_generator_raw_output": output.get(
+                "full_generator_raw_output", ""
             ),
-            "generation_schema_context": output.get(
-                "generation_schema_context",
-                "",
+            "full_sql": output.get("full_sql", ""),
+        }
+
+    if node_name == "build_robust_schema":
+        return {
+            "forward_schema_tables": output.get(
+                "forward_schema_tables", []
             ),
-            "generator_raw_output": output.get(
-                "generator_raw_output",
-                "",
+            "forward_schema_columns": output.get(
+                "forward_schema_columns", []
             ),
-            "cleaned_sql": output.get(
-                "raw_sql",
-                "",
+            "backward_schema_tables": output.get(
+                "backward_schema_tables", []
             ),
+            "backward_schema_columns": output.get(
+                "backward_schema_columns", []
+            ),
+            "accepted_backward_tables": output.get(
+                "accepted_backward_tables", []
+            ),
+            "rejected_backward_tables": output.get(
+                "rejected_backward_tables", []
+            ),
+            "robust_schema_tables": output.get(
+                "robust_schema_tables", []
+            ),
+            "robust_schema_columns": output.get(
+                "robust_schema_columns", []
+            ),
+            "robust_schema_context": output.get(
+                "robust_schema_context", ""
+            ),
+        }
+
+    if node_name == "generate_pruned_sql":
+        return {
+            "pruned_generator_raw_output": output.get(
+                "pruned_generator_raw_output", ""
+            ),
+            "pruned_sql": output.get("pruned_sql", ""),
+        }
+
+    if node_name == "select_sql_candidate":
+        return {
+            "candidate_full_valid": output.get(
+                "candidate_full_valid", False
+            ),
+            "candidate_full_score": output.get(
+                "candidate_full_score", 0.0
+            ),
+            "candidate_full_error": output.get(
+                "candidate_full_error", ""
+            ),
+            "candidate_pruned_valid": output.get(
+                "candidate_pruned_valid", False
+            ),
+            "candidate_pruned_score": output.get(
+                "candidate_pruned_score", 0.0
+            ),
+            "candidate_pruned_error": output.get(
+                "candidate_pruned_error", ""
+            ),
+            "selected_candidate": output.get(
+                "selected_candidate", ""
+            ),
+            "candidate_selection_reason": output.get(
+                "candidate_selection_reason", ""
+            ),
+            "selected_sql": output.get("raw_sql", ""),
         }
 
     if node_name == "validate_sql":
@@ -514,10 +598,44 @@ def print_node_event(
         "load_schema": [
             "normalized_question",
         ],
-        "generate_sql": [
-            "generation_relevant_tables",
+        "build_query_plan": [
+            "query_plan_mode",
+            "query_plan_reason",
+            "query_spec",
+            "deterministic_sql",
+        ],
+        "generate_simple_sql": [
+            "selected_candidate",
+            "candidate_selection_reason",
+            "selected_sql",
+        ],
+        "generate_full_sql": [
             "field_hint",
-            "cleaned_sql",
+            "full_sql",
+        ],
+        "build_robust_schema": [
+            "forward_schema_tables",
+            "forward_schema_columns",
+            "backward_schema_tables",
+            "backward_schema_columns",
+            "accepted_backward_tables",
+            "rejected_backward_tables",
+            "robust_schema_tables",
+            "robust_schema_columns",
+        ],
+        "generate_pruned_sql": [
+            "pruned_sql",
+        ],
+        "select_sql_candidate": [
+            "candidate_full_valid",
+            "candidate_full_score",
+            "candidate_full_error",
+            "candidate_pruned_valid",
+            "candidate_pruned_score",
+            "candidate_pruned_error",
+            "selected_candidate",
+            "candidate_selection_reason",
+            "selected_sql",
         ],
         "validate_sql": [
             "valid",
@@ -729,6 +847,41 @@ def build_trace_record(
         "initial_sql": result.get(
             "initial_sql",
             "",
+        ),
+        "full_sql": result.get("full_sql", ""),
+        "pruned_sql": result.get("pruned_sql", ""),
+        "selected_candidate": result.get(
+            "selected_candidate", ""
+        ),
+        "candidate_selection_reason": result.get(
+            "candidate_selection_reason", ""
+        ),
+        "candidate_full_valid": result.get(
+            "candidate_full_valid", False
+        ),
+        "candidate_full_score": result.get(
+            "candidate_full_score", 0.0
+        ),
+        "candidate_full_error": result.get(
+            "candidate_full_error", ""
+        ),
+        "candidate_pruned_valid": result.get(
+            "candidate_pruned_valid", False
+        ),
+        "candidate_pruned_score": result.get(
+            "candidate_pruned_score", 0.0
+        ),
+        "candidate_pruned_error": result.get(
+            "candidate_pruned_error", ""
+        ),
+        "forward_schema_tables": result.get(
+            "forward_schema_tables", []
+        ),
+        "backward_schema_tables": result.get(
+            "backward_schema_tables", []
+        ),
+        "robust_schema_tables": result.get(
+            "robust_schema_tables", []
         ),
         "final_sql": (
             result.get("validated_sql")
