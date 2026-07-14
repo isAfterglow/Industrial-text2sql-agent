@@ -1,0 +1,844 @@
+import json
+import os
+import threading
+import time
+import uuid
+from datetime import date, datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+from typing import Any, Callable
+
+
+_LOG_LOCK = threading.Lock()
+
+
+def _env_bool(
+    name: str,
+    default: bool,
+) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    return raw.strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def trace_enabled() -> bool:
+    return _env_bool(
+        "TEXT2SQL_TRACE_ENABLED",
+        True,
+    )
+
+
+def console_trace_enabled() -> bool:
+    return _env_bool(
+        "TEXT2SQL_TRACE_CONSOLE",
+        True,
+    )
+
+
+def verbose_trace_enabled() -> bool:
+    return _env_bool(
+        "TEXT2SQL_TRACE_VERBOSE",
+        False,
+    )
+
+
+def trace_log_dir() -> Path:
+    return Path(
+        os.getenv(
+            "TEXT2SQL_TRACE_LOG_DIR",
+            "logs",
+        )
+    )
+
+
+def utc_now_iso() -> str:
+    return datetime.now(
+        timezone.utc
+    ).isoformat(timespec="milliseconds")
+
+
+def new_trace_id() -> str:
+    timestamp = datetime.now().strftime(
+        "%Y%m%d-%H%M%S"
+    )
+    suffix = uuid.uuid4().hex[:8]
+    return f"{timestamp}-{suffix}"
+
+
+def safe_json_value(
+    value: Any,
+    *,
+    max_string_length: int = 12000,
+    max_list_items: int = 50,
+) -> Any:
+    """Convert common DB/LLM values into JSON-safe values."""
+
+    if value is None or isinstance(
+        value,
+        (bool, int, float),
+    ):
+        return value
+
+    if isinstance(value, str):
+        if len(value) <= max_string_length:
+            return value
+        return (
+            value[:max_string_length]
+            + "...<truncated>"
+        )
+
+    if isinstance(value, Decimal):
+        return str(value)
+
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+
+    if isinstance(value, dict):
+        return {
+            str(key): safe_json_value(
+                item,
+                max_string_length=max_string_length,
+                max_list_items=max_list_items,
+            )
+            for key, item in value.items()
+        }
+
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+        result = [
+            safe_json_value(
+                item,
+                max_string_length=max_string_length,
+                max_list_items=max_list_items,
+            )
+            for item in items[:max_list_items]
+        ]
+        if len(items) > max_list_items:
+            result.append(
+                f"...<{len(items) - max_list_items} more items>"
+            )
+        return result
+
+    return str(value)
+
+
+def _row_preview(
+    rows: list[Any],
+    limit: int = 5,
+) -> list[Any]:
+    return safe_json_value(
+        rows[:limit],
+        max_list_items=limit,
+    )
+
+
+def summarize_node_input(
+    node_name: str,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    common = {
+        "question": state.get("question", ""),
+        "normalized_question": state.get(
+            "normalized_question",
+            "",
+        ),
+        "retry_count": state.get(
+            "retry_count",
+            0,
+        ),
+    }
+
+    if node_name == "load_schema":
+        return {
+            "question": common["question"],
+        }
+
+    if node_name == "generate_sql":
+        return common
+
+    if node_name == "validate_sql":
+        return {
+            **common,
+            "raw_sql": state.get(
+                "raw_sql",
+                "",
+            ),
+        }
+
+    if node_name == "review_sql":
+        return {
+            **common,
+            "validated_sql": state.get(
+                "validated_sql",
+                "",
+            ),
+        }
+
+    if node_name == "repair_sql":
+        return {
+            **common,
+            "raw_sql": state.get(
+                "raw_sql",
+                "",
+            ),
+            "validated_sql": state.get(
+                "validated_sql",
+                "",
+            ),
+            "validation_error": state.get(
+                "validation_error",
+                "",
+            ),
+            "review_reason": state.get(
+                "review_reason",
+                "",
+            ),
+            "execution_error": state.get(
+                "execution_error",
+                "",
+            ),
+        }
+
+    if node_name == "execute_sql":
+        return {
+            **common,
+            "validated_sql": state.get(
+                "validated_sql",
+                "",
+            ),
+        }
+
+    if node_name in {
+        "format_result",
+        "format_error",
+    }:
+        return {
+            **common,
+            "validated_sql": state.get(
+                "validated_sql",
+                "",
+            ),
+            "validation_error": state.get(
+                "validation_error",
+                "",
+            ),
+            "execution_error": state.get(
+                "execution_error",
+                "",
+            ),
+            "row_count": state.get(
+                "row_count",
+                0,
+            ),
+        }
+
+    return common
+
+
+def summarize_node_output(
+    node_name: str,
+    output: dict[str, Any],
+) -> dict[str, Any]:
+    if node_name == "load_schema":
+        return {
+            "normalized_question": output.get(
+                "normalized_question",
+                "",
+            ),
+            "schema_context": output.get(
+                "schema_context",
+                "",
+            ),
+        }
+
+    if node_name == "generate_sql":
+        return {
+            "generation_relevant_tables": output.get(
+                "generation_relevant_tables",
+                [],
+            ),
+            "field_hint": output.get(
+                "field_hint",
+                "",
+            ),
+            "generation_schema_context": output.get(
+                "generation_schema_context",
+                "",
+            ),
+            "generator_raw_output": output.get(
+                "generator_raw_output",
+                "",
+            ),
+            "cleaned_sql": output.get(
+                "raw_sql",
+                "",
+            ),
+        }
+
+    if node_name == "validate_sql":
+        return {
+            "valid": not bool(
+                output.get(
+                    "validation_error"
+                )
+            ),
+            "validated_sql": output.get(
+                "validated_sql",
+                "",
+            ),
+            "validation_error": output.get(
+                "validation_error",
+                "",
+            ),
+            "validation_error_type": output.get(
+                "validation_error_type",
+                "",
+            ),
+            "validation_repairable": output.get(
+                "validation_repairable",
+                True,
+            ),
+        }
+
+    if node_name == "review_sql":
+        return {
+            "review_called": output.get(
+                "review_called",
+                False,
+            ),
+            "review_passed": output.get(
+                "review_passed",
+                False,
+            ),
+            "review_reason": output.get(
+                "review_reason",
+                "",
+            ),
+            "review_note": output.get(
+                "review_note",
+                "",
+            ),
+            "review_input_summary": output.get(
+                "review_input_summary",
+                "",
+            ),
+        }
+
+    if node_name == "repair_sql":
+        return {
+            "repair_source": output.get(
+                "repair_source",
+                "",
+            ),
+            "repair_reason": output.get(
+                "last_repair_reason",
+                "",
+            ),
+            "repair_action": output.get(
+                "repair_action",
+                "",
+            ),
+            "repair_bad_sql": output.get(
+                "repair_bad_sql",
+                "",
+            ),
+            "repair_raw_output": output.get(
+                "repair_raw_output",
+                "",
+            ),
+            "repaired_sql": output.get(
+                "raw_sql",
+                "",
+            ),
+            "retry_count": output.get(
+                "retry_count",
+                0,
+            ),
+        }
+
+    if node_name == "execute_sql":
+        return {
+            "execution_error": output.get(
+                "execution_error",
+                "",
+            ),
+            "columns": output.get(
+                "columns",
+                [],
+            ),
+            "row_count": output.get(
+                "row_count",
+                0,
+            ),
+            "truncated": output.get(
+                "truncated",
+                False,
+            ),
+            "rows_preview": _row_preview(
+                output.get("rows", [])
+            ),
+        }
+
+    if node_name in {
+        "format_result",
+        "format_error",
+    }:
+        return {
+            "final_status": output.get(
+                "final_status",
+                "",
+            ),
+            "final_answer_preview": safe_json_value(
+                output.get(
+                    "final_answer",
+                    "",
+                ),
+                max_string_length=2000,
+            ),
+        }
+
+    return safe_json_value(output)
+
+
+def infer_event_status(
+    node_name: str,
+    output: dict[str, Any],
+) -> str:
+    if node_name == "validate_sql" and output.get(
+        "validation_error"
+    ):
+        return "rejected"
+
+    if node_name == "review_sql" and not output.get(
+        "review_passed",
+        False,
+    ):
+        return "rejected"
+
+    if node_name == "execute_sql" and output.get(
+        "execution_error"
+    ):
+        return "failed"
+
+    if node_name == "format_error":
+        return "failed"
+
+    return "ok"
+
+
+def append_jsonl(
+    path: Path,
+    record: dict[str, Any],
+) -> None:
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    payload = json.dumps(
+        safe_json_value(record),
+        ensure_ascii=False,
+    )
+
+    with _LOG_LOCK:
+        with path.open(
+            "a",
+            encoding="utf-8",
+        ) as file:
+            file.write(payload + "\n")
+
+
+def append_node_event(
+    event: dict[str, Any],
+) -> None:
+    if not trace_enabled():
+        return
+
+    append_jsonl(
+        trace_log_dir()
+        / "node_events.jsonl",
+        event,
+    )
+
+
+def _console_value(
+    value: Any,
+    max_length: int = 900,
+) -> str:
+    if isinstance(value, str):
+        text = value
+    else:
+        text = json.dumps(
+            safe_json_value(value),
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    if len(text) > max_length:
+        return text[:max_length] + "..."
+    return text
+
+
+def print_node_event(
+    event: dict[str, Any],
+) -> None:
+    if not (
+        trace_enabled()
+        and console_trace_enabled()
+    ):
+        return
+
+    status = event.get("status", "ok")
+    symbol = {
+        "ok": "✓",
+        "rejected": "!",
+        "failed": "✗",
+    }.get(status, "•")
+
+    print(
+        f"\n[TRACE] {symbol} "
+        f"{event['node']} "
+        f"{event['elapsed_ms']:.2f} ms"
+    )
+
+    output = event.get("output", {})
+
+    # Normal mode prints the fields that are most useful for debugging.
+    preferred_keys = {
+        "load_schema": [
+            "normalized_question",
+        ],
+        "generate_sql": [
+            "generation_relevant_tables",
+            "field_hint",
+            "cleaned_sql",
+        ],
+        "validate_sql": [
+            "valid",
+            "validated_sql",
+            "validation_error_type",
+            "validation_error",
+        ],
+        "review_sql": [
+            "review_called",
+            "review_passed",
+            "review_reason",
+            "review_note",
+        ],
+        "repair_sql": [
+            "repair_source",
+            "repair_action",
+            "repaired_sql",
+        ],
+        "execute_sql": [
+            "execution_error",
+            "columns",
+            "row_count",
+            "truncated",
+            "rows_preview",
+        ],
+        "format_result": [
+            "final_status",
+        ],
+        "format_error": [
+            "final_status",
+        ],
+    }.get(event["node"], list(output))
+
+    if verbose_trace_enabled():
+        preferred_keys = list(output)
+
+    for key in preferred_keys:
+        value = output.get(key)
+        if (
+            value is None
+            or value == ""
+            or value is False
+            or value == []
+        ):
+            continue
+        print(
+            f"  {key}: "
+            f"{_console_value(value)}"
+        )
+
+
+def traced_node(
+    node_name: str,
+    node_function: Callable[
+        [dict[str, Any]],
+        dict[str, Any],
+    ],
+) -> Callable[
+    [dict[str, Any]],
+    dict[str, Any],
+]:
+    """Wrap a LangGraph node with timing and structured trace output."""
+
+    def wrapped(
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not trace_enabled():
+            return node_function(state)
+
+        trace_id = state.get(
+            "trace_id"
+        ) or new_trace_id()
+        trace_started_at = state.get(
+            "trace_started_at"
+        ) or utc_now_iso()
+        started_at = utc_now_iso()
+        started = time.perf_counter()
+        node_input = summarize_node_input(
+            node_name,
+            state,
+        )
+
+        try:
+            output = node_function(state)
+            elapsed_ms = (
+                time.perf_counter() - started
+            ) * 1000
+            event = {
+                "trace_id": trace_id,
+                "node": node_name,
+                "status": infer_event_status(
+                    node_name,
+                    output,
+                ),
+                "started_at": started_at,
+                "finished_at": utc_now_iso(),
+                "elapsed_ms": round(
+                    elapsed_ms,
+                    3,
+                ),
+                "input": safe_json_value(
+                    node_input
+                ),
+                "output": safe_json_value(
+                    summarize_node_output(
+                        node_name,
+                        output,
+                    )
+                ),
+            }
+            append_node_event(event)
+            print_node_event(event)
+
+            return {
+                **output,
+                "trace_id": trace_id,
+                "trace_started_at": (
+                    trace_started_at
+                ),
+                "trace_events": [event],
+            }
+        except Exception as exc:
+            elapsed_ms = (
+                time.perf_counter() - started
+            ) * 1000
+            event = {
+                "trace_id": trace_id,
+                "node": node_name,
+                "status": "failed",
+                "started_at": started_at,
+                "finished_at": utc_now_iso(),
+                "elapsed_ms": round(
+                    elapsed_ms,
+                    3,
+                ),
+                "input": safe_json_value(
+                    node_input
+                ),
+                "output": {},
+                "exception": (
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            }
+            append_node_event(event)
+            print_node_event(event)
+            raise
+
+    wrapped.__name__ = (
+        f"traced_{node_name}"
+    )
+    return wrapped
+
+
+def infer_final_status(
+    result: dict[str, Any],
+) -> str:
+    if result.get("final_status"):
+        return str(result["final_status"])
+
+    if result.get("execution_error"):
+        return "execution_failed"
+    if result.get("validation_error"):
+        if result.get(
+            "validation_error_type"
+        ) == "policy":
+            return "policy_rejected"
+        return "validation_failed"
+    if not result.get(
+        "review_passed",
+        False,
+    ):
+        return "review_failed"
+    if result.get("retry_count", 0) > 0:
+        return "repaired_success"
+    return "first_pass_success"
+
+
+def build_trace_record(
+    result: dict[str, Any],
+    total_elapsed_ms: float,
+) -> dict[str, Any]:
+    return {
+        "trace_id": (
+            result.get("trace_id")
+            or new_trace_id()
+        ),
+        "started_at": result.get(
+            "trace_started_at",
+            "",
+        ),
+        "finished_at": utc_now_iso(),
+        "question": result.get(
+            "question",
+            "",
+        ),
+        "normalized_question": result.get(
+            "normalized_question",
+            "",
+        ),
+        "status": infer_final_status(result),
+        "retry_count": result.get(
+            "retry_count",
+            0,
+        ),
+        "total_elapsed_ms": round(
+            total_elapsed_ms,
+            3,
+        ),
+        "initial_sql": result.get(
+            "initial_sql",
+            "",
+        ),
+        "final_sql": (
+            result.get("validated_sql")
+            or result.get("raw_sql", "")
+        ),
+        "validation_error": result.get(
+            "validation_error",
+            "",
+        ),
+        "validation_error_type": result.get(
+            "validation_error_type",
+            "",
+        ),
+        "review_called": result.get(
+            "review_called",
+            False,
+        ),
+        "review_passed": result.get(
+            "review_passed",
+            False,
+        ),
+        "review_reason": result.get(
+            "review_reason",
+            "",
+        ),
+        "execution_error": result.get(
+            "execution_error",
+            "",
+        ),
+        "columns": result.get(
+            "columns",
+            [],
+        ),
+        "row_count": result.get(
+            "row_count",
+            0,
+        ),
+        "rows_preview": _row_preview(
+            result.get("rows", [])
+        ),
+        "events": result.get(
+            "trace_events",
+            [],
+        ),
+    }
+
+
+def save_trace_record(
+    result: dict[str, Any],
+    total_elapsed_ms: float,
+) -> dict[str, Any]:
+    record = build_trace_record(
+        result,
+        total_elapsed_ms,
+    )
+
+    if trace_enabled():
+        append_jsonl(
+            trace_log_dir()
+            / "traces.jsonl",
+            record,
+        )
+        if record["status"] not in {
+            "first_pass_success",
+            "repaired_success",
+        }:
+            append_jsonl(
+                trace_log_dir()
+                / "errors.jsonl",
+                record,
+            )
+
+    return record
+
+
+def print_trace_summary(
+    record: dict[str, Any],
+) -> None:
+    if not (
+        trace_enabled()
+        and console_trace_enabled()
+    ):
+        return
+
+    print("\n" + "-" * 80)
+    print("TRACE SUMMARY")
+    print(
+        f"trace_id: {record['trace_id']}"
+    )
+    print(
+        f"status: {record['status']}"
+    )
+    print(
+        "total_elapsed_ms: "
+        f"{record['total_elapsed_ms']:.2f}"
+    )
+    print(
+        "node_path: "
+        + " -> ".join(
+            event["node"]
+            for event in record.get(
+                "events",
+                []
+            )
+        )
+    )
+    print(
+        f"retry_count: {record['retry_count']}"
+    )
+    print(
+        f"row_count: {record['row_count']}"
+    )
+    print("-" * 80)

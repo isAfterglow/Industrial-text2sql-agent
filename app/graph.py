@@ -18,44 +18,69 @@ from app.nodes import (
     validate_sql,
 )
 from app.state import Text2SQLState
+from app.trace import traced_node
 
 
 def build_graph():
-    """构建精简通用Text2SQL工作流。"""
+    """构建带统一节点Trace的Text2SQL工作流。"""
 
     builder = StateGraph(Text2SQLState)
 
     builder.add_node(
         "load_schema",
-        load_schema,
+        traced_node(
+            "load_schema",
+            load_schema,
+        ),
     )
     builder.add_node(
         "generate_sql",
-        generate_sql,
+        traced_node(
+            "generate_sql",
+            generate_sql,
+        ),
     )
     builder.add_node(
         "validate_sql",
-        validate_sql,
+        traced_node(
+            "validate_sql",
+            validate_sql,
+        ),
     )
     builder.add_node(
         "review_sql",
-        review_sql,
+        traced_node(
+            "review_sql",
+            review_sql,
+        ),
     )
     builder.add_node(
         "repair_sql",
-        repair_sql,
+        traced_node(
+            "repair_sql",
+            repair_sql,
+        ),
     )
     builder.add_node(
         "execute_sql",
-        execute_sql,
+        traced_node(
+            "execute_sql",
+            execute_sql,
+        ),
     )
     builder.add_node(
         "format_result",
-        format_result,
+        traced_node(
+            "format_result",
+            format_result,
+        ),
     )
     builder.add_node(
         "format_error",
-        format_error,
+        traced_node(
+            "format_error",
+            format_error,
+        ),
     )
 
     builder.add_edge(
@@ -91,7 +116,6 @@ def build_graph():
         },
     )
 
-    # 修复后的SQL必须重新经过确定性Guard和语义审查。
     builder.add_edge(
         "repair_sql",
         "validate_sql",

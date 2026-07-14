@@ -16,6 +16,7 @@ from app.schema import (
     build_question_field_hint,
     build_schema_context,
     extract_requested_sample_ids,
+    infer_relevant_tables,
     normalize_question_sample_ids,
 )
 from app.sql_guard import (
@@ -178,15 +179,21 @@ def load_schema(
             )
         ),
         "schema_context": build_schema_context(),
+        "generation_schema_context": "",
+        "generation_relevant_tables": [],
+        "field_hint": "",
+        "generator_raw_output": "",
         "initial_sql": "",
         "raw_sql": "",
         "validated_sql": "",
         "validation_error": "",
         "validation_repairable": True,
         "validation_error_type": "",
+        "review_called": False,
         "review_passed": False,
         "review_reason": "",
         "review_note": "",
+        "review_input_summary": "",
         "execution_error": "",
         "columns": [],
         "rows": [],
@@ -194,6 +201,11 @@ def load_schema(
         "truncated": False,
         "retry_count": 0,
         "last_repair_reason": "",
+        "repair_source": "",
+        "repair_action": "",
+        "repair_bad_sql": "",
+        "repair_raw_output": "",
+        "final_status": "",
         "final_answer": "",
     }
 
@@ -237,9 +249,11 @@ def generate_sql(
             "raw_sql": "",
             "validated_sql": "",
             "validation_error": "",
+            "review_called": False,
             "review_passed": False,
             "review_reason": "",
             "review_note": "",
+            "review_input_summary": "",
             "execution_error": "",
         }
 
@@ -265,23 +279,32 @@ def generate_sql(
 只输出一条完整SQL。
 """.strip()
 
+    generator_raw_output = invoke_text(
+        system_prompt,
+        user_prompt,
+    )
     sql = normalize_sample_id_literals(
         clean_llm_sql(
-            invoke_text(
-                system_prompt,
-                user_prompt,
-            )
+            generator_raw_output
         )
     )
 
     return {
+        "generation_schema_context": generation_context,
+        "generation_relevant_tables": sorted(
+            infer_relevant_tables(question)
+        ),
+        "field_hint": field_hint,
+        "generator_raw_output": generator_raw_output,
         "initial_sql": sql,
         "raw_sql": sql,
         "validated_sql": "",
         "validation_error": "",
+        "review_called": False,
         "review_passed": False,
         "review_reason": "",
         "review_note": "",
+        "review_input_summary": "",
         "execution_error": "",
     }
 
@@ -334,13 +357,20 @@ def review_sql(
 
     if covered:
         return {
+            "review_called": False,
             "review_passed": True,
             "review_reason": (
                 "确定性语义检查通过。"
             ),
             "review_note": coverage_reason,
+            "review_input_summary": "",
         }
 
+    review_input_summary = (
+        build_sql_review_summary(
+            state["validated_sql"]
+        )
+    )
     passed, reason = review_complex_sql(
         question=state[
             "normalized_question"
@@ -353,17 +383,21 @@ def review_sql(
 
     if passed is None:
         return {
+            "review_called": True,
             "review_passed": False,
             "review_reason": (
                 "复杂SQL语义审查未能返回可信结论。"
             ),
             "review_note": "review_unavailable",
+            "review_input_summary": review_input_summary,
         }
 
     return {
+        "review_called": True,
         "review_passed": passed,
         "review_reason": reason,
         "review_note": "llm_review",
+        "review_input_summary": review_input_summary,
     }
 
 
@@ -556,12 +590,13 @@ def repair_sql(
 请从零输出修复后的完整SQL。
 """.strip()
 
+    repair_raw_output = invoke_text(
+        system_prompt,
+        user_prompt,
+    )
     repaired_sql = normalize_sample_id_literals(
         clean_llm_sql(
-            invoke_text(
-                system_prompt,
-                user_prompt,
-            )
+            repair_raw_output
         )
     )
 
@@ -572,12 +607,18 @@ def repair_sql(
         "last_repair_reason": (
             f"{source}: {reason}"
         ),
+        "repair_source": source,
+        "repair_action": repair_action,
+        "repair_bad_sql": bad_sql,
+        "repair_raw_output": repair_raw_output,
         "validation_error": "",
         "validation_repairable": True,
         "validation_error_type": "",
+        "review_called": False,
         "review_passed": False,
         "review_reason": "",
         "review_note": "",
+        "review_input_summary": "",
         "execution_error": "",
         "columns": [],
         "rows": [],
@@ -687,6 +728,11 @@ def format_result(
         )
 
     return {
+        "final_status": (
+            "repaired_success"
+            if retry_count > 0
+            else "first_pass_success"
+        ),
         "final_answer": f"""
 查询执行成功。
 
@@ -733,7 +779,14 @@ def format_error(
             "本次查询未能生成可执行结果。"
         )
 
+    final_status = (
+        "policy_rejected"
+        if state.get("validation_error_type") == "policy"
+        else "failed"
+    )
+
     return {
+        "final_status": final_status,
         "final_answer": f"""
 本次查询没有成功执行。
 
