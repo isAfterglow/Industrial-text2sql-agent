@@ -11,7 +11,7 @@ class Text2SQLState(TypedDict, total=False):
     resolved_question: str
     session_id: str
 
-    # V0.7.1 QueryDelta短期记忆与上下文解析
+    # V0.7.3 澄清感知短期记忆与上下文解析
     conversation_memory: dict[str, Any]
     query_delta: dict[str, Any]
     query_delta_source: str
@@ -22,6 +22,11 @@ class Text2SQLState(TypedDict, total=False):
     memory_used: bool
     context_resolution: dict[str, Any]
     context_resolution_valid: bool
+    clarification_required: bool
+    clarification_cancelled: bool
+    clarification_question: str
+    pending_clarification: dict[str, Any]
+    policy_precheck_failed: bool
     current_turn_coverage: dict[str, Any]
     inherited_fields: list[str]
     overridden_fields: list[str]

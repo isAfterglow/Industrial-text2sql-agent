@@ -9,6 +9,10 @@ from app.nodes import (
     build_robust_schema,
     execute_sql,
     extract_query_delta,
+    policy_precheck,
+    route_after_policy_precheck,
+    request_clarification,
+    route_after_context_resolution,
     format_error,
     format_result,
     generate_full_sql,
@@ -31,14 +35,16 @@ from app.trace import traced_node
 
 
 def build_graph():
-    """构建V0.7.1 QueryDelta短期记忆与双Schema候选工作流。"""
+    """构建V0.7.3 澄清感知短期记忆与双Schema候选工作流。"""
 
     builder = StateGraph(Text2SQLState)
 
     for node_name, node_function in (
         ("load_schema", load_schema),
+        ("policy_precheck", policy_precheck),
         ("extract_query_delta", extract_query_delta),
         ("resolve_conversation_context", resolve_conversation_context),
+        ("request_clarification", request_clarification),
         ("build_query_plan", build_query_plan),
         ("generate_simple_sql", generate_simple_sql),
         ("generate_full_sql", generate_full_sql),
@@ -62,9 +68,18 @@ def build_graph():
         )
 
     builder.add_edge(START, "load_schema")
-    builder.add_edge("load_schema", "extract_query_delta")
+    builder.add_edge("load_schema", "policy_precheck")
+    builder.add_conditional_edges(
+        "policy_precheck",
+        route_after_policy_precheck,
+        {"continue": "extract_query_delta", "error": "format_error"},
+    )
     builder.add_edge("extract_query_delta", "resolve_conversation_context")
-    builder.add_edge("resolve_conversation_context", "build_query_plan")
+    builder.add_conditional_edges(
+        "resolve_conversation_context",
+        route_after_context_resolution,
+        {"continue": "build_query_plan", "clarify": "request_clarification"},
+    )
     builder.add_conditional_edges(
         "build_query_plan",
         route_after_query_plan,
@@ -125,6 +140,7 @@ def build_graph():
 
     builder.add_edge("update_session_memory", "format_result")
     builder.add_edge("format_result", END)
+    builder.add_edge("request_clarification", END)
     builder.add_edge("format_error", END)
 
     return builder.compile()

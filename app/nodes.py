@@ -17,7 +17,9 @@ from app.llm import get_llm
 from app.memory import (
     build_deterministic_query_delta,
     build_query_delta_prompts,
+    mark_current_turn_status,
     parse_query_delta_response,
+    record_user_turn,
     resolve_conversation_context as resolve_memory_context,
     update_short_term_memory,
 )
@@ -218,6 +220,11 @@ def load_schema(
         "memory_used": False,
         "context_resolution": {},
         "context_resolution_valid": True,
+        "clarification_required": False,
+        "clarification_cancelled": False,
+        "clarification_question": "",
+        "pending_clarification": {},
+        "policy_precheck_failed": False,
         "current_turn_coverage": {},
         "inherited_fields": [],
         "overridden_fields": [],
@@ -283,6 +290,35 @@ def load_schema(
     }
 
 
+
+def policy_precheck(state: Text2SQLState) -> dict[str, Any]:
+    """在记忆解析前拒绝写入/破坏性请求，避免数字被误作LIMIT。"""
+
+    question = state.get("normalized_question") or state.get("question", "")
+    error = validate_question_policy(question)
+    if error is None:
+        return {"policy_precheck_failed": False}
+
+    memory = record_user_turn(state.get("conversation_memory", {}), state.get("question", question))
+    memory = mark_current_turn_status(
+        memory,
+        question=state.get("question", question),
+        status="policy_rejected",
+        resolved_question=question,
+    )
+    return {
+        "policy_precheck_failed": True,
+        "validation_error": error,
+        "validation_error_type": "policy",
+        "validation_repairable": False,
+        "conversation_memory": memory,
+    }
+
+
+def route_after_policy_precheck(state: Text2SQLState) -> Literal["continue", "error"]:
+    return "error" if state.get("policy_precheck_failed") else "continue"
+
+
 def extract_query_delta(
     state: Text2SQLState,
 ) -> dict[str, Any]:
@@ -317,7 +353,11 @@ def extract_query_delta(
             delta["needs_llm"] = False
             delta["llm_error"] = f"{type(exc).__name__}: {exc}"
 
+    # 原始对话窗口与最后一次成功状态分离。即使后续SQL失败，
+    # 当前用户输入也会保留在最近两轮文本中，用于下一轮指代解析。
+    turn_memory = record_user_turn(memory, state.get("question", question))
     return {
+        "conversation_memory": turn_memory,
         "query_delta": delta,
         "query_delta_source": str(delta.get("source", "deterministic")),
         "query_delta_llm_called": llm_called,
@@ -351,12 +391,90 @@ def resolve_conversation_context(
             "overridden_fields": [],
         }
 
+    query_delta = state.get("query_delta", {})
+
     resolved = resolve_memory_context(
         original_question,
         state.get("conversation_memory", {}),
-        state.get("query_delta", {}),
+        query_delta,
     )
+
+    # 最后一层历史范围防泄漏保护：
+    # 当前轮已经能够独立形成完整 QuerySpec，
+    # 且没有“它、它们、这些样本、其中”等显式指代时，
+    # 当前轮 QuerySpec 是唯一权威状态。
+    #
+    # 即使以后上游的依赖分类再次发生回归，
+    # 也不允许历史 sample_ids、排序结果范围等进入本轮。
+    if (
+        query_delta.get("independent_complete")
+        and not query_delta.get("explicit_reference")
+    ):
+        authoritative_spec = (
+            query_delta.get("current_spec")
+            or build_query_spec(original_question)
+        )
+
+        resolved = {
+            **resolved,
+            "resolved_question": original_question,
+            "resolved_query_spec": authoritative_spec,
+            "turn_type": "new_query",
+            "memory_used": False,
+            "context_resolution_valid": True,
+            "current_turn_coverage": {
+                "passed": True,
+                "mode": "independent_scope_guard",
+                "historical_scope_leak": False,
+                "sample_ids": list(
+                    authoritative_spec.get(
+                        "sample_ids",
+                        [],
+                    )
+                ),
+            },
+            "context_resolution": {
+                **resolved.get(
+                    "context_resolution",
+                    {},
+                ),
+                "reason": (
+                    "当前轮可独立形成完整 QuerySpec 且没有显式指代，"
+                    "强制清空历史样本范围。"
+                ),
+            },
+            "inherited_fields": [],
+            "overridden_fields": [],
+            "clarification_required": False,
+            "clarification_cancelled": False,
+            "clarification_question": "",
+            "pending_clarification": {},
+        }
+
+    memory = state.get("conversation_memory", {})
+    
+    if resolved.get("clarification_required"):
+        memory = dict(memory)
+        memory["pending_clarification"] = resolved.get("pending_clarification", {})
+        memory = mark_current_turn_status(
+            memory,
+            question=state.get("question", original_question),
+            status=(
+                "clarification_cancelled"
+                if resolved.get("clarification_cancelled")
+                else "clarification_required"
+            ),
+            resolved_question=original_question,
+        )
+    elif (
+        state.get("query_delta", {}).get("clarification_resolved")
+        or state.get("query_delta", {}).get("clear_pending_clarification")
+    ):
+        memory = dict(memory)
+        memory["pending_clarification"] = {}
+
     return {
+        "conversation_memory": memory,
         "resolved_question": resolved.get("resolved_question", ""),
         "resolved_query_spec": resolved.get("resolved_query_spec", {}),
         "turn_type": resolved.get("turn_type", "new_query"),
@@ -365,9 +483,31 @@ def resolve_conversation_context(
         "context_resolution_valid": bool(
             resolved.get("context_resolution_valid", True)
         ),
+        "clarification_required": bool(resolved.get("clarification_required", False)),
+        "clarification_cancelled": bool(resolved.get("clarification_cancelled", False)),
+        "clarification_question": resolved.get("clarification_question", ""),
+        "pending_clarification": resolved.get("pending_clarification", {}),
         "current_turn_coverage": resolved.get("current_turn_coverage", {}),
         "inherited_fields": resolved.get("inherited_fields", []),
         "overridden_fields": resolved.get("overridden_fields", []),
+    }
+
+
+
+def route_after_context_resolution(state: Text2SQLState) -> Literal["clarify", "continue"]:
+    return "clarify" if state.get("clarification_required") else "continue"
+
+
+def request_clarification(state: Text2SQLState) -> dict[str, Any]:
+    question = state.get("clarification_question") or "请补充必要信息后再继续查询。"
+    cancelled = bool(state.get("clarification_cancelled"))
+    return {
+        "final_status": "clarification_cancelled" if cancelled else "clarification_required",
+        "final_answer": (
+            question
+            if cancelled
+            else "需要补充确认后才能安全执行。\n\n" + question
+        ),
     }
 
 
@@ -933,41 +1073,48 @@ def validate_sql(
 def review_sql(
     state: Text2SQLState,
 ) -> dict[str, Any]:
-    """基础SQL由确定性Guard放行，复杂SQL才调用一次LLM审查。"""
+    """优先使用结构化QuerySpec和Guard；仅审查真正模糊的独立复杂SQL。"""
 
-    covered, coverage_reason = (
-        assess_deterministic_semantic_coverage(
-            question=state[
-                "normalized_question"
-            ],
-            sql=state["validated_sql"],
-            query_spec=state.get("query_spec"),
-        )
+    question = effective_question(state)
+    covered, coverage_reason = assess_deterministic_semantic_coverage(
+        question=question,
+        sql=state["validated_sql"],
+        query_spec=state.get("query_spec"),
     )
 
     if covered:
         return {
             "review_called": False,
             "review_passed": True,
-            "review_reason": (
-                "确定性语义检查通过。"
-            ),
+            "review_reason": "确定性语义检查通过。",
             "review_note": coverage_reason,
             "review_input_summary": "",
         }
 
-    review_input_summary = (
-        build_sql_review_summary(
-            state["validated_sql"]
-        )
-    )
+    query_spec = state.get("query_spec", {})
+    if (
+        state.get("memory_used", False)
+        and state.get("context_resolution_valid", True)
+        and query_spec.get("memory_resolved")
+        and query_spec.get("structured_context_complete")
+    ):
+        # SQL已经通过统一Guard，当前轮字段、范围、过滤、排序、聚合和数量
+        # 又通过短期记忆Coverage；此时再次让LLM审查容易把正确跨表SQL误杀。
+        return {
+            "review_called": False,
+            "review_passed": True,
+            "review_reason": "结构化记忆语义检查通过。",
+            "review_note": (
+                "当前轮QueryDelta覆盖、陈旧状态清理和SQL Guard均已通过，"
+                "无需再次调用LLM语义审查。"
+            ),
+            "review_input_summary": "",
+        }
+
+    review_input_summary = build_sql_review_summary(state["validated_sql"])
     passed, reason = review_complex_sql(
-        question=state[
-            "normalized_question"
-        ],
-        schema_context=state[
-            "schema_context"
-        ],
+        question=question,
+        schema_context=state["schema_context"],
         sql=state["validated_sql"],
     )
 
@@ -975,9 +1122,7 @@ def review_sql(
         return {
             "review_called": True,
             "review_passed": False,
-            "review_reason": (
-                "复杂SQL语义审查未能返回可信结论。"
-            ),
+            "review_reason": "复杂SQL语义审查未能返回可信结论。",
             "review_note": "review_unavailable",
             "review_input_summary": review_input_summary,
         }
@@ -1248,6 +1393,15 @@ def execute_sql(
             "truncated": False,
         }
 
+    order_ids = list(state.get("query_spec", {}).get("result_order_sample_ids", []))
+    if order_ids and "sample_id" in result.get("columns", []):
+        index = result["columns"].index("sample_id")
+        rank = {sample_id: position for position, sample_id in enumerate(order_ids)}
+        result["rows"] = sorted(
+            result.get("rows", []),
+            key=lambda row: rank.get(row[index] if index < len(row) else None, len(rank)),
+        )
+
     return {
         "execution_error": "",
         **result,
@@ -1294,6 +1448,10 @@ def update_session_memory(
             "session_id": memory.get("session_id", ""),
             "turn_type": state.get("turn_type", "new_query"),
             "active_sample_count": len(memory.get("active_sample_ids", [])),
+            "parent_sample_count": len(
+                memory.get("parent_result_scope", {}).get("sample_ids", [])
+            ),
+            "recent_user_turn_count": len(memory.get("recent_user_turns", [])),
             "recent_turn_count": len(memory.get("recent_turns", [])),
         },
     }
@@ -1406,31 +1564,30 @@ def format_error(
         or "未知错误"
     )
 
-    if (
-        state.get("validation_error_type")
-        == "policy"
-    ):
-        description = (
-            "该请求违反只读、白名单或跨库安全策略，"
-            "系统不会尝试改写。"
-        )
+    if state.get("validation_error_type") == "policy":
+        description = "该请求违反只读、白名单或跨库安全策略，系统不会尝试改写。"
     elif state.get("retry_count", 0) > 0:
         description = (
-            "系统已经自动修复一次，"
-            "但仍未通过确定性校验、复杂语义审查或数据库执行。"
+            "系统已经自动修复一次，但仍未通过确定性校验、"
+            "复杂语义审查或数据库执行。"
         )
     else:
-        description = (
-            "本次查询未能生成可执行结果。"
-        )
+        description = "本次查询未能生成可执行结果。"
 
     final_status = (
         "policy_rejected"
         if state.get("validation_error_type") == "policy"
         else "failed"
     )
+    memory = mark_current_turn_status(
+        state.get("conversation_memory", {}),
+        question=state.get("question", ""),
+        status=final_status,
+        resolved_question=effective_question(state),
+    )
 
     return {
+        "conversation_memory": memory,
         "final_status": final_status,
         "final_answer": f"""
 本次查询没有成功执行。
@@ -1452,7 +1609,7 @@ def format_error(
 ```sql
 {state.get("raw_sql") or "未生成SQL"}
 ```
-""".strip()
+""".strip(),
     }
 
 

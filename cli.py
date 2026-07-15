@@ -4,6 +4,7 @@ from langgraph.errors import GraphRecursionError
 
 from app.graph import graph
 from app.memory import (
+    cancel_pending_clarification,
     format_memory_summary,
     new_short_term_memory,
     reset_short_term_memory,
@@ -18,31 +19,37 @@ from app.trace import (
 
 
 WELCOME_TEXT = """
-树脂基防热材料 Text2SQL V0.7.1 QueryDelta短期记忆版
+树脂基防热材料 Text2SQL V0.7.4 指代安全短期记忆版
 
 流程：
-1. 保存最后一次成功QuerySpec、最近两轮成功对话和上一结果样本范围；
-2. 将当前轮解析成QueryDelta：独立查询、同一样本、上一结果集合或修改上一查询；
-3. 常见承接表达使用Schema字段识别和确定性算法，特别模糊时才调用一次轻量LLM；
-4. LLM只提取字段替换/增加/删除与指代关系，不直接修改旧SQL；
-5. 确定性State Reducer合并QueryDelta，并重新推导表、查询类型和SQL路径；
-6. 当前轮字段、数量和样本范围必须通过Coverage检查，防止错误状态与错误SQL互相验证；
-7. SQL继续经过原有只读策略、Schema、字段、数值、Top-K和聚合Guard；
-8. 仅在语义覆盖与数据库执行均成功后更新记忆，失败轮次保留上一成功状态。
+1. 最近两轮原始用户输入用于理解“它、它们、这些样本、其中”等指代，成功和失败轮次都保留；
+2. 最后一次成功QuerySpec单独保存，失败查询不会覆盖可执行状态；
+3. 结果范围保存当前集合和父集合两层，支持从Top-1继续回到原候选集合；
+4. QueryDelta分别描述样本范围、返回字段、过滤、排序、时序聚合和数量变化；
+5. 引用上一结果集合时只继承sample_id范围，不继承旧过滤、排序、聚合和LIMIT；
+6. State Reducer按固定继承矩阵合并状态，并重新推导表、查询类型和SQL路径；
+7. Coverage同时检查当前字段是否缺失和旧状态是否残留；
+8. 结果集合保存原始顺序；只换展示字段时保持原顺序，明确最高/最低时才重新排序；
+9. “它”回指最近单样本，“它们/这些样本/其中”回指最近样本集合；单样本和样本集合锚点互不覆盖；
+10. 澄清最多允许两次无效回答，可输入/取消澄清退出；输入新的完整查询会自动放弃旧澄清；
+11. 写入、删除和修改请求在记忆解析前直接按只读策略拒绝。
 
 会话命令：
-- /memory：查看当前结构化短期记忆；
-- /reset：清空当前会话记忆，但保留session_id；
+- /memory：查看成功查询状态、当前/父结果集合和最近两轮原始输入；
+- /reset：清空当前会话短期记忆，但保留session_id；
 - /new：创建全新会话；
+- /取消澄清：只取消当前待澄清问题，不清空成功查询记忆；
+- 出现澄清选项时，可直接输入A/B/C/D/E、补充明确字段/样本编号，或输入“取消”；
 - exit、quit、q：退出。
 
-推荐多轮示例：
-- 查询样本305的热解热。
-- 它的碳化密度是多少？
-- 再返回表面发射率。
+重点回归示例：
+- 查询原始密度最低的5个样本。
+- 改成最高的10个。
+- 数量改为3个。
 
-- 找出表面发射率最低的5个样本。
-- 这些样本中碳化密度最高的是哪个？
+- 找出峰值表面温度最高的10个样本。
+- 这些样本中原始密度最高的是哪个？
+- 再找出其中碳化密度最低的3个。
 
 默认日志：
 - logs/node_events.jsonl：每次节点执行记录；
@@ -96,6 +103,11 @@ def main() -> None:
             )
             continue
 
+        if lowered in {"/取消澄清", "/cancel", "/cancel-clarification"}:
+            conversation_memory = cancel_pending_clarification(conversation_memory)
+            print("当前待澄清问题已取消，最后一次成功查询记忆仍保留。")
+            continue
+
         trace_id = new_trace_id()
         started_at = utc_now_iso()
         started = time.perf_counter()
@@ -115,7 +127,7 @@ def main() -> None:
                 },
             )
 
-            # 只有成功路径会经过update_session_memory；失败结果保留旧记忆。
+            # 成功路径提交QuerySpec；失败路径也会保留最近两轮原始输入。
             updated_memory = result.get("conversation_memory")
             if isinstance(updated_memory, dict) and updated_memory:
                 conversation_memory = updated_memory
