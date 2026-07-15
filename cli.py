@@ -3,6 +3,11 @@ import time
 from langgraph.errors import GraphRecursionError
 
 from app.graph import graph
+from app.memory import (
+    format_memory_summary,
+    new_short_term_memory,
+    reset_short_term_memory,
+)
 from app.trace import (
     new_trace_id,
     print_trace_summary,
@@ -13,44 +18,52 @@ from app.trace import (
 
 
 WELCOME_TEXT = """
-树脂基防热材料 Text2SQL V0.6.4 Guard约束一致性版
+树脂基防热材料 Text2SQL V0.7.1 QueryDelta短期记忆版
 
 流程：
-1. 规范化问题，统一解析数值并构建静态QuerySpec或TemporalQuerySpec；
-2. 可确定的静态查询、时序明细和标准时序聚合走确定性SQL快路径；
-3. 无法完整规划的复杂查询进入RSL-SQL-inspired双候选链路；
-4. 完整Schema生成SQL1，并进行正向/反向Schema Linking；
-5. 置信度过滤反向噪声，形成表级和列级稳健裁剪Schema；
-6. 裁剪Schema生成SQL2，并通过Guard与结构评分选择候选；
-7. 执行统一安全、Schema、投影、数值、Top-K和聚合校验；
-8. 必要时轻量语义审查并最多自动修复一次；
-9. 执行数据库查询，输出节点输入、输出、耗时和JSONL日志。
+1. 保存最后一次成功QuerySpec、最近两轮成功对话和上一结果样本范围；
+2. 将当前轮解析成QueryDelta：独立查询、同一样本、上一结果集合或修改上一查询；
+3. 常见承接表达使用Schema字段识别和确定性算法，特别模糊时才调用一次轻量LLM；
+4. LLM只提取字段替换/增加/删除与指代关系，不直接修改旧SQL；
+5. 确定性State Reducer合并QueryDelta，并重新推导表、查询类型和SQL路径；
+6. 当前轮字段、数量和样本范围必须通过Coverage检查，防止错误状态与错误SQL互相验证；
+7. SQL继续经过原有只读策略、Schema、字段、数值、Top-K和聚合Guard；
+8. 仅在语义覆盖与数据库执行均成功后更新记忆，失败轮次保留上一成功状态。
+
+会话命令：
+- /memory：查看当前结构化短期记忆；
+- /reset：清空当前会话记忆，但保留session_id；
+- /new：创建全新会话；
+- exit、quit、q：退出。
+
+推荐多轮示例：
+- 查询样本305的热解热。
+- 它的碳化密度是多少？
+- 再返回表面发射率。
+
+- 找出表面发射率最低的5个样本。
+- 这些样本中碳化密度最高的是哪个？
 
 默认日志：
 - logs/node_events.jsonl：每次节点执行记录；
 - logs/traces.jsonl：每次完整查询记录；
 - logs/errors.jsonl：失败或安全拒绝记录。
-
-环境变量：
-- TEXT2SQL_TRACE_ENABLED=0：关闭Trace；
-- TEXT2SQL_TRACE_CONSOLE=0：不在终端打印Trace；
-- TEXT2SQL_TRACE_VERBOSE=1：终端显示更完整的节点输出；
-- TEXT2SQL_TRACE_LOG_DIR=路径：修改日志目录。
-
-输入 exit、quit 或 q 退出。
 """.strip()
 
 
 def main() -> None:
     print(WELCOME_TEXT)
+    conversation_memory = new_short_term_memory()
+    print(
+        "\n当前session_id: "
+        + conversation_memory["session_id"]
+    )
 
     while True:
         print("\n" + "=" * 80)
 
         try:
-            question = input(
-                "请输入问题："
-            ).strip()
+            question = input("请输入问题：").strip()
         except KeyboardInterrupt:
             print("\n已退出。")
             break
@@ -58,13 +71,30 @@ def main() -> None:
         if not question:
             continue
 
-        if question.lower() in {
-            "exit",
-            "quit",
-            "q",
-        }:
+        lowered = question.lower()
+        if lowered in {"exit", "quit", "q"}:
             print("已退出。")
             break
+
+        if lowered == "/memory":
+            print("\n" + format_memory_summary(conversation_memory))
+            continue
+
+        if lowered == "/reset":
+            conversation_memory = reset_short_term_memory(
+                conversation_memory,
+                keep_session_id=True,
+            )
+            print("当前会话短期记忆已清空。")
+            continue
+
+        if lowered == "/new":
+            conversation_memory = new_short_term_memory()
+            print(
+                "已创建新会话，session_id: "
+                + conversation_memory["session_id"]
+            )
+            continue
 
         trace_id = new_trace_id()
         started_at = utc_now_iso()
@@ -74,16 +104,21 @@ def main() -> None:
             result = graph.invoke(
                 {
                     "question": question,
+                    "session_id": conversation_memory["session_id"],
+                    "conversation_memory": conversation_memory,
                     "trace_id": trace_id,
-                    "trace_started_at": (
-                        started_at
-                    ),
+                    "trace_started_at": started_at,
                     "trace_events": [],
                 },
                 {
-                    "recursion_limit": 24,
+                    "recursion_limit": 28,
                 },
             )
+
+            # 只有成功路径会经过update_session_memory；失败结果保留旧记忆。
+            updated_memory = result.get("conversation_memory")
+            if isinstance(updated_memory, dict) and updated_memory:
+                conversation_memory = updated_memory
 
             total_elapsed_ms = (
                 time.perf_counter() - started
@@ -93,10 +128,7 @@ def main() -> None:
                 total_elapsed_ms,
             )
 
-            print(
-                "\n"
-                + result["final_answer"]
-            )
+            print("\n" + result["final_answer"])
             print_trace_summary(record)
 
         except GraphRecursionError:
@@ -104,14 +136,12 @@ def main() -> None:
                 time.perf_counter() - started
             ) * 1000
             print(
-                "\nGraph超过最大执行步数，"
-                "请检查重试路由。"
+                "\nGraph超过最大执行步数，请检查重试路由。"
             )
             if trace_enabled():
                 print(
                     "trace_id: "
-                    f"{trace_id}; "
-                    "partial node events are in "
+                    f"{trace_id}; partial node events are in "
                     "logs/node_events.jsonl; "
                     f"elapsed={total_elapsed_ms:.2f} ms"
                 )
@@ -127,8 +157,7 @@ def main() -> None:
             if trace_enabled():
                 print(
                     "trace_id: "
-                    f"{trace_id}; "
-                    "partial node events are in "
+                    f"{trace_id}; partial node events are in "
                     "logs/node_events.jsonl; "
                     f"elapsed={total_elapsed_ms:.2f} ms"
                 )

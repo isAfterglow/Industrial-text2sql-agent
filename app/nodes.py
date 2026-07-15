@@ -14,6 +14,13 @@ from tabulate import tabulate
 from app.config import get_settings
 from app.db import execute_readonly_query
 from app.llm import get_llm
+from app.memory import (
+    build_deterministic_query_delta,
+    build_query_delta_prompts,
+    parse_query_delta_response,
+    resolve_conversation_context as resolve_memory_context,
+    update_short_term_memory,
+)
 from app.schema import (
     build_compact_sql_context,
     build_query_spec,
@@ -36,6 +43,17 @@ from app.sql_guard import (
 )
 from app.state import Text2SQLState
 
+
+
+
+def effective_question(state: Text2SQLState) -> str:
+    """返回已经结合短期记忆消解后的本轮完整问题。"""
+
+    return (
+        state.get("resolved_question")
+        or state.get("normalized_question")
+        or state.get("question", "")
+    )
 
 def message_content_to_text(content: Any) -> str:
     """兼容常见OpenAI-compatible接口的content格式。"""
@@ -188,6 +206,22 @@ def load_schema(
             )
         ),
         "schema_context": build_schema_context(),
+        "resolved_question": "",
+        "resolved_query_spec": {},
+        "session_id": state.get("session_id", ""),
+        "conversation_memory": state.get("conversation_memory", {}),
+        "query_delta": {},
+        "query_delta_source": "",
+        "query_delta_llm_called": False,
+        "query_delta_llm_raw_output": "",
+        "turn_type": "new_query",
+        "memory_used": False,
+        "context_resolution": {},
+        "context_resolution_valid": True,
+        "current_turn_coverage": {},
+        "inherited_fields": [],
+        "overridden_fields": [],
+        "memory_update_summary": {},
         "query_spec": {},
         "query_plan_mode": "",
         "query_plan_reason": "",
@@ -249,13 +283,101 @@ def load_schema(
     }
 
 
+def extract_query_delta(
+    state: Text2SQLState,
+) -> dict[str, Any]:
+    """提取当前轮相对上一成功QuerySpec的变化。
+
+    常见承接表达走确定性提取；只有无法判断“继续什么/怎么改”的
+    模糊短句才调用一次轻量LLM，且LLM只输出QueryDelta，不生成SQL。
+    """
+
+    question = state.get(
+        "normalized_question",
+        state.get("question", ""),
+    )
+    memory = state.get("conversation_memory", {})
+    delta = build_deterministic_query_delta(question, memory)
+
+    llm_called = False
+    llm_raw_output = ""
+    if delta.get("needs_llm"):
+        system_prompt, user_prompt = build_query_delta_prompts(
+            question,
+            memory,
+            delta,
+        )
+        try:
+            llm_called = True
+            llm_raw_output = invoke_text(system_prompt, user_prompt)
+            delta = parse_query_delta_response(llm_raw_output, delta)
+        except Exception as exc:
+            delta = dict(delta)
+            delta["source"] = "deterministic_fallback"
+            delta["needs_llm"] = False
+            delta["llm_error"] = f"{type(exc).__name__}: {exc}"
+
+    return {
+        "query_delta": delta,
+        "query_delta_source": str(delta.get("source", "deterministic")),
+        "query_delta_llm_called": llm_called,
+        "query_delta_llm_raw_output": llm_raw_output,
+    }
+
+
+def resolve_conversation_context(
+    state: Text2SQLState,
+) -> dict[str, Any]:
+    """消解多轮指代，并生成可供现有规划器使用的完整问题与QuerySpec。"""
+
+    original_question = state.get(
+        "normalized_question",
+        state.get("question", ""),
+    )
+    # 安全策略永远优先于记忆继承。禁止把“删除这些样本”等
+    # 越权承接表达重写成上一轮的只读SELECT。
+    if validate_question_policy(original_question) is not None:
+        return {
+            "resolved_question": original_question,
+            "resolved_query_spec": build_query_spec(original_question),
+            "turn_type": "new_query",
+            "memory_used": False,
+            "context_resolution": {
+                "reason": "当前问题触发安全策略，不使用历史记忆改写。"
+            },
+            "context_resolution_valid": True,
+            "current_turn_coverage": {"passed": True, "mode": "policy"},
+            "inherited_fields": [],
+            "overridden_fields": [],
+        }
+
+    resolved = resolve_memory_context(
+        original_question,
+        state.get("conversation_memory", {}),
+        state.get("query_delta", {}),
+    )
+    return {
+        "resolved_question": resolved.get("resolved_question", ""),
+        "resolved_query_spec": resolved.get("resolved_query_spec", {}),
+        "turn_type": resolved.get("turn_type", "new_query"),
+        "memory_used": bool(resolved.get("memory_used", False)),
+        "context_resolution": resolved.get("context_resolution", {}),
+        "context_resolution_valid": bool(
+            resolved.get("context_resolution_valid", True)
+        ),
+        "current_turn_coverage": resolved.get("current_turn_coverage", {}),
+        "inherited_fields": resolved.get("inherited_fields", []),
+        "overridden_fields": resolved.get("overridden_fields", []),
+    }
+
+
 def build_query_plan(
     state: Text2SQLState,
 ) -> dict[str, Any]:
     """构建基础查询QuerySpec，决定快路径或RSL路径。"""
 
-    spec = build_query_spec(
-        state["normalized_question"]
+    spec = state.get("resolved_query_spec") or build_query_spec(
+        effective_question(state)
     )
     deterministic_sql = (
         compile_query_spec_sql(spec)
@@ -383,7 +505,7 @@ def generate_full_sql(
 ) -> dict[str, Any]:
     """使用完整Schema生成第一条候选SQL。"""
 
-    question = state["normalized_question"]
+    question = effective_question(state)
     if validate_question_policy(question) is not None:
         return {
             "full_schema_context": state.get(
@@ -418,7 +540,7 @@ def build_robust_schema(
     """将问题正向链接与SQL1反向链接合并为稳健裁剪Schema。"""
 
     linking = build_robust_schema_linking(
-        question=state["normalized_question"],
+        question=effective_question(state),
         preliminary_sql=state.get(
             "full_sql", ""
         ),
@@ -467,7 +589,7 @@ def generate_pruned_sql(
 ) -> dict[str, Any]:
     """使用稳健裁剪Schema生成第二条候选SQL。"""
 
-    question = state["normalized_question"]
+    question = effective_question(state)
     if validate_question_policy(question) is not None:
         return {
             "pruned_generator_raw_output": "",
@@ -650,7 +772,7 @@ def select_sql_candidate(
 ) -> dict[str, Any]:
     """先用Guard淘汰，再用确定性覆盖与复杂度选择候选。"""
 
-    question = state["normalized_question"]
+    question = effective_question(state)
     full_eval = _evaluate_candidate(
         label="full",
         sql=state.get("full_sql", ""),
@@ -765,13 +887,28 @@ def validate_sql(
 ) -> dict[str, Any]:
     settings = get_settings()
 
+    if state.get("memory_used") and not state.get(
+        "context_resolution_valid", True
+    ):
+        coverage = state.get("current_turn_coverage", {})
+        return {
+            "validation_error": (
+                "短期记忆合并未完整覆盖当前轮明确语义："
+                + str(coverage)
+            ),
+            "validation_repairable": False,
+            "validation_error_type": "context",
+            "validated_sql": "",
+            "execution_error": "",
+        }
+
     result = validate_and_normalize_sql(
         sql=state.get("raw_sql", ""),
         allowed_tables=set(
             settings.allowed_tables
         ),
         max_rows=settings.SQL_MAX_ROWS,
-        question=state["normalized_question"],
+        question=effective_question(state),
         query_spec=state.get("query_spec"),
     )
 
@@ -1000,7 +1137,7 @@ def repair_sql(
     next_retry_count = (
         state.get("retry_count", 0) + 1
     )
-    question = state["normalized_question"]
+    question = effective_question(state)
     compact_context = (
         state.get("robust_schema_context")
         or build_compact_sql_context(
@@ -1114,6 +1251,51 @@ def execute_sql(
     return {
         "execution_error": "",
         **result,
+    }
+
+
+def update_session_memory(
+    state: Text2SQLState,
+) -> dict[str, Any]:
+    """仅在执行成功且当前轮语义覆盖通过后提交短期记忆。"""
+
+    if not state.get("context_resolution_valid", True):
+        return {
+            "conversation_memory": state.get("conversation_memory", {}),
+            "memory_update_summary": {
+                "updated": False,
+                "reason": "当前轮语义覆盖未通过，保留上一成功记忆。",
+            },
+        }
+
+    final_status = (
+        "repaired_success"
+        if state.get("retry_count", 0) > 0
+        else "first_pass_success"
+    )
+    memory = update_short_term_memory(
+        state.get("conversation_memory", {}),
+        question=state.get("question", ""),
+        resolved_question=effective_question(state),
+        query_spec=state.get("query_spec", {}),
+        validated_sql=state.get("validated_sql", ""),
+        columns=list(state.get("columns", [])),
+        rows=list(state.get("rows", [])),
+        row_count=int(state.get("row_count", 0)),
+        truncated=bool(state.get("truncated", False)),
+        final_status=final_status,
+        turn_type=state.get("turn_type", "new_query"),
+        query_delta=state.get("query_delta", {}),
+    )
+    return {
+        "conversation_memory": memory,
+        "memory_update_summary": {
+            "updated": True,
+            "session_id": memory.get("session_id", ""),
+            "turn_type": state.get("turn_type", "new_query"),
+            "active_sample_count": len(memory.get("active_sample_ids", [])),
+            "recent_turn_count": len(memory.get("recent_turns", [])),
+        },
     }
 
 

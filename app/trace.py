@@ -153,11 +153,28 @@ def summarize_node_input(
             "retry_count",
             0,
         ),
+        "resolved_question": state.get("resolved_question", ""),
+        "turn_type": state.get("turn_type", ""),
+        "memory_used": state.get("memory_used", False),
     }
 
     if node_name == "load_schema":
         return {
             "question": common["question"],
+            "session_id": state.get("session_id", ""),
+        }
+
+    if node_name == "extract_query_delta":
+        return {
+            **common,
+            "conversation_memory": state.get("conversation_memory", {}),
+        }
+
+    if node_name == "resolve_conversation_context":
+        return {
+            **common,
+            "conversation_memory": state.get("conversation_memory", {}),
+            "query_delta": state.get("query_delta", {}),
         }
 
     if node_name in {
@@ -229,6 +246,14 @@ def summarize_node_input(
             ),
         }
 
+    if node_name == "update_session_memory":
+        return {
+            **common,
+            "query_spec": state.get("query_spec", {}),
+            "validated_sql": state.get("validated_sql", ""),
+            "row_count": state.get("row_count", 0),
+        }
+
     if node_name in {
         "format_result",
         "format_error",
@@ -270,6 +295,26 @@ def summarize_node_output(
                 "schema_context",
                 "",
             ),
+        }
+
+    if node_name == "extract_query_delta":
+        return {
+            "query_delta_source": output.get("query_delta_source", ""),
+            "query_delta_llm_called": output.get("query_delta_llm_called", False),
+            "query_delta": output.get("query_delta", {}),
+        }
+
+    if node_name == "resolve_conversation_context":
+        return {
+            "turn_type": output.get("turn_type", ""),
+            "memory_used": output.get("memory_used", False),
+            "resolved_question": output.get("resolved_question", ""),
+            "context_resolution": output.get("context_resolution", {}),
+            "context_resolution_valid": output.get("context_resolution_valid", True),
+            "current_turn_coverage": output.get("current_turn_coverage", {}),
+            "inherited_fields": output.get("inherited_fields", []),
+            "overridden_fields": output.get("overridden_fields", []),
+            "resolved_query_spec": output.get("resolved_query_spec", {}),
         }
 
     if node_name == "build_query_plan":
@@ -470,6 +515,11 @@ def summarize_node_output(
             ),
         }
 
+    if node_name == "update_session_memory":
+        return {
+            "memory_update_summary": output.get("memory_update_summary", {}),
+        }
+
     if node_name in {
         "format_result",
         "format_error",
@@ -598,6 +648,20 @@ def print_node_event(
         "load_schema": [
             "normalized_question",
         ],
+        "extract_query_delta": [
+            "query_delta_source",
+            "query_delta_llm_called",
+            "query_delta",
+        ],
+        "resolve_conversation_context": [
+            "turn_type",
+            "memory_used",
+            "resolved_question",
+            "context_resolution_valid",
+            "current_turn_coverage",
+            "inherited_fields",
+            "overridden_fields",
+        ],
         "build_query_plan": [
             "query_plan_mode",
             "query_plan_reason",
@@ -660,6 +724,9 @@ def print_node_event(
             "row_count",
             "truncated",
             "rows_preview",
+        ],
+        "update_session_memory": [
+            "memory_update_summary",
         ],
         "format_result": [
             "final_status",
@@ -835,6 +902,18 @@ def build_trace_record(
             "normalized_question",
             "",
         ),
+        "resolved_question": result.get("resolved_question", ""),
+        "session_id": result.get("session_id", ""),
+        "turn_type": result.get("turn_type", ""),
+        "memory_used": result.get("memory_used", False),
+        "query_delta": result.get("query_delta", {}),
+        "query_delta_source": result.get("query_delta_source", ""),
+        "query_delta_llm_called": result.get("query_delta_llm_called", False),
+        "context_resolution_valid": result.get("context_resolution_valid", True),
+        "current_turn_coverage": result.get("current_turn_coverage", {}),
+        "inherited_fields": result.get("inherited_fields", []),
+        "overridden_fields": result.get("overridden_fields", []),
+        "memory_update_summary": result.get("memory_update_summary", {}),
         "status": infer_final_status(result),
         "retry_count": result.get(
             "retry_count",

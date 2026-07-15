@@ -3,11 +3,29 @@ from typing import Annotated, Any, TypedDict
 
 
 class Text2SQLState(TypedDict, total=False):
-    """Text2SQL LangGraph共享状态，包含V0.6双Schema候选字段。"""
+    """Text2SQL LangGraph共享状态，包含V0.7短期记忆与V0.6双候选字段。"""
 
-    # 用户输入
+    # 用户输入与会话
     question: str
     normalized_question: str
+    resolved_question: str
+    session_id: str
+
+    # V0.7.1 QueryDelta短期记忆与上下文解析
+    conversation_memory: dict[str, Any]
+    query_delta: dict[str, Any]
+    query_delta_source: str
+    query_delta_llm_called: bool
+    query_delta_llm_raw_output: str
+    resolved_query_spec: dict[str, Any]
+    turn_type: str
+    memory_used: bool
+    context_resolution: dict[str, Any]
+    context_resolution_valid: bool
+    current_turn_coverage: dict[str, Any]
+    inherited_fields: list[str]
+    overridden_fields: list[str]
+    memory_update_summary: dict[str, Any]
 
     # 基础Schema与字段提示
     schema_context: str
