@@ -14,6 +14,7 @@ from tabulate import tabulate
 from app.config import get_settings
 from app.db import execute_readonly_query
 from app.llm import get_llm
+from app.long_term_memory import get_long_term_memory_service
 from app.memory import (
     build_deterministic_query_delta,
     build_query_delta_prompts,
@@ -53,6 +54,7 @@ def effective_question(state: Text2SQLState) -> str:
 
     return (
         state.get("resolved_question")
+        or state.get("memory_augmented_question")
         or state.get("normalized_question")
         or state.get("question", "")
     )
@@ -208,6 +210,17 @@ def load_schema(
             )
         ),
         "schema_context": build_schema_context(),
+        "memory_augmented_question": "",
+        "long_term_memory_enabled": False,
+        "semantic_memory_matches": [],
+        "semantic_memory_applied_ids": [],
+        "semantic_memory_hint": "",
+        "episodic_memory_matches": [],
+        "few_shot_context": "",
+        "procedural_memory_matches": [],
+        "procedural_memory_context": "",
+        "long_term_memory_retrieval_summary": {},
+        "long_term_memory_write_summary": {},
         "resolved_question": "",
         "resolved_query_spec": {},
         "session_id": state.get("session_id", ""),
@@ -319,6 +332,53 @@ def route_after_policy_precheck(state: Text2SQLState) -> Literal["continue", "er
     return "error" if state.get("policy_precheck_failed") else "continue"
 
 
+def retrieve_semantic_memory(
+    state: Text2SQLState,
+) -> dict[str, Any]:
+    """按需检索语义记忆，并在QueryDelta提取前做可审计术语改写。"""
+
+    question = state.get("normalized_question") or state.get("question", "")
+    try:
+        service = get_long_term_memory_service()
+        if not service.enabled:
+            return {
+                "long_term_memory_enabled": False,
+                "memory_augmented_question": question,
+            }
+
+        preliminary_spec = build_query_spec(question)
+        memories = service.retrieve_semantic(
+            question,
+            force_vector=not bool(preliminary_spec.get("eligible")),
+        )
+        augmented, hints, applied_ids = service.apply_semantic_memories(
+            question,
+            memories,
+        )
+        public_matches = [record.to_public_dict() for record in memories]
+        return {
+            "long_term_memory_enabled": True,
+            "memory_augmented_question": augmented,
+            "semantic_memory_matches": public_matches,
+            "semantic_memory_applied_ids": applied_ids,
+            "semantic_memory_hint": "\n".join(hints),
+            "long_term_memory_retrieval_summary": {
+                "semantic_count": len(memories),
+                "semantic_applied_count": len(applied_ids),
+                "question_rewritten": augmented != question,
+            },
+        }
+    except Exception as exc:
+        # 长期记忆是增强层，故障不能阻断主Text2SQL链路。
+        return {
+            "long_term_memory_enabled": False,
+            "memory_augmented_question": question,
+            "long_term_memory_retrieval_summary": {
+                "semantic_error": f"{type(exc).__name__}: {exc}",
+            },
+        }
+
+
 def extract_query_delta(
     state: Text2SQLState,
 ) -> dict[str, Any]:
@@ -328,9 +388,10 @@ def extract_query_delta(
     模糊短句才调用一次轻量LLM，且LLM只输出QueryDelta，不生成SQL。
     """
 
-    question = state.get(
-        "normalized_question",
-        state.get("question", ""),
+    question = (
+        state.get("memory_augmented_question")
+        or state.get("normalized_question")
+        or state.get("question", "")
     )
     memory = state.get("conversation_memory", {})
     delta = build_deterministic_query_delta(question, memory)
@@ -370,9 +431,10 @@ def resolve_conversation_context(
 ) -> dict[str, Any]:
     """消解多轮指代，并生成可供现有规划器使用的完整问题与QuerySpec。"""
 
-    original_question = state.get(
-        "normalized_question",
-        state.get("question", ""),
+    original_question = (
+        state.get("memory_augmented_question")
+        or state.get("normalized_question")
+        or state.get("question", "")
     )
     # 安全策略永远优先于记忆继承。禁止把“删除这些样本”等
     # 越权承接表达重写成上一轮的只读SELECT。
@@ -392,20 +454,13 @@ def resolve_conversation_context(
         }
 
     query_delta = state.get("query_delta", {})
-
     resolved = resolve_memory_context(
         original_question,
         state.get("conversation_memory", {}),
         query_delta,
     )
 
-    # 最后一层历史范围防泄漏保护：
-    # 当前轮已经能够独立形成完整 QuerySpec，
-    # 且没有“它、它们、这些样本、其中”等显式指代时，
-    # 当前轮 QuerySpec 是唯一权威状态。
-    #
-    # 即使以后上游的依赖分类再次发生回归，
-    # 也不允许历史 sample_ids、排序结果范围等进入本轮。
+    # 历史范围防泄漏：完整且无显式指代的新查询以当前QuerySpec为准。
     if (
         query_delta.get("independent_complete")
         and not query_delta.get("explicit_reference")
@@ -414,7 +469,6 @@ def resolve_conversation_context(
             query_delta.get("current_spec")
             or build_query_spec(original_question)
         )
-
         resolved = {
             **resolved,
             "resolved_question": original_question,
@@ -426,20 +480,12 @@ def resolve_conversation_context(
                 "passed": True,
                 "mode": "independent_scope_guard",
                 "historical_scope_leak": False,
-                "sample_ids": list(
-                    authoritative_spec.get(
-                        "sample_ids",
-                        [],
-                    )
-                ),
+                "sample_ids": list(authoritative_spec.get("sample_ids", [])),
             },
             "context_resolution": {
-                **resolved.get(
-                    "context_resolution",
-                    {},
-                ),
+                **resolved.get("context_resolution", {}),
                 "reason": (
-                    "当前轮可独立形成完整 QuerySpec 且没有显式指代，"
+                    "当前轮可独立形成完整QuerySpec且没有显式指代，"
                     "强制清空历史样本范围。"
                 ),
             },
@@ -452,7 +498,6 @@ def resolve_conversation_context(
         }
 
     memory = state.get("conversation_memory", {})
-    
     if resolved.get("clarification_required"):
         memory = dict(memory)
         memory["pending_clarification"] = resolved.get("pending_clarification", {})
@@ -509,6 +554,46 @@ def request_clarification(state: Text2SQLState) -> dict[str, Any]:
             else "需要补充确认后才能安全执行。\n\n" + question
         ),
     }
+
+
+def retrieve_few_shot_memory(
+    state: Text2SQLState,
+) -> dict[str, Any]:
+    """仅为复杂跨表/聚合查询检索情节记忆Few-shot。"""
+
+    try:
+        service = get_long_term_memory_service()
+        query_spec = state.get("resolved_query_spec") or build_query_spec(
+            effective_question(state)
+        )
+        if not service.enabled or not service.should_retrieve_episodic(query_spec):
+            return {
+                "episodic_memory_matches": [],
+                "few_shot_context": "",
+            }
+
+        memories = service.retrieve_episodic(
+            effective_question(state),
+            query_spec,
+        )
+        context = service.build_few_shot_context(memories)
+        summary = dict(state.get("long_term_memory_retrieval_summary", {}))
+        summary["episodic_count"] = len(memories)
+        return {
+            "episodic_memory_matches": [
+                record.to_public_dict() for record in memories
+            ],
+            "few_shot_context": context,
+            "long_term_memory_retrieval_summary": summary,
+        }
+    except Exception as exc:
+        summary = dict(state.get("long_term_memory_retrieval_summary", {}))
+        summary["episodic_error"] = f"{type(exc).__name__}: {exc}"
+        return {
+            "episodic_memory_matches": [],
+            "few_shot_context": "",
+            "long_term_memory_retrieval_summary": summary,
+        }
 
 
 def build_query_plan(
@@ -615,6 +700,7 @@ def _generate_candidate_sql(
     schema_context: str,
     field_hint: str,
     candidate_mode: str,
+    few_shot_context: str = "",
 ) -> tuple[str, str]:
     user_prompt = f"""
 数据库Schema：
@@ -624,6 +710,8 @@ def _generate_candidate_sql(
 {question}
 
 {field_hint}
+
+{few_shot_context}
 
 只输出一条完整SQL。
 """.strip()
@@ -658,12 +746,20 @@ def generate_full_sql(
     field_hint = build_question_field_hint(
         question
     )
+    semantic_hint = state.get("semantic_memory_hint", "").strip()
+    if semantic_hint:
+        field_hint = (
+            field_hint
+            + "\n长期语义记忆提示：\n"
+            + semantic_hint
+        ).strip()
     full_context = state["schema_context"]
     raw_output, sql = _generate_candidate_sql(
         question=question,
         schema_context=full_context,
         field_hint=field_hint,
         candidate_mode="full",
+        few_shot_context=state.get("few_shot_context", ""),
     )
 
     return {
@@ -745,6 +841,7 @@ def generate_pruned_sql(
             "field_hint", ""
         ),
         candidate_mode="pruned",
+        few_shot_context=state.get("few_shot_context", ""),
     )
 
     return {
@@ -1296,6 +1393,18 @@ def repair_sql(
         )
     )
 
+    procedural_memories = []
+    procedural_context = ""
+    try:
+        memory_service = get_long_term_memory_service()
+        procedural_memories = memory_service.retrieve_procedural(reason)
+        procedural_context = memory_service.build_procedural_context(
+            procedural_memories
+        )
+    except Exception:
+        procedural_memories = []
+        procedural_context = ""
+
     system_prompt = """
 你是MySQL SQL修复器。
 
@@ -1323,6 +1432,8 @@ def repair_sql(
 
 必须执行的修复动作：
 {repair_action}
+
+{procedural_context}
 
 错误SQL：
 {bad_sql}
@@ -1356,6 +1467,10 @@ def repair_sql(
         "repair_action": repair_action,
         "repair_bad_sql": bad_sql,
         "repair_raw_output": repair_raw_output,
+        "procedural_memory_matches": [
+            record.to_public_dict() for record in procedural_memories
+        ],
+        "procedural_memory_context": procedural_context,
         "validation_error": "",
         "validation_repairable": True,
         "validation_error_type": "",
@@ -1455,6 +1570,25 @@ def update_session_memory(
             "recent_turn_count": len(memory.get("recent_turns", [])),
         },
     }
+
+
+def update_long_term_memory(
+    state: Text2SQLState,
+) -> dict[str, Any]:
+    """成功执行后按规则保存高价值情节记忆和修复经验。"""
+
+    try:
+        service = get_long_term_memory_service()
+        summary = service.auto_save_from_state(dict(state))
+        return {"long_term_memory_write_summary": summary}
+    except Exception as exc:
+        return {
+            "long_term_memory_write_summary": {
+                "enabled": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "saved": [],
+            }
+        }
 
 
 def shorten_cell(

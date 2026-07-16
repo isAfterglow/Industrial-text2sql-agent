@@ -3,7 +3,7 @@ from typing import Annotated, Any, TypedDict
 
 
 class Text2SQLState(TypedDict, total=False):
-    """Text2SQL LangGraph共享状态，包含V0.7短期记忆与V0.6双候选字段。"""
+    """Text2SQL LangGraph共享状态，包含V0.8.1长期记忆、V0.7短期记忆与V0.6双候选字段。"""
 
     # 用户输入与会话
     question: str
@@ -31,6 +31,20 @@ class Text2SQLState(TypedDict, total=False):
     inherited_fields: list[str]
     overridden_fields: list[str]
     memory_update_summary: dict[str, Any]
+
+
+    # V0.8.1 持久化长期记忆与Few-shot检索
+    memory_augmented_question: str
+    long_term_memory_enabled: bool
+    semantic_memory_matches: list[dict[str, Any]]
+    semantic_memory_applied_ids: list[str]
+    semantic_memory_hint: str
+    episodic_memory_matches: list[dict[str, Any]]
+    few_shot_context: str
+    procedural_memory_matches: list[dict[str, Any]]
+    procedural_memory_context: str
+    long_term_memory_retrieval_summary: dict[str, Any]
+    long_term_memory_write_summary: dict[str, Any]
 
     # 基础Schema与字段提示
     schema_context: str
