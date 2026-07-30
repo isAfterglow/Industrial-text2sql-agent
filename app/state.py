@@ -41,6 +41,8 @@ class Text2SQLState(TypedDict, total=False):
     semantic_memory_hint: str
     episodic_memory_matches: list[dict[str, Any]]
     few_shot_context: str
+    few_shot_retrieval_diagnostics: dict[str, Any]
+    query_signature: dict[str, Any]
     procedural_memory_matches: list[dict[str, Any]]
     procedural_memory_context: str
     long_term_memory_retrieval_summary: dict[str, Any]
@@ -55,6 +57,9 @@ class Text2SQLState(TypedDict, total=False):
     query_plan_mode: str
     query_plan_reason: str
     deterministic_sql: str
+    unsupported_query: bool
+    unsupported_query_reason: str
+    unsupported_query_suggestions: list[str]
 
     # RSL-SQL-inspired：完整Schema候选
     full_schema_context: str

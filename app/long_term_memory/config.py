@@ -34,10 +34,7 @@ def _env_float(name: str, default: float) -> float:
 
 @dataclass(frozen=True)
 class LongTermMemorySettings:
-    """V0.8.1长期记忆配置。
-
-    所有配置均可通过环境变量覆盖，不要求修改现有app/config.py。
-    """
+    """持久化长期记忆和结构感知Few-shot配置。"""
 
     enabled: bool
     namespace: str
@@ -45,12 +42,21 @@ class LongTermMemorySettings:
     embedding_model: str
     embedding_device: str
     allow_model_download: bool
+
     semantic_top_k: int
     episodic_top_k: int
     procedural_top_k: int
     semantic_min_score: float
     episodic_min_score: float
     procedural_min_score: float
+
+    # QuerySpec-aware Hybrid Demonstration Retrieval
+    episodic_candidate_k: int
+    episodic_max_examples: int
+    episodic_structural_min_score: float
+    episodic_final_min_score: float
+    episodic_mmr_lambda: float
+
     auto_save: bool
     max_prompt_chars: int
 
@@ -78,8 +84,17 @@ def get_long_term_memory_settings() -> LongTermMemorySettings:
         episodic_top_k=_env_int("LTM_EPISODIC_TOP_K", 3),
         procedural_top_k=_env_int("LTM_PROCEDURAL_TOP_K", 2),
         semantic_min_score=_env_float("LTM_SEMANTIC_MIN_SCORE", 0.48),
-        episodic_min_score=_env_float("LTM_EPISODIC_MIN_SCORE", 0.28),
+        episodic_min_score=_env_float("LTM_EPISODIC_MIN_SCORE", 0.20),
         procedural_min_score=_env_float("LTM_PROCEDURAL_MIN_SCORE", 0.25),
+        episodic_candidate_k=_env_int("LTM_EPISODIC_CANDIDATE_K", 20),
+        episodic_max_examples=_env_int("LTM_EPISODIC_MAX_EXAMPLES", 2),
+        episodic_structural_min_score=_env_float(
+            "LTM_EPISODIC_STRUCTURAL_MIN_SCORE", 0.45
+        ),
+        episodic_final_min_score=_env_float(
+            "LTM_EPISODIC_FINAL_MIN_SCORE", 0.48
+        ),
+        episodic_mmr_lambda=_env_float("LTM_EPISODIC_MMR_LAMBDA", 0.80),
         auto_save=_env_bool("LTM_AUTO_SAVE", True),
         max_prompt_chars=_env_int("LTM_MAX_PROMPT_CHARS", 6000),
     )

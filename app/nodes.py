@@ -14,7 +14,13 @@ from tabulate import tabulate
 from app.config import get_settings
 from app.db import execute_readonly_query
 from app.llm import get_llm
-from app.long_term_memory import get_long_term_memory_service
+from app.long_term_memory.service import get_long_term_memory_service
+from app.query_enhancement import (
+    augment_common_query_spec,
+    compile_extended_query_sql,
+    detect_unsupported_nested_topk,
+    validate_compiled_extended_sql,
+)
 from app.memory import (
     build_deterministic_query_delta,
     build_query_delta_prompts,
@@ -217,6 +223,11 @@ def load_schema(
         "semantic_memory_hint": "",
         "episodic_memory_matches": [],
         "few_shot_context": "",
+        "few_shot_retrieval_diagnostics": {},
+        "query_signature": {},
+        "unsupported_query": False,
+        "unsupported_query_reason": "",
+        "unsupported_query_suggestions": [],
         "procedural_memory_matches": [],
         "procedural_memory_context": "",
         "long_term_memory_retrieval_summary": {},
@@ -454,6 +465,46 @@ def resolve_conversation_context(
         }
 
     query_delta = state.get("query_delta", {})
+
+    # 能力边界应基于原始问题、且早于历史状态合并判断。
+    # 一个复杂查询可能暂时不支持执行，但仍然是完整独立的新查询；
+    # 不能因为QuerySpec暂时为complex_or_uncertain就继承上一轮过滤和范围。
+    raw_capability = detect_unsupported_nested_topk(original_question)
+    if raw_capability.get("unsupported") and not query_delta.get("explicit_reference"):
+        authoritative_spec = augment_common_query_spec(
+            original_question,
+            query_delta.get("current_spec") or build_query_spec(original_question),
+            query_delta,
+        )
+        memory = state.get("conversation_memory", {})
+        return {
+            "conversation_memory": memory,
+            "resolved_question": original_question,
+            "resolved_query_spec": authoritative_spec,
+            "turn_type": "new_query",
+            "memory_used": False,
+            "context_resolution": {
+                "reason": (
+                    "原始问题包含完整的多阶段Top-K结构，按独立新查询处理；"
+                    "当前版本将在规划阶段给出多轮拆分建议。"
+                ),
+                "capability_check": raw_capability,
+            },
+            "context_resolution_valid": True,
+            "clarification_required": False,
+            "clarification_cancelled": False,
+            "clarification_question": "",
+            "pending_clarification": {},
+            "current_turn_coverage": {
+                "passed": True,
+                "mode": "independent_unsupported_guard",
+                "historical_scope_leak": False,
+                "sample_ids": [],
+            },
+            "inherited_fields": [],
+            "overridden_fields": [],
+        }
+
     resolved = resolve_memory_context(
         original_question,
         state.get("conversation_memory", {}),
@@ -518,10 +569,17 @@ def resolve_conversation_context(
         memory = dict(memory)
         memory["pending_clarification"] = {}
 
+    resolved_question = resolved.get("resolved_question", "") or original_question
+    resolved_spec = augment_common_query_spec(
+        original_question,
+        resolved.get("resolved_query_spec", {}),
+        query_delta,
+    )
+
     return {
         "conversation_memory": memory,
-        "resolved_question": resolved.get("resolved_question", ""),
-        "resolved_query_spec": resolved.get("resolved_query_spec", {}),
+        "resolved_question": resolved_question,
+        "resolved_query_spec": resolved_spec,
         "turn_type": resolved.get("turn_type", "new_query"),
         "memory_used": bool(resolved.get("memory_used", False)),
         "context_resolution": resolved.get("context_resolution", {}),
@@ -559,31 +617,68 @@ def request_clarification(state: Text2SQLState) -> dict[str, Any]:
 def retrieve_few_shot_memory(
     state: Text2SQLState,
 ) -> dict[str, Any]:
-    """仅为复杂跨表/聚合查询检索情节记忆Few-shot。"""
+    """BGE-M3粗召回后使用QuerySignature硬过滤、结构重排和MMR选例。"""
 
     try:
         service = get_long_term_memory_service()
-        query_spec = state.get("resolved_query_spec") or build_query_spec(
-            effective_question(state)
+        question = effective_question(state)
+        query_spec = augment_common_query_spec(
+            question,
+            state.get("resolved_query_spec") or build_query_spec(question),
+            state.get("query_delta", {}),
         )
-        if not service.enabled or not service.should_retrieve_episodic(query_spec):
+        capability = query_spec.get("capability_check") or detect_unsupported_nested_topk(question)
+        if capability.get("unsupported"):
+            diagnostics = {
+                "candidate_count": 0,
+                "hard_compatible_count": 0,
+                "selected_count": 0,
+                "few_shot_used": False,
+                "skip_reason": "unsupported_nested_topk",
+            }
+            summary = dict(state.get("long_term_memory_retrieval_summary", {}))
+            summary.update({"episodic_count": 0, **diagnostics})
             return {
                 "episodic_memory_matches": [],
                 "few_shot_context": "",
+                "few_shot_retrieval_diagnostics": diagnostics,
+                "long_term_memory_retrieval_summary": summary,
             }
 
-        memories = service.retrieve_episodic(
-            effective_question(state),
+        if not service.enabled or not service.should_retrieve_episodic(query_spec):
+            diagnostics = {
+                "candidate_count": 0,
+                "hard_compatible_count": 0,
+                "selected_count": 0,
+                "few_shot_used": False,
+                "skip_reason": "simple_or_deterministic_query",
+            }
+            return {
+                "episodic_memory_matches": [],
+                "few_shot_context": "",
+                "few_shot_retrieval_diagnostics": diagnostics,
+            }
+
+        memories, diagnostics = service.retrieve_episodic_with_diagnostics(
+            question,
             query_spec,
         )
         context = service.build_few_shot_context(memories)
         summary = dict(state.get("long_term_memory_retrieval_summary", {}))
-        summary["episodic_count"] = len(memories)
+        summary.update(
+            {
+                "episodic_count": len(memories),
+                "few_shot_used": bool(memories),
+                "few_shot_skip_reason": diagnostics.get("skip_reason", ""),
+                "episodic_candidate_count": diagnostics.get("candidate_count", 0),
+                "episodic_structural_count": diagnostics.get("hard_compatible_count", 0),
+            }
+        )
         return {
-            "episodic_memory_matches": [
-                record.to_public_dict() for record in memories
-            ],
+            "episodic_memory_matches": [record.to_public_dict() for record in memories],
             "few_shot_context": context,
+            "few_shot_retrieval_diagnostics": diagnostics,
+            "query_signature": diagnostics.get("query_signature", {}),
             "long_term_memory_retrieval_summary": summary,
         }
     except Exception as exc:
@@ -592,6 +687,10 @@ def retrieve_few_shot_memory(
         return {
             "episodic_memory_matches": [],
             "few_shot_context": "",
+            "few_shot_retrieval_diagnostics": {
+                "few_shot_used": False,
+                "skip_reason": "retrieval_error",
+            },
             "long_term_memory_retrieval_summary": summary,
         }
 
@@ -599,29 +698,53 @@ def retrieve_few_shot_memory(
 def build_query_plan(
     state: Text2SQLState,
 ) -> dict[str, Any]:
-    """构建基础查询QuerySpec，决定快路径或RSL路径。"""
+    """构建查询计划；常见时序派生指标走确定性扩展路径。"""
 
-    spec = state.get("resolved_query_spec") or build_query_spec(
-        effective_question(state)
+    question = effective_question(state)
+    spec = augment_common_query_spec(
+        question,
+        state.get("resolved_query_spec") or build_query_spec(question),
+        state.get("query_delta", {}),
     )
-    deterministic_sql = (
-        compile_query_spec_sql(spec)
-        if spec.get("eligible")
-        else ""
-    )
+    capability = spec.get("capability_check") or detect_unsupported_nested_topk(question)
+    if capability.get("unsupported"):
+        return {
+            "query_spec": spec,
+            "query_plan_mode": "unsupported",
+            "query_plan_reason": capability.get("reason", "当前问题超出单轮能力边界。"),
+            "deterministic_sql": "",
+            "unsupported_query": True,
+            "unsupported_query_reason": capability.get("reason", ""),
+            "unsupported_query_suggestions": capability.get("suggested_turns", []),
+        }
+
+    if spec.get("mode") == "deterministic_extended":
+        deterministic_sql = compile_extended_query_sql(spec)
+        return {
+            "query_spec": spec,
+            "query_plan_mode": "deterministic_extended",
+            "query_plan_reason": spec.get("reason", "确定性扩展查询快路径。"),
+            "deterministic_sql": deterministic_sql,
+            "unsupported_query": False,
+        }
+
+    deterministic_sql = compile_query_spec_sql(spec) if spec.get("eligible") else ""
     return {
         "query_spec": spec,
         "query_plan_mode": spec.get("mode", "rsl"),
         "query_plan_reason": spec.get("reason", ""),
         "deterministic_sql": deterministic_sql,
+        "unsupported_query": False,
     }
 
 
 def route_after_query_plan(
     state: Text2SQLState,
-) -> Literal["simple", "rsl"]:
+) -> Literal["simple", "rsl", "unsupported"]:
+    if state.get("query_plan_mode") == "unsupported":
+        return "unsupported"
     if (
-        state.get("query_plan_mode") == "deterministic"
+        state.get("query_plan_mode") in {"deterministic", "deterministic_extended"}
         and state.get("deterministic_sql")
     ):
         return "simple"
@@ -634,8 +757,13 @@ def generate_simple_sql(
     """将可信QuerySpec编译结果送入统一Guard。"""
 
     sql = state.get("deterministic_sql", "")
+    selected_label = (
+        "deterministic_extended"
+        if state.get("query_plan_mode") == "deterministic_extended"
+        else "deterministic"
+    )
     return {
-        "selected_candidate": "deterministic",
+        "selected_candidate": selected_label,
         "candidate_selection_reason": state.get(
             "query_plan_reason", "基础查询确定性快路径。"
         ),
@@ -691,7 +819,12 @@ def _generation_system_prompt(
 14. 用户明确请求某个白名单表全部数据时，只查询该表并显式列出全部字段；
 15. 禁止SELECT *、写操作和跨库查询；
 16. 科学计数法是一个完整数值，例如2e-12不得拆成2和12；
-17. 用户没有要求数量时，不得自行添加LIMIT 1或其他限制性LIMIT，系统会统一添加资源上限。
+17. 用户没有要求数量时，不得自行添加LIMIT 1或其他限制性LIMIT，系统会统一添加资源上限；
+18. INITIAL表示每个sample_id最小point_index对应的记录，FINAL表示最大point_index对应的记录；
+19. 质量损失率固定为(initial_mass-final_mass)/NULLIF(initial_mass,0)，背温抬升固定为final_back_temperature-initial_back_temperature；
+20. 字段与字段比较必须保留为真实字段比较，例如ms.porosity_c > ms.porosity_v；
+21. Few-shot结构与当前QuerySpec不一致时不得复制；没有可靠结构时以QuerySpec和Schema为准；
+22. 若问题包含“前N个中再取前M个”等多阶段Top-K，不得猜测或拼接多个ORDER BY/LIMIT。
 """.strip()
 
 
@@ -896,6 +1029,31 @@ def _canonical_sql(sql: str) -> str:
         return sql.strip()
 
 
+def _guard_error_penalty(error: str, error_type: str) -> float:
+    """候选失败时按错误严重度评分，避免未知别名压过轻微冗余字段。"""
+
+    base = {
+        "policy": 1000.0,
+        "generation": 260.0,
+        "syntax": 240.0,
+        "schema": 120.0,
+        "semantic": 100.0,
+        "resource": 90.0,
+    }.get(error_type, 120.0)
+    rules = (
+        (r"未知表或派生表别名|不存在的表|未知表", 90.0),
+        (r"字段归属错误|未知字段|多个来源中存在", 65.0),
+        (r"排序字段错误|排序方向错误|Top-K数量不一致", 55.0),
+        (r"没有返回该真实字段|缺少返回字段|没有使用该字段", 45.0),
+        (r"IN子查询中使用LIMIT|multiple 'ORDER BY'", 50.0),
+        (r"无关字段|冗余字段", 12.0),
+    )
+    penalty = base
+    for pattern, weight in rules:
+        penalty += len(re.findall(pattern, error, flags=re.IGNORECASE)) * weight
+    return penalty
+
+
 def _evaluate_candidate(
     label: str,
     sql: str,
@@ -914,18 +1072,8 @@ def _evaluate_candidate(
     )
 
     if not result.valid:
-        severity = {
-            "policy": 1000.0,
-            "generation": 220.0,
-            "syntax": 200.0,
-            "schema": 150.0,
-            "semantic": 120.0,
-            "resource": 100.0,
-        }.get(result.error_type, 130.0)
-        error_lines = max(
-            1,
-            result.error.count("\n") + 1,
-        )
+        severity = _guard_error_penalty(result.error, result.error_type)
+        error_lines = max(1, result.error.count("\n") + 1)
         return {
             "label": label,
             "valid": False,
@@ -1139,6 +1287,29 @@ def validate_sql(
             "execution_error": "",
         }
 
+    if state.get("query_plan_mode") == "deterministic_extended":
+        valid, normalized_sql, error = validate_compiled_extended_sql(
+            state.get("raw_sql", ""),
+            state.get("query_spec", {}),
+            set(settings.allowed_tables),
+            settings.SQL_MAX_ROWS,
+        )
+        if not valid:
+            return {
+                "validation_error": error,
+                "validation_repairable": False,
+                "validation_error_type": "deterministic_extended",
+                "validated_sql": "",
+                "execution_error": "",
+            }
+        return {
+            "validation_error": "",
+            "validation_repairable": True,
+            "validation_error_type": "",
+            "validated_sql": normalized_sql,
+            "execution_error": "",
+        }
+
     result = validate_and_normalize_sql(
         sql=state.get("raw_sql", ""),
         allowed_tables=set(
@@ -1173,6 +1344,17 @@ def review_sql(
     """优先使用结构化QuerySpec和Guard；仅审查真正模糊的独立复杂SQL。"""
 
     question = effective_question(state)
+    if state.get("query_plan_mode") == "deterministic_extended":
+        return {
+            "review_called": False,
+            "review_passed": True,
+            "review_reason": "确定性扩展QuerySpec语义检查通过。",
+            "review_note": (
+                "INITIAL/FINAL、白名单派生指标、字段间比较、排序和LIMIT均由确定性编译器生成并校验。"
+            ),
+            "review_input_summary": "",
+        }
+
     covered, coverage_reason = assess_deterministic_semantic_coverage(
         question=question,
         sql=state["validated_sql"],
@@ -1688,6 +1870,32 @@ def format_result(
     }
 
 
+def format_unsupported_query(
+    state: Text2SQLState,
+) -> dict[str, Any]:
+    suggestions = list(state.get("unsupported_query_suggestions", []))
+    suggestion_text = "\n".join(
+        f"{index}. {item}" for index, item in enumerate(suggestions, start=1)
+    ) or "请把多阶段筛选拆成两到三轮查询。"
+    memory = mark_current_turn_status(
+        state.get("conversation_memory", {}),
+        question=state.get("question", ""),
+        status="unsupported",
+        resolved_question=effective_question(state),
+    )
+    return {
+        "conversation_memory": memory,
+        "final_status": "unsupported",
+        "final_answer": (
+            "当前问题包含多阶段候选筛选或二次Top-K，当前版本不在单条SQL中自动猜测其执行顺序。\n\n"
+            + str(state.get("unsupported_query_reason", ""))
+            + "\n\n建议拆成多轮查询：\n"
+            + suggestion_text
+            + "\n\n拆分后系统会通过短期记忆自动保留上一轮样本集合。"
+        ).strip(),
+    }
+
+
 def format_error(
     state: Text2SQLState,
 ) -> dict[str, Any]:
@@ -1794,6 +2002,11 @@ def route_after_execution(
 ) -> Literal["success", "repair", "error"]:
     if not state.get("execution_error"):
         return "success"
+
+    # 确定性扩展SQL由代码编译。若数据库仍拒绝执行，应直接暴露编译器问题，
+    # 而不是调用通用LLM修复并等待长时间超时。
+    if state.get("query_plan_mode") == "deterministic_extended":
+        return "error"
 
     if (
         state.get("retry_count", 0)

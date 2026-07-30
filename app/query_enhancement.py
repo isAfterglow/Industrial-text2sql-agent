@@ -321,6 +321,61 @@ def extract_common_filters(
     return _dedupe_dicts(filters, ("column", "operator", "value", "value_type"))
 
 
+def _extract_explicit_order(question: str) -> dict[str, Any] | None:
+    """解析“按X从低到高排列”等显式排序，优先于其他字段线索。"""
+
+    match = re.search(
+        r"(?:按|根据)\s*(?P<target>.{1,32}?)\s*"
+        r"(?P<direction>从高到低|从低到高|由高到低|由低到高|升序|降序)"
+        r"(?:排列|排序)?",
+        question,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    target = match.group("target").strip("，,、。；; ")
+    direction_word = match.group("direction")
+    direction = "DESC" if direction_word in {"从高到低", "由高到低", "降序"} else "ASC"
+
+    for metric_pattern, alias in _RANKING_METRICS:
+        if re.search(metric_pattern, target, flags=re.IGNORECASE):
+            metric = next(
+                (item for item in _METRIC_PATTERNS if item[3] == alias),
+                None,
+            )
+            if metric:
+                return {
+                    "kind": "metric",
+                    "column": metric[1],
+                    "alias": alias,
+                    "direction": direction,
+                }
+            return {
+                "kind": "derived" if alias in _DERIVED_ALIASES else "metric",
+                "column": alias,
+                "alias": alias,
+                "direction": direction,
+            }
+
+    for column, terms in _FIELD_TERMS.items():
+        if any(term in target for term in terms):
+            return {"kind": "column", "column": column, "direction": direction}
+    return None
+
+
+def _requested_metric_aliases(question: str) -> set[str]:
+    aliases: set[str] = set()
+    for pattern, _column, _aggregation, alias in _METRIC_PATTERNS:
+        if re.search(pattern, question, flags=re.IGNORECASE):
+            aliases.add(alias)
+    if re.search(r"质量损失率", question):
+        aliases.add("mass_loss_rate")
+    if re.search(r"背温抬升|背面温度抬升|背温升高量", question):
+        aliases.add("back_temperature_rise")
+    return aliases
+
+
 def _extract_metric_order(question: str) -> dict[str, Any] | None:
     for metric_pattern, alias in _RANKING_METRICS:
         match = re.search(
@@ -350,20 +405,24 @@ def augment_common_query_spec(
     base_spec: dict[str, Any] | None,
     query_delta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """补齐现有Schema规划器尚未稳定表达的常见时序语义。"""
+    """补齐常见时序、派生指标、字段比较与明确排序语义。"""
 
     spec = deepcopy(base_spec or {})
     delta = query_delta or {}
     unsupported = detect_unsupported_nested_topk(question)
     spec["capability_check"] = unsupported
     if unsupported["unsupported"]:
-        spec["eligible"] = False
-        spec["mode"] = "unsupported"
-        spec["query_type"] = "unsupported_nested_topk"
-        spec["reason"] = unsupported["reason"]
+        spec.update(
+            {
+                "eligible": False,
+                "mode": "unsupported",
+                "query_type": "unsupported_nested_topk",
+                "reason": unsupported["reason"],
+            }
+        )
         return spec
 
-    extracted_metrics, derived_metrics = extract_common_temporal_metrics(question)
+    extracted_metrics, extracted_derived = extract_common_temporal_metrics(question)
     existing_metrics = list(spec.get("all_temporal_metrics") or spec.get("temporal_metrics") or [])
     delta_metrics = list(delta.get("temporal_metrics") or [])
     metrics = _dedupe_dicts(
@@ -375,6 +434,14 @@ def augment_common_query_spec(
         for item in metrics
         if str(item.get("aggregation", "")).upper() in _SUPPORTED_TEMPORAL_AGGREGATIONS
     ]
+    derived_metrics = _dedupe_dicts(
+        [
+            *list(spec.get("derived_metrics") or []),
+            *list(delta.get("derived_metrics") or []),
+            *extracted_derived,
+        ],
+        ("alias", "operation"),
+    )
 
     filters = extract_common_filters(
         question,
@@ -383,41 +450,27 @@ def augment_common_query_spec(
 
     requested_outputs = set(infer_requested_output_columns(question))
     explicit_columns = set(match_question_semantic_columns(question))
-    has_output_cue = bool(re.search(r"返回|显示|列出|同时返回|并返回|只返回|只显示", question))
+    has_output_cue = bool(
+        re.search(r"返回|显示|列出|同时返回|并返回|只返回|只显示", question)
+    )
     if not requested_outputs and has_output_cue:
         requested_outputs = explicit_columns
 
-    derived_aliases = {item["alias"] for item in derived_metrics}
-    metric_aliases = {item.get("alias", "") for item in metrics}
-    output_columns: list[str] = ["sample_id"]
+    metric_aliases = {str(item.get("alias", "")) for item in metrics if item.get("alias")}
+    derived_aliases = {str(item.get("alias", "")) for item in derived_metrics if item.get("alias")}
+    explicitly_requested_aliases = _requested_metric_aliases(question)
 
+    output_columns: list[str] = ["sample_id"]
     if has_output_cue:
-        scalar_outputs = sorted(
-            column
-            for column in requested_outputs
-            if column not in _RESPONSE_COLUMNS and column != "point_index"
+        output_columns.extend(
+            sorted(
+                column
+                for column in requested_outputs
+                if column not in _RESPONSE_COLUMNS and column != "point_index"
+            )
         )
-        output_columns.extend(scalar_outputs)
-        for metric in metrics:
-            alias = str(metric.get("alias", ""))
-            phrase_map = {
-                "peak_surface_temperature": r"峰值表面温度|表面温度峰值|峰值表温",
-                "peak_back_temperature": r"峰值背面温度|背面温度峰值|峰值背温",
-                "initial_mass": r"初始质量",
-                "final_mass": r"最终质量",
-                "initial_back_temperature": r"初始背面温度|初始背温",
-                "final_back_temperature": r"最终背面温度|最终背温",
-                "initial_surface_temperature": r"初始表面温度|初始表温",
-                "final_surface_temperature": r"最终表面温度|最终表温",
-            }
-            pattern = phrase_map.get(alias)
-            if pattern and re.search(pattern, question):
-                output_columns.append(alias)
-        for alias in sorted(derived_aliases):
-            if alias == "mass_loss_rate" and "质量损失率" in question:
-                output_columns.append(alias)
-            if alias == "back_temperature_rise" and re.search(r"背温抬升|背面温度抬升", question):
-                output_columns.append(alias)
+        # 不依赖上游的原始字段映射，直接按“初始/最终/峰值/变化率”短语补充别名。
+        output_columns.extend(sorted(explicitly_requested_aliases))
     else:
         output_columns.extend(
             column
@@ -425,15 +478,19 @@ def augment_common_query_spec(
             if column not in _RESPONSE_COLUMNS and column != "point_index"
         )
         output_columns.extend(alias for alias in metric_aliases if alias)
-        output_columns.extend(sorted(derived_aliases))
+        output_columns.extend(alias for alias in derived_aliases if alias)
 
-    output_columns = list(dict.fromkeys(output_columns))
-
-    order_by = _extract_metric_order(question) or deepcopy(spec.get("order_by"))
+    # 明确“按X排列”优先级最高；其次才是“X最高/最低”的排名语义；
+    # 最后才沿用上游QuerySpec，避免返回字段覆盖排序字段。
+    order_by = (
+        _extract_explicit_order(question)
+        or _extract_metric_order(question)
+        or deepcopy(spec.get("order_by"))
+    )
     if isinstance(order_by, dict):
         order_alias = str(order_by.get("alias") or order_by.get("column") or "")
         matching_metric = next(
-            (item for item in metrics if item.get("alias") == order_alias),
+            (item for item in metrics if str(item.get("alias", "")) == order_alias),
             None,
         )
         if matching_metric:
@@ -443,6 +500,11 @@ def augment_common_query_spec(
                 "alias": matching_metric.get("alias"),
                 "direction": order_by.get("direction", "ASC"),
             }
+        # 排序所需的聚合/派生指标必须在当前查询层真实定义。
+        if order_alias in metric_aliases or order_alias in derived_aliases or order_alias in _DERIVED_ALIASES:
+            output_columns.append(order_alias)
+
+    output_columns = list(dict.fromkeys(output_columns))
 
     owner_map = _owner_map()
     scalar_columns = {
@@ -463,12 +525,12 @@ def augment_common_query_spec(
             scalar_columns.add(order_column)
 
     scalar_tables = sorted({owner_map[column] for column in scalar_columns if column in owner_map})
-
     needs_extended = bool(
         metrics
         or derived_metrics
         or any(item.get("value_type") == "column" for item in filters)
     )
+
     if needs_extended:
         spec.update(
             {
@@ -502,11 +564,12 @@ def augment_common_query_spec(
         if metrics:
             spec["temporal_metrics"] = metrics
             spec["all_temporal_metrics"] = deepcopy(metrics)
+        if derived_metrics:
+            spec["derived_metrics"] = derived_metrics
         if order_by:
             spec["order_by"] = order_by
 
     return spec
-
 
 def _metric_alias_expression(alias: str) -> str:
     mapping = {
@@ -547,6 +610,13 @@ def compile_extended_query_sql(spec: dict[str, Any]) -> str:
     filters = list(spec.get("filters") or [])
     order_by = spec.get("order_by") or {}
 
+    metric_by_alias = {str(item.get("alias", "")): item for item in metrics if item.get("alias")}
+    derived_aliases = {str(item.get("alias", "")) for item in derived_metrics if item.get("alias")}
+    order_alias = str(order_by.get("alias") or order_by.get("column") or "")
+    if order_alias in metric_by_alias or order_alias in derived_aliases or order_alias in _DERIVED_ALIASES:
+        output_columns.append(order_alias)
+    output_columns = list(dict.fromkeys(output_columns))
+
     needed_scalar_columns: set[str] = set()
     for column in output_columns:
         if column in owner_map and column not in _RESPONSE_COLUMNS and column != "sample_id":
@@ -558,24 +628,26 @@ def compile_extended_query_sql(spec: dict[str, Any]) -> str:
             needed_scalar_columns.add(column)
         if item.get("value_type") == "column" and value in owner_map and value not in _RESPONSE_COLUMNS:
             needed_scalar_columns.add(value)
-    order_column = str(order_by.get("column", ""))
-    if order_column in owner_map and order_column not in _RESPONSE_COLUMNS:
-        needed_scalar_columns.add(order_column)
+    if order_alias in owner_map and order_alias not in _RESPONSE_COLUMNS:
+        needed_scalar_columns.add(order_alias)
 
     needs_mtp = any(owner_map.get(column) == "material_thermal_property" for column in needed_scalar_columns)
-
-    metric_by_alias = {str(item.get("alias", "")): item for item in metrics}
     aggregate_metrics = [
-        item for item in metrics if str(item.get("aggregation", "")).upper() in {"MAX", "MIN", "AVG", "SUM"}
+        item for item in metrics
+        if str(item.get("aggregation", "")).upper() in {"MAX", "MIN", "AVG", "SUM"}
     ]
-    initial_metrics = [item for item in metrics if str(item.get("aggregation", "")).upper() == "INITIAL"]
-    final_metrics = [item for item in metrics if str(item.get("aggregation", "")).upper() == "FINAL"]
+    initial_metrics = [
+        item for item in metrics
+        if str(item.get("aggregation", "")).upper() == "INITIAL"
+    ]
+    final_metrics = [
+        item for item in metrics
+        if str(item.get("aggregation", "")).upper() == "FINAL"
+    ]
 
     joins: list[str] = []
     if needs_mtp:
-        joins.append(
-            "JOIN material_thermal_property AS mtp ON ms.sample_id = mtp.sample_id"
-        )
+        joins.append("JOIN material_thermal_property AS mtp ON ms.sample_id = mtp.sample_id")
 
     if aggregate_metrics:
         aggregate_selects = ["tr.sample_id"]
@@ -585,26 +657,19 @@ def compile_extended_query_sql(spec: dict[str, Any]) -> str:
             alias = str(metric.get("alias", ""))
             aggregate_selects.append(f"{aggregation}(tr.{column}) AS {alias}")
         joins.append(
-            "JOIN (SELECT "
-            + ", ".join(aggregate_selects)
+            "JOIN (SELECT " + ", ".join(aggregate_selects)
             + " FROM thermal_response AS tr GROUP BY tr.sample_id) AS agg "
             + "ON ms.sample_id = agg.sample_id"
         )
 
     if initial_metrics:
-        initial_columns = sorted({str(item.get("column", "")) for item in initial_metrics})
         select_items = ["initial_row.sample_id"]
-        for column in initial_columns:
-            aliases = [
-                str(item.get("alias", ""))
-                for item in initial_metrics
-                if str(item.get("column", "")) == column
-            ]
-            for alias in aliases:
-                select_items.append(f"initial_row.{column} AS {alias}")
+        for metric in initial_metrics:
+            select_items.append(
+                f"initial_row.{metric.get('column')} AS {metric.get('alias')}"
+            )
         joins.append(
-            "JOIN (SELECT "
-            + ", ".join(select_items)
+            "JOIN (SELECT " + ", ".join(dict.fromkeys(select_items))
             + " FROM thermal_response AS initial_row "
             + "JOIN (SELECT sample_id, MIN(point_index) AS min_point_index "
             + "FROM thermal_response GROUP BY sample_id) AS initial_idx "
@@ -614,19 +679,13 @@ def compile_extended_query_sql(spec: dict[str, Any]) -> str:
         )
 
     if final_metrics:
-        final_columns = sorted({str(item.get("column", "")) for item in final_metrics})
         select_items = ["final_row.sample_id"]
-        for column in final_columns:
-            aliases = [
-                str(item.get("alias", ""))
-                for item in final_metrics
-                if str(item.get("column", "")) == column
-            ]
-            for alias in aliases:
-                select_items.append(f"final_row.{column} AS {alias}")
+        for metric in final_metrics:
+            select_items.append(
+                f"final_row.{metric.get('column')} AS {metric.get('alias')}"
+            )
         joins.append(
-            "JOIN (SELECT "
-            + ", ".join(select_items)
+            "JOIN (SELECT " + ", ".join(dict.fromkeys(select_items))
             + " FROM thermal_response AS final_row "
             + "JOIN (SELECT sample_id, MAX(point_index) AS max_point_index "
             + "FROM thermal_response GROUP BY sample_id) AS final_idx "
@@ -643,9 +702,8 @@ def compile_extended_query_sql(spec: dict[str, Any]) -> str:
             table = owner_map[column]
             alias = _TABLE_ALIASES.get(table, table)
             select_items.append(f"{alias}.{column}")
-        elif column in metric_by_alias or column in _DERIVED_ALIASES:
+        elif column in metric_by_alias or column in derived_aliases or column in _DERIVED_ALIASES:
             select_items.append(f"{_metric_alias_expression(column)} AS {column}")
-
     if not select_items:
         select_items = ["ms.sample_id"]
 
@@ -654,8 +712,9 @@ def compile_extended_query_sql(spec: dict[str, Any]) -> str:
     if len(sample_ids) == 1:
         where_parts.append(f"ms.sample_id = '{sample_ids[0]}'")
     elif sample_ids:
-        literals = ", ".join(f"'{value}'" for value in sample_ids)
-        where_parts.append(f"ms.sample_id IN ({literals})")
+        where_parts.append(
+            "ms.sample_id IN (" + ", ".join(f"'{value}'" for value in sample_ids) + ")"
+        )
 
     for item in filters:
         column = str(item.get("column", ""))
@@ -673,17 +732,13 @@ def compile_extended_query_sql(spec: dict[str, Any]) -> str:
             right = _normalize_numeric(value)
         where_parts.append(f"{left} {operator} {right}")
 
-    sql_parts = [
-        "SELECT " + ", ".join(select_items),
-        "FROM material_static AS ms",
-        *joins,
-    ]
+    sql_parts = ["SELECT " + ", ".join(select_items), "FROM material_static AS ms", *joins]
     if where_parts:
         sql_parts.append("WHERE " + " AND ".join(where_parts))
 
-    if isinstance(order_by, dict) and (order_by.get("alias") or order_by.get("column")):
-        order_alias = str(order_by.get("alias") or order_by.get("column"))
-        if order_alias in metric_by_alias or order_alias in _DERIVED_ALIASES:
+    if order_alias:
+        if order_alias in metric_by_alias or order_alias in derived_aliases or order_alias in _DERIVED_ALIASES:
+            # 上面已确保该别名进入SELECT，ORDER BY别名在MySQL中可见。
             order_expression = order_alias
         elif order_alias in owner_map:
             table_alias = _TABLE_ALIASES.get(owner_map[order_alias], owner_map[order_alias])
@@ -696,9 +751,7 @@ def compile_extended_query_sql(spec: dict[str, Any]) -> str:
     limit = spec.get("limit")
     if isinstance(limit, int) and limit > 0:
         sql_parts.append(f"LIMIT {limit}")
-
     return " ".join(sql_parts)
-
 
 def validate_compiled_extended_sql(
     sql: str,
@@ -706,13 +759,12 @@ def validate_compiled_extended_sql(
     allowed_tables: set[str],
     max_rows: int,
 ) -> tuple[bool, str, str]:
-    """验证由本模块确定性编译的SQL，不依赖旧Guard对派生别名的理解。"""
+    """验证确定性扩展SQL，包括派生排序别名是否真实定义。"""
 
     try:
         tree = sqlglot.parse_one(sql, read="mysql")
     except ParseError as exc:
         return False, "", f"确定性扩展SQL解析失败：{exc}"
-
     if not isinstance(tree, exp.Select):
         return False, "", "确定性扩展查询必须是SELECT。"
 
@@ -720,11 +772,7 @@ def validate_compiled_extended_sql(
     unknown_tables = used_tables - set(allowed_tables)
     if unknown_tables:
         return False, "", "确定性扩展SQL使用未知表：" + ", ".join(sorted(unknown_tables))
-
-    forbidden = tuple(
-        tree.find_all(exp.Insert, exp.Update, exp.Delete, exp.Drop, exp.Alter, exp.Create)
-    )
-    if forbidden:
+    if tuple(tree.find_all(exp.Insert, exp.Update, exp.Delete, exp.Drop, exp.Alter, exp.Create)):
         return False, "", "确定性扩展SQL包含写操作。"
 
     top_level_names: set[str] = set()
@@ -763,13 +811,17 @@ def validate_compiled_extended_sql(
         ordered_sql = ordered.this.sql(dialect="mysql") if isinstance(ordered, exp.Ordered) else ordered.sql(dialect="mysql")
         if expected_order not in ordered_sql:
             return False, "", f"确定性扩展SQL排序字段应为{expected_order}。"
+        if (
+            expected_order in _DERIVED_ALIASES
+            or str(order_by.get("kind", "")) in {"metric", "derived"}
+        ) and expected_order not in top_level_names:
+            return False, "", f"排序别名{expected_order}未在顶层SELECT中定义。"
         actual_direction = "DESC" if isinstance(ordered, exp.Ordered) and bool(ordered.args.get("desc")) else "ASC"
         expected_direction = str(order_by.get("direction", "ASC")).upper()
         if actual_direction != expected_direction:
             return False, "", f"确定性扩展SQL排序方向应为{expected_direction}。"
 
     return True, tree.sql(dialect="mysql"), ""
-
 
 def _set_jaccard(left: Iterable[str], right: Iterable[str]) -> float:
     left_set = {str(item) for item in left if str(item)}
@@ -784,6 +836,7 @@ def build_query_signature(query_spec: dict[str, Any], question: str = "") -> dic
     temporal_metrics = list(query_spec.get("all_temporal_metrics") or query_spec.get("temporal_metrics") or [])
     derived_metrics = list(query_spec.get("derived_metrics") or [])
     capability = query_spec.get("capability_check") or detect_unsupported_nested_topk(question)
+    order_by = query_spec.get("order_by") or {}
 
     temporal_ops = {
         str(item.get("aggregation", "")).upper()
@@ -796,14 +849,18 @@ def build_query_signature(query_spec: dict[str, Any], question: str = "") -> dic
             temporal_ops.add("RATE")
         elif operation == "DELTA":
             temporal_ops.add("DELTA")
+    order_alias = str(order_by.get("alias") or order_by.get("column") or "")
+    if order_alias == "mass_loss_rate":
+        temporal_ops.update({"INITIAL", "FINAL", "RATE"})
+    elif order_alias == "back_temperature_rise":
+        temporal_ops.update({"INITIAL", "FINAL", "DELTA"})
 
     filter_types = {
         "column_column" if item.get("value_type") == "column" else "column_literal"
         for item in filters
     }
-    order_by = query_spec.get("order_by") or {}
     tables = set(query_spec.get("scalar_tables") or [])
-    if temporal_metrics or derived_metrics:
+    if temporal_metrics or derived_metrics or str(order_by.get("kind", "")) in {"metric", "derived"}:
         tables.add("thermal_response")
 
     query_type = str(query_spec.get("query_type", "complex_or_uncertain"))
@@ -812,6 +869,11 @@ def build_query_signature(query_spec: dict[str, Any], question: str = "") -> dic
         family += "_multi_table"
 
     stage_count = max(1, len(capability.get("stages", []))) if capability.get("unsupported") else 1
+    has_derived = bool(
+        derived_metrics
+        or str(order_by.get("kind", "")) == "derived"
+        or order_alias in _DERIVED_ALIASES
+    )
     return {
         "query_type": query_type,
         "query_family": family,
@@ -822,11 +884,10 @@ def build_query_signature(query_spec: dict[str, Any], question: str = "") -> dic
         "ranking_direction": str(order_by.get("direction", "")),
         "ranking_stage_count": stage_count,
         "has_nested_topk": bool(capability.get("unsupported", False)),
-        "has_derived_metric": bool(derived_metrics),
+        "has_derived_metric": has_derived,
         "select_role_count": len(query_spec.get("output_columns") or query_spec.get("select_columns") or []),
         "has_limit": query_spec.get("limit") is not None,
     }
-
 
 def hard_signature_compatible(
     current: dict[str, Any],

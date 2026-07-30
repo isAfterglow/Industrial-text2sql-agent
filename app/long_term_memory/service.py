@@ -10,6 +10,12 @@ from typing import Any, Iterable
 import numpy as np
 
 from app.schema import get_schema_catalog
+from app.query_enhancement import (
+    build_query_signature,
+    hard_signature_compatible,
+    query_signature_similarity,
+    signature_summary,
+)
 
 from .config import LongTermMemorySettings, get_long_term_memory_settings
 from .embeddings import EmbeddingProvider
@@ -144,6 +150,7 @@ def _episodic_dedupe_key(query_spec: dict[str, Any]) -> str:
     filters = query_spec.get("filters") or query_spec.get("where_filters") or []
     temporal_metrics = query_spec.get("temporal_metrics") or []
     payload = {
+        "query_signature": build_query_signature(query_spec),
         "query_type": query_spec.get("query_type", ""),
         "select_columns": sorted(query_spec.get("select_columns", [])),
         "filter_roles": sorted(
@@ -262,9 +269,11 @@ class LongTermMemoryService:
         sql: str,
         source: str,
         repaired: bool = False,
+        case_context: dict[str, Any] | None = None,
     ) -> MemoryWriteResult:
         query_type = str(query_spec.get("query_type", "complex_or_uncertain"))
         title = f"案例：{query_type}"
+        context = dict(case_context or {})
         content = (
             f"用户问题：{question}\n"
             f"消解问题：{resolved_question}\n"
@@ -280,9 +289,15 @@ class LongTermMemoryService:
                 "resolved_question": resolved_question,
                 "query_type": query_type,
                 "query_spec": query_spec,
+                "query_signature": build_query_signature(query_spec, resolved_question or question),
                 "sql": sql,
                 "sql_template": _parameterize_sql(sql),
                 "repaired": repaired,
+                "dependency": context.get("dependency", ""),
+                "memory_used": bool(context.get("memory_used", False)),
+                "independent_case": bool(
+                    context.get("independent_case", source == "manual_case")
+                ),
             },
             source=source,
             dedupe_key=_episodic_dedupe_key(query_spec),
@@ -498,25 +513,205 @@ class LongTermMemoryService:
             hints.append(record.content)
         return augmented, hints, applied_ids
 
+    def _record_is_safe_few_shot(self, record: MemoryRecord) -> tuple[bool, str]:
+        """拒绝历史范围污染、具体样本集合和不支持结构产生的案例。"""
+
+        metadata = dict(record.metadata or {})
+        query_spec = metadata.get("query_spec")
+        if not isinstance(query_spec, dict):
+            return False, "missing_query_spec"
+        if query_spec.get("sample_ids"):
+            return False, "history_bound_sample_scope"
+        if query_spec.get("capability_check", {}).get("unsupported"):
+            return False, "unsupported_case"
+        if str(query_spec.get("query_type", "")) == "unsupported_nested_topk":
+            return False, "unsupported_case"
+        if query_spec.get("memory_resolved") or query_spec.get("structured_context_complete"):
+            return False, "memory_resolved_case"
+        resolved = str(metadata.get("resolved_question", ""))
+        if "样本编号限定为" in resolved:
+            return False, "history_bound_sample_scope"
+        if "independent_case" in metadata and not bool(metadata.get("independent_case")):
+            return False, "non_independent_case"
+        return True, ""
+
+
+    def _record_signature(self, record: MemoryRecord) -> dict[str, Any]:
+        signature = record.metadata.get("query_signature")
+        if isinstance(signature, dict) and signature:
+            return signature
+        query_spec = record.metadata.get("query_spec")
+        if isinstance(query_spec, dict):
+            return build_query_signature(
+                query_spec,
+                str(
+                    record.metadata.get("resolved_question")
+                    or record.metadata.get("question", "")
+                ),
+            )
+        return {}
+
+    def _candidate_similarity(
+        self,
+        left: MemoryRecord,
+        right: MemoryRecord,
+    ) -> float:
+        vector_score = _cosine_similarity(left.embedding, right.embedding)
+        if vector_score > 0.0:
+            return vector_score
+        left_question = str(
+            left.metadata.get("resolved_question")
+            or left.metadata.get("question", "")
+        )
+        right_question = str(
+            right.metadata.get("resolved_question")
+            or right.metadata.get("question", "")
+        )
+        structure_score = query_signature_similarity(
+            self._record_signature(left),
+            self._record_signature(right),
+        )
+        return 0.55 * _lexical_score(left_question, right_question) + 0.45 * structure_score
+
+    def _mmr_select(
+        self,
+        candidates: list[MemoryRecord],
+        max_examples: int,
+    ) -> list[MemoryRecord]:
+        if not candidates or max_examples <= 0:
+            return []
+        selected: list[MemoryRecord] = []
+        remaining = list(candidates)
+        lambda_value = min(1.0, max(0.0, self.settings.episodic_mmr_lambda))
+
+        while remaining and len(selected) < max_examples:
+            if not selected:
+                chosen = max(remaining, key=lambda item: item.score)
+            else:
+                def mmr_score(item: MemoryRecord) -> float:
+                    redundancy = max(
+                        self._candidate_similarity(item, selected_item)
+                        for selected_item in selected
+                    )
+                    return lambda_value * item.score - (1.0 - lambda_value) * redundancy
+
+                chosen = max(remaining, key=mmr_score)
+            selected.append(chosen)
+            remaining.remove(chosen)
+        return selected
+
+    def retrieve_episodic_with_diagnostics(
+        self,
+        question: str,
+        query_spec: dict[str, Any],
+    ) -> tuple[list[MemoryRecord], dict[str, Any]]:
+        current_signature = build_query_signature(query_spec, question)
+        if current_signature.get("has_nested_topk"):
+            return [], {
+                "candidate_count": 0,
+                "hard_compatible_count": 0,
+                "selected_count": 0,
+                "few_shot_used": False,
+                "skip_reason": "unsupported_nested_topk",
+                "query_signature": current_signature,
+            }
+
+        query_type = str(query_spec.get("query_type", ""))
+        retrieval_text = (
+            f"问题：{question}\n"
+            f"查询类型：{query_type}\n"
+            f"返回字段：{query_spec.get('output_columns') or query_spec.get('select_columns', [])}\n"
+            f"排序：{query_spec.get('order_by')}\n"
+            f"聚合：{query_spec.get('all_temporal_metrics') or query_spec.get('temporal_metrics', [])}\n"
+            f"派生指标：{query_spec.get('derived_metrics', [])}\n"
+            f"结构签名：{signature_summary(current_signature)}"
+        )
+
+        semantic_candidates = self.search(
+            retrieval_text,
+            memory_types=["episodic"],
+            top_k=max(1, self.settings.episodic_candidate_k),
+            min_score=self.settings.episodic_min_score,
+        )
+
+        compatible: list[MemoryRecord] = []
+        rejected_reasons: dict[str, int] = {}
+        for record in semantic_candidates:
+            safe_case, unsafe_reason = self._record_is_safe_few_shot(record)
+            if not safe_case:
+                rejected_reasons[unsafe_reason] = rejected_reasons.get(unsafe_reason, 0) + 1
+                continue
+            candidate_signature = self._record_signature(record)
+            is_compatible, reason = hard_signature_compatible(
+                current_signature, candidate_signature
+            )
+            if not is_compatible:
+                rejected_reasons[reason] = rejected_reasons.get(reason, 0) + 1
+                continue
+
+            structural_score = query_signature_similarity(
+                current_signature, candidate_signature
+            )
+            if structural_score < self.settings.episodic_structural_min_score:
+                rejected_reasons["low_structural_score"] = (
+                    rejected_reasons.get("low_structural_score", 0) + 1
+                )
+                continue
+
+            semantic_score = float(record.score)
+            current_tables = set(current_signature.get("tables", []))
+            candidate_tables = set(candidate_signature.get("tables", []))
+            schema_score = (
+                len(current_tables & candidate_tables)
+                / max(1, len(current_tables | candidate_tables))
+                if current_tables or candidate_tables
+                else 1.0
+            )
+            final_score = (
+                0.35 * semantic_score
+                + 0.50 * structural_score
+                + 0.15 * schema_score
+            )
+            if final_score < self.settings.episodic_final_min_score:
+                rejected_reasons["low_final_score"] = (
+                    rejected_reasons.get("low_final_score", 0) + 1
+                )
+                continue
+
+            record.metadata = dict(record.metadata)
+            record.metadata["retrieval_scores"] = {
+                "semantic": round(semantic_score, 4),
+                "structural": round(structural_score, 4),
+                "schema": round(schema_score, 4),
+                "final": round(final_score, 4),
+            }
+            record.metadata["query_signature"] = candidate_signature
+            record.score = float(final_score)
+            compatible.append(record)
+
+        compatible.sort(key=lambda item: item.score, reverse=True)
+        selected = self._mmr_select(
+            compatible,
+            max_examples=max(1, self.settings.episodic_max_examples),
+        )
+        diagnostics = {
+            "candidate_count": len(semantic_candidates),
+            "hard_compatible_count": len(compatible),
+            "selected_count": len(selected),
+            "few_shot_used": bool(selected),
+            "skip_reason": "" if selected else "no_structurally_compatible_example",
+            "rejected_reasons": rejected_reasons,
+            "query_signature": current_signature,
+        }
+        return selected, diagnostics
+
     def retrieve_episodic(
         self,
         question: str,
         query_spec: dict[str, Any],
     ) -> list[MemoryRecord]:
-        query_type = str(query_spec.get("query_type", ""))
-        retrieval_text = (
-            f"问题：{question}\n"
-            f"查询类型：{query_type}\n"
-            f"返回字段：{query_spec.get('select_columns', [])}\n"
-            f"排序：{query_spec.get('order_by')}\n"
-            f"聚合：{query_spec.get('temporal_metrics', [])}"
-        )
-        return self.search(
-            retrieval_text,
-            memory_types=["episodic"],
-            top_k=self.settings.episodic_top_k,
-            min_score=self.settings.episodic_min_score,
-        )
+        memories, _ = self.retrieve_episodic_with_diagnostics(question, query_spec)
+        return memories
 
     def retrieve_procedural(self, error_text: str) -> list[MemoryRecord]:
         return self.search(
@@ -530,25 +725,28 @@ class LongTermMemoryService:
         if not memories:
             return ""
         blocks = [
-            "以下是长期记忆中已验证成功的相似案例，仅参考查询结构。",
-            "必须以当前问题、当前Schema和当前QuerySpec为准，",
-            "不得复制历史sample_id、过滤值或LIMIT。",
+            "以下案例经过Schema与SQL Guard验证，只用于参考结构。",
+            "必须以当前问题、当前Schema和当前QuerySpec为准。",
+            "禁止复制历史sample_id、过滤值、LIMIT或不匹配的派生指标。",
+            "没有完全匹配的信息时不得猜测；应触发澄清或能力边界提示。",
         ]
         for index, record in enumerate(memories, start=1):
             metadata = record.metadata
+            query_spec = metadata.get("query_spec", {})
+            signature = metadata.get("query_signature") or self._record_signature(record)
+            scores = metadata.get("retrieval_scores", {})
             blocks.append(
                 "\n".join(
                     [
-                        f"案例{index}（相似度{record.score:.3f}）：",
+                        f"案例{index}（混合匹配分{record.score:.3f}）：",
                         f"问题：{metadata.get('resolved_question') or metadata.get('question', '')}",
-                        f"查询类型：{metadata.get('query_type', '')}",
-                        "QuerySpec："
-                        + json.dumps(
-                            metadata.get("query_spec", {}),
-                            ensure_ascii=False,
-                            sort_keys=True,
-                        ),
-                        f"SQL结构模板：{metadata.get('sql_template', '')}",
+                        f"结构：{signature_summary(signature)}",
+                        f"过滤：{query_spec.get('filters') or query_spec.get('where_filters', [])}",
+                        f"排序：{query_spec.get('order_by')}",
+                        f"时序指标：{query_spec.get('all_temporal_metrics') or query_spec.get('temporal_metrics', [])}",
+                        f"派生指标：{query_spec.get('derived_metrics', [])}",
+                        f"参考SQL模板：{metadata.get('sql_template', '')}",
+                        f"检索分解：{json.dumps(scores, ensure_ascii=False, sort_keys=True)}",
                     ]
                 )
             )
@@ -564,25 +762,61 @@ class LongTermMemoryService:
 
     def should_retrieve_episodic(self, query_spec: dict[str, Any]) -> bool:
         query_type = str(query_spec.get("query_type", ""))
-        if not query_spec:
+        if not query_spec or query_type == "unsupported_nested_topk":
+            return False
+        if query_spec.get("capability_check", {}).get("unsupported"):
             return False
         if not query_spec.get("eligible"):
             return True
-        return any(
-            marker in query_type
-            for marker in ("multi_table", "temporal", "aggregate", "final")
+        return bool(
+            query_spec.get("temporal_metrics")
+            or query_spec.get("derived_metrics")
+            or len(query_spec.get("scalar_tables", [])) > 1
+            or any(
+                marker in query_type
+                for marker in ("multi_table", "temporal", "aggregate", "final", "extended")
+            )
         )
 
     def should_auto_save_case(self, state: dict[str, Any]) -> bool:
+        """只自动保存自包含、无历史范围绑定且完整校验成功的案例。"""
+
         if not self.settings.auto_save:
             return False
+        if state.get("execution_error") or state.get("validation_error"):
+            return False
+        if not state.get("context_resolution_valid", True):
+            return False
+        coverage = state.get("current_turn_coverage") or {}
+        if coverage and not coverage.get("passed", False):
+            return False
+        if coverage.get("historical_scope_leak"):
+            return False
+
         query_spec = state.get("query_spec", {})
+        if not isinstance(query_spec, dict) or not query_spec:
+            return False
+        if query_spec.get("sample_ids"):
+            return False
+        if query_spec.get("capability_check", {}).get("unsupported"):
+            return False
         query_type = str(query_spec.get("query_type", ""))
+        if query_type == "unsupported_nested_topk":
+            return False
+
+        delta = state.get("query_delta") or {}
+        if str(delta.get("dependency", "independent")) != "independent":
+            return False
+        if state.get("memory_used"):
+            return False
+        if delta.get("independent_complete") is False and delta.get("explicit_reference"):
+            return False
+
         if state.get("retry_count", 0) > 0:
             return True
         return any(
             marker in query_type
-            for marker in ("multi_table", "temporal", "aggregate", "final")
+            for marker in ("multi_table", "temporal", "aggregate", "final", "extended")
         )
 
     def auto_save_from_state(self, state: dict[str, Any]) -> dict[str, Any]:
@@ -606,6 +840,11 @@ class LongTermMemoryService:
                     else "successful_query"
                 ),
                 repaired=bool(state.get("retry_count", 0) > 0),
+                case_context={
+                    "dependency": (state.get("query_delta") or {}).get("dependency", ""),
+                    "memory_used": bool(state.get("memory_used", False)),
+                    "independent_case": True,
+                },
             )
             saved.append(
                 {

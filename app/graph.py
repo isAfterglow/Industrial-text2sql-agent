@@ -17,6 +17,7 @@ from app.nodes import (
     route_after_context_resolution,
     format_error,
     format_result,
+    format_unsupported_query,
     generate_full_sql,
     generate_simple_sql,
     generate_pruned_sql,
@@ -38,7 +39,7 @@ from app.trace import traced_node
 
 
 def build_graph():
-    """构建V0.8.1长期记忆、短期记忆与双Schema候选工作流。"""
+    """构建V0.8.2常见时序增强、结构感知Few-shot与双Schema候选工作流。"""
 
     builder = StateGraph(Text2SQLState)
 
@@ -63,6 +64,7 @@ def build_graph():
         ("update_session_memory", update_session_memory),
         ("update_long_term_memory", update_long_term_memory),
         ("format_result", format_result),
+        ("format_unsupported_query", format_unsupported_query),
         ("format_error", format_error),
     ):
         builder.add_node(
@@ -94,6 +96,7 @@ def build_graph():
         {
             "simple": "generate_simple_sql",
             "rsl": "generate_full_sql",
+            "unsupported": "format_unsupported_query",
         },
     )
     builder.add_edge("generate_simple_sql", "validate_sql")
@@ -150,6 +153,7 @@ def build_graph():
     builder.add_edge("update_long_term_memory", "format_result")
     builder.add_edge("format_result", END)
     builder.add_edge("request_clarification", END)
+    builder.add_edge("format_unsupported_query", END)
     builder.add_edge("format_error", END)
 
     return builder.compile()

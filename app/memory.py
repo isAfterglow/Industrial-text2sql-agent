@@ -353,50 +353,116 @@ def _has_explicit_reference(question: str) -> bool:
 
 
 def _question_is_complete(current_spec: dict[str, Any], question: str) -> bool:
-    """判断当前轮能否在不依赖历史状态的情况下形成完整查询。
+    """判断当前轮是否是一个自包含查询，而不是依赖历史的修改片段。
 
-    核心原则：
-    1. 明确代词仍然属于多轮引用；
-    2. “重新查询/从头查询”只要字段、排序或条件完整，就强制视为新查询；
-    3. “改成3个/只看密度”等片段才属于上一查询修改；
-    4. Top-K表达本身不是修改标志，因为它常出现在完整新查询中。
+    “是否独立”与“当前版本是否能够执行”必须分开：复杂或暂不支持的查询，
+    只要自身包含明确对象、指标、条件/排序/数量，也仍然属于独立新查询。
     """
 
     normalized = str(question).strip()
-    if _has_explicit_reference(normalized):
+    if not normalized or _has_explicit_reference(normalized):
         return False
 
-    meaningful = bool(
-        current_spec.get("eligible")
-        or (
-            current_spec.get("query_type")
-            in {"multi_table_topk", "multi_table_filter", "multi_table_projection"}
-            and (
-                current_spec.get("select_columns")
-                or current_spec.get("filters")
-                or current_spec.get("sample_ids")
-                or current_spec.get("order_by")
-            )
+    # 纯修改片段仍然承接上一轮；但完整句中出现“最高/最低”不属于修改信号。
+    if _TOPK_FRAGMENT_RE.fullmatch(normalized):
+        return False
+    if _CONTINUATION_PREFIX_RE.search(normalized) or _MODIFICATION_RE.search(normalized):
+        # “重新查询/从头查询”是显式重置，不受修改词影响。
+        if not _RESET_QUERY_RE.search(normalized):
+            return False
+
+    explicit_columns = set(match_question_semantic_columns(normalized))
+    sample_ids = set(extract_requested_sample_ids(normalized))
+    has_limit = extract_requested_limit_from_question(normalized) is not None
+    has_query_verb = bool(
+        re.search(
+            r"查询|查找|查一下|找出|筛选|统计|列出|获取|查看|检索|返回",
+            normalized,
+            flags=re.IGNORECASE,
         )
     )
-    if not meaningful:
-        return False
+    has_scope_and_action = bool(
+        re.search(
+            r"(?:在|从).{0,80}(?:样本|结果)(?:中|里|范围内).{0,80}"
+            r"(?:找出|查询|筛选|排列|排序|取前)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+    )
+    has_structured_signal = bool(
+        explicit_columns
+        or sample_ids
+        or has_limit
+        or current_spec.get("filters")
+        or current_spec.get("order_by")
+        or current_spec.get("temporal_metrics")
+        or current_spec.get("select_columns")
+    )
 
-    # “重新查询……”是显式清空旧范围的强信号。
     if _RESET_QUERY_RE.search(normalized):
-        return True
-
-    # 有完整查询动词且QuerySpec已成形时，优先作为独立查询。
+        return has_structured_signal
     if _EXPLICIT_QUERY_START_RE.search(normalized):
+        return has_structured_signal
+    if has_query_verb and has_structured_signal:
+        return True
+    if has_scope_and_action and has_structured_signal:
         return True
 
-    # 纯修改片段不应被当作独立查询。
-    if _CONTINUATION_PREFIX_RE.search(normalized) or _MODIFICATION_RE.search(normalized):
-        return False
-    if _TOPK_FRAGMENT_RE.search(normalized):
-        return False
+    # 没有显式查询动词时，仍允许“原始密度最低的3个样本”这类完整短句。
+    meaningful_spec = bool(
+        current_spec.get("eligible")
+        or current_spec.get("order_by")
+        or current_spec.get("filters")
+        or current_spec.get("sample_ids")
+    )
+    return bool(meaningful_spec and has_structured_signal)
 
-    return True
+def _extract_explicit_order_by(question: str) -> dict[str, Any] | None:
+    """优先解析“按X从低到高排列”等明确排序短语。
+
+    明确排序短语的优先级高于后文出现的返回字段，避免把“返回峰值表温”
+    错当成排序字段。
+    """
+
+    normalized = str(question)
+    match = re.search(
+        r"(?:按|根据)\s*(?P<target>.{1,28}?)\s*"
+        r"(?P<direction>从高到低|从低到高|由高到低|由低到高|升序|降序)"
+        r"(?:排列|排序)?",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    target = match.group("target").strip("，,、。；; ")
+    direction_word = match.group("direction")
+    direction = "DESC" if direction_word in {"从高到低", "由高到低", "降序"} else "ASC"
+
+    derived_map = {
+        "质量损失率": "mass_loss_rate",
+        "背温抬升": "back_temperature_rise",
+        "背面温度抬升": "back_temperature_rise",
+        "背温升高量": "back_temperature_rise",
+    }
+    for phrase, alias in derived_map.items():
+        if phrase in target:
+            return {
+                "kind": "derived",
+                "column": alias,
+                "alias": alias,
+                "direction": direction,
+            }
+
+    ranking = infer_question_ranking_column(target)
+    if ranking:
+        column = ranking[0]
+        return {"kind": "column", "column": column, "direction": direction}
+
+    columns = sorted(match_question_semantic_columns(target))
+    if columns:
+        return {"kind": "column", "column": columns[0], "direction": direction}
+    return None
 
 
 def _looks_like_follow_up(
@@ -968,7 +1034,8 @@ def build_deterministic_query_delta(
     elif filters:
         filter_action = "replace" if _REPLACE_FILTER_RE.search(normalized) else "add"
 
-    order_by = deepcopy(current_spec.get("order_by"))
+    explicit_order_by = _extract_explicit_order_by(normalized)
+    order_by = explicit_order_by or deepcopy(current_spec.get("order_by"))
     ranking = infer_question_ranking_column(normalized)
     direction = _direction_from_question(normalized)
     if not order_by and ranking and direction:
@@ -1774,14 +1841,19 @@ def update_short_term_memory(
 
     if delta.get("dependency") == "previous_result_set":
         # 只有真正从较大候选集缩小结果时才建立父层级；仅换展示字段且集合不变时不制造重复父集合。
-        if source_ids and source_ids != stored_sample_ids:
+        source_members = set(source_ids)
+        result_members = set(stored_sample_ids)
+        previous_parent_members = set(_scope_ids(previous_parent_scope))
+        # 仅成员发生变化时建立父集合；同一批样本只改变顺序或返回字段时，
+        # 不制造 active=50 / parent=50 的重复层级。
+        if source_ids and source_members != result_members:
             updated["parent_result_scope"] = _make_scope(
                 source_ids,
                 selection_order_by=updated.get("last_successful_query_state", {}).get("order_by"),
                 row_count=len(source_ids),
                 source_question=updated.get("last_resolved_question", ""),
             )
-        elif _scope_ids(previous_parent_scope) and _scope_ids(previous_parent_scope) != stored_sample_ids:
+        elif previous_parent_members and previous_parent_members != result_members:
             updated["parent_result_scope"] = previous_parent_scope
         else:
             updated["parent_result_scope"] = _empty_scope()
