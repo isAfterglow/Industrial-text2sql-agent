@@ -615,6 +615,11 @@ def compile_extended_query_sql(spec: dict[str, Any]) -> str:
     order_alias = str(order_by.get("alias") or order_by.get("column") or "")
     if order_alias in metric_by_alias or order_alias in derived_aliases or order_alias in _DERIVED_ALIASES:
         output_columns.append(order_alias)
+    elif order_alias in owner_map and not spec.get("strict_projection", False):
+        # Ranking by a static field while returning a temporal aggregate should
+        # expose that rank field; otherwise users cannot interpret why these
+        # entities were selected.
+        output_columns.append(order_alias)
     output_columns = list(dict.fromkeys(output_columns))
 
     needed_scalar_columns: set[str] = set()

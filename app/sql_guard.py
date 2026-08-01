@@ -65,7 +65,7 @@ def validate_question_policy(
         )
 
     if re.search(
-        r"删除|清空|写入|插入|更新.+(?:数据|记录|表)|"
+        r"删除|清空|写入|插入|更新(?:.+)?(?:数据|记录|表|为|成)|"
         r"创建.+表|删除.+表",
         question,
         flags=re.IGNORECASE,

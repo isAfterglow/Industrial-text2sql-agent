@@ -65,6 +65,8 @@ class Text2SQLState(TypedDict, total=False):
     query_spec: dict[str, Any]
     query_plan_mode: str
     query_plan_reason: str
+    capability_family: str
+    delivery_policy: dict[str, Any]
     deterministic_sql: str
     advanced_plan: dict[str, Any]
     advanced_plan_raw: str

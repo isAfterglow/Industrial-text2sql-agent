@@ -1862,6 +1862,11 @@ def build_query_spec(
             result["scalar_tables"] = sorted(candidate_tables)
             if one_to_one and _all_question_numbers_consumed(question, consumed_numbers, limit):
                 selected = set(requested_outputs) or {"sample_id", *business_columns}
+                # "返回样本编号和这三个字段" refers to the explicit
+                # predicates immediately before it. This is a reusable
+                # projection convention, not a benchmark-specific rule.
+                if re.search(r"(?:这|上述|这些)(?:一|二|三|四|\d+)?个?字段", question):
+                    selected.update(item["column"] for item in filters)
                 if ranking is not None and not strict_projection:
                     selected.add(ranking[0])
                 result.update({

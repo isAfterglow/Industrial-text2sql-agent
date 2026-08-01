@@ -30,6 +30,8 @@ from app.material_plan import (
     material_plan_prompt,
     parse_material_plan,
 )
+from app.capabilities import capability_family
+from app.delivery import build_delivery_policy
 from app.query_expectations import assert_query_expectation, build_query_expectation
 from app.long_term_memory.service import get_long_term_memory_service
 from app.result_assertions import assert_advanced_result
@@ -335,6 +337,8 @@ def load_schema(
         "query_spec": {},
         "query_plan_mode": "",
         "query_plan_reason": "",
+        "capability_family": "",
+        "delivery_policy": {},
         "advanced_plan": {},
         "advanced_plan_raw": "",
         "advanced_plan_error": "",
@@ -634,6 +638,25 @@ def resolve_conversation_context(
             "overridden_fields": [],
         }
 
+    # Requests such as "the best samples" lack a measurable business target.
+    # They must be clarified before memory, planning, or repair can invent one.
+    if re.search(r"(?:最好|最佳|最优|合适|优秀).{0,8}(?:样本|材料|记录)?", original_question):
+        return {
+            "resolved_question": original_question,
+            "resolved_query_spec": {},
+            "turn_type": "clarification_required",
+            "memory_used": False,
+            "context_resolution": {"reason": "missing_rank_metric"},
+            "context_resolution_valid": False,
+            "clarification_required": True,
+            "clarification_cancelled": False,
+            "clarification_question": "“最好”缺少可计算指标。请说明按原始密度、热解热、导热率、温度响应或其它字段排序。",
+            "pending_clarification": {"reason": "missing_rank_metric", "original_question": original_question},
+            "current_turn_coverage": {"passed": False, "mode": "missing_rank_metric"},
+            "inherited_fields": [],
+            "overridden_fields": [],
+        }
+
     query_delta = state.get("query_delta", {})
 
     # The existing deterministic resolver encodes resin-specific field and
@@ -708,6 +731,33 @@ def resolve_conversation_context(
         state.get("conversation_memory", {}),
         query_delta,
     )
+
+    # A complete, high-confidence independent QuerySpec is stronger evidence
+    # than generic conversational wording such as "同时返回它们".  Do not ask
+    # for clarification when the Profile can already compile the request.
+    direct_spec = query_delta.get("current_spec") or build_query_spec(original_question)
+    if (
+        resolved.get("clarification_required")
+        and direct_spec.get("eligible")
+        and (
+            query_delta.get("independent_complete")
+            or not state.get("conversation_memory", {}).get("last_successful_query_state")
+        )
+    ):
+        resolved = {
+            **resolved,
+            "resolved_question": original_question,
+            "resolved_query_spec": direct_spec,
+            "turn_type": "new_query",
+            "memory_used": False,
+            "context_resolution_valid": True,
+            "clarification_required": False,
+            "clarification_cancelled": False,
+            "clarification_question": "",
+            "pending_clarification": {},
+            "current_turn_coverage": {"passed": True, "mode": "independent_high_confidence"},
+            "context_resolution": {"reason": "complete_independent_queryspec_overrides_generic_clarification"},
+        }
 
     # 历史范围防泄漏：完整且无显式指代的新查询以当前QuerySpec为准。
     if (
@@ -911,6 +961,7 @@ def build_query_plan(
             "unsupported_query": True,
             "unsupported_query_reason": capability.get("reason", ""),
             "unsupported_query_suggestions": capability.get("suggested_turns", []),
+            "capability_family": "unsupported",
         }
 
     if spec.get("mode") == "deterministic_extended":
@@ -921,6 +972,7 @@ def build_query_plan(
             "query_plan_reason": spec.get("reason", "确定性扩展查询快路径。"),
             "deterministic_sql": deterministic_sql,
             "unsupported_query": False,
+            "capability_family": capability_family(state.get("domain_profile", "resin"), str(spec.get("query_type", ""))),
         }
 
     deterministic_sql = compile_query_spec_sql(spec) if spec.get("eligible") else ""
@@ -930,6 +982,7 @@ def build_query_plan(
         "query_plan_reason": spec.get("reason", ""),
         "deterministic_sql": deterministic_sql,
         "unsupported_query": False,
+        "capability_family": capability_family(state.get("domain_profile", "resin"), str(spec.get("query_type", ""))),
     }
 
 
@@ -1756,6 +1809,30 @@ def validate_sql(
             ],
         }
 
+    # A confirmed conversational entity scope is a hard execution constraint,
+    # not a hint for the repair model.  This prevents repaired SQL from
+    # widening "that sample" into every sample at the requested time point.
+    inherited_scope = list(
+        (state.get("resolved_query_spec") or {}).get("sample_ids", [])
+        or state.get("query_delta", {}).get("sample_ids", [])
+    )
+    if state.get("memory_used") and inherited_scope:
+        normalized_sql = result.sql.lower()
+        missing_scope = [
+            sample_id for sample_id in inherited_scope
+            if str(sample_id).lower() not in normalized_sql
+        ]
+        if missing_scope:
+            error = "修复后的SQL丢失已确认的实体范围：" + ", ".join(missing_scope)
+            return {
+                "validation_error": error,
+                "validation_repairable": True,
+                "validation_error_type": "context_scope",
+                "validated_sql": "",
+                "execution_error": "",
+                "failure_events": [failure_event("validation", error, "context_scope", True)],
+            }
+
     return {
         "validation_error": "",
         "validation_repairable": True,
@@ -2353,6 +2430,9 @@ def execute_sql(
 
     return {
         "execution_error": "",
+        "delivery_policy": build_delivery_policy(
+            effective_question(state), state.get("query_spec", {}), settings.SQL_MAX_ROWS
+        ),
         **result,
     }
 
