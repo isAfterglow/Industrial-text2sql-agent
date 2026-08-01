@@ -662,6 +662,19 @@ def compile_extended_query_sql(spec: dict[str, Any]) -> str:
             + "ON ms.sample_id = agg.sample_id"
         )
 
+    aggregate_alias_by_column = {
+        str(metric.get("column", "")): str(metric.get("alias", ""))
+        for metric in aggregate_metrics
+    }
+    initial_alias_by_column = {
+        str(metric.get("column", "")): str(metric.get("alias", ""))
+        for metric in initial_metrics
+    }
+    final_alias_by_column = {
+        str(metric.get("column", "")): str(metric.get("alias", ""))
+        for metric in final_metrics
+    }
+
     if initial_metrics:
         select_items = ["initial_row.sample_id"]
         for metric in initial_metrics:
@@ -722,8 +735,20 @@ def compile_extended_query_sql(spec: dict[str, Any]) -> str:
         value = item.get("value")
         if column not in owner_map:
             continue
-        left_alias = _TABLE_ALIASES.get(owner_map[column], owner_map[column])
-        left = f"{left_alias}.{column}"
+        if column in _RESPONSE_COLUMNS:
+            # Response rows are materialized as aggregated/initial/final
+            # subqueries, so the original `tr` alias is not visible here.
+            if column in aggregate_alias_by_column:
+                left = f"agg.{aggregate_alias_by_column[column]}"
+            elif column in initial_alias_by_column:
+                left = f"ini.{initial_alias_by_column[column]}"
+            elif column in final_alias_by_column:
+                left = f"fin.{final_alias_by_column[column]}"
+            else:
+                continue
+        else:
+            left_alias = _TABLE_ALIASES.get(owner_map[column], owner_map[column])
+            left = f"{left_alias}.{column}"
         if item.get("value_type") == "column" and str(value) in owner_map:
             right_column = str(value)
             right_alias = _TABLE_ALIASES.get(owner_map[right_column], owner_map[right_column])

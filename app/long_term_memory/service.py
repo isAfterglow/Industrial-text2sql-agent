@@ -902,7 +902,8 @@ class LongTermMemoryService:
                         f"排序：{query_spec.get('order_by')}",
                         f"时序指标：{query_spec.get('all_temporal_metrics') or query_spec.get('temporal_metrics', [])}",
                         f"派生指标：{query_spec.get('derived_metrics', [])}",
-                        f"参考SQL模板：{metadata.get('sql_template', '')}",
+                        "参考结构：QuerySpec字段、过滤角色、排序和时序口径；"
+                        "不得复制历史SQL、样本值或返回结果。",
                         f"检索分解：{json.dumps(scores, ensure_ascii=False, sort_keys=True)}",
                     ]
                 )

@@ -1007,7 +1007,9 @@ def generate_structured_query_spec(state: Text2SQLState) -> dict[str, Any]:
         "Supported query_type: single_table_filter, single_table_topk, exact_sample, "
         "response_detail, one_to_one_join, per_sample_temporal_aggregate. "
         "Include eligible=true, table, select_columns, filters, order_by, limit, sample_ids as applicable.\n"
-        f"Schema:\n{state['schema_context']}\nQuestion:\n{question}"
+        f"Schema:\n{state['schema_context']}\n"
+        f"{state.get('few_shot_context', '')}\n"
+        f"Question:\n{question}"
     )
     raw = invoke_text("You produce validated Text2SQL QuerySpec JSON, never SQL.", prompt)
     try:
