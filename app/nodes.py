@@ -691,7 +691,7 @@ def resolve_conversation_context(
     # 一个复杂查询可能暂时不支持执行，但仍然是完整独立的新查询；
     # 不能因为QuerySpec暂时为complex_or_uncertain就继承上一轮过滤和范围。
     raw_capability = detect_unsupported_nested_topk(original_question)
-    if raw_capability.get("unsupported") and not query_delta.get("explicit_reference"):
+    if raw_capability.get("unsupported"):
         authoritative_spec = augment_common_query_spec(
             original_question,
             query_delta.get("current_spec") or build_query_spec(original_question),
@@ -739,6 +739,7 @@ def resolve_conversation_context(
     if (
         resolved.get("clarification_required")
         and direct_spec.get("eligible")
+        and not query_delta.get("explicit_reference")
         and (
             query_delta.get("independent_complete")
             or not state.get("conversation_memory", {}).get("last_successful_query_state")

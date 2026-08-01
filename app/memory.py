@@ -77,7 +77,7 @@ _PARENT_RESULT_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _SAME_SAMPLE_RE = re.compile(
-    r"它的|它呢|这个样本|该样本|同一个样本|继续看它|再看它|这个材料|该材料",
+    r"它(?:的|呢|在)|这个样本|该样本|同一个样本|继续看它|再看它|这个材料|该材料",
     flags=re.IGNORECASE,
 )
 _PLURAL_SAMPLE_RE = re.compile(
@@ -1294,8 +1294,6 @@ def _apply_query_delta(
         selected = set(columns)
         if not delta.get("strict_projection"):
             selected.add("sample_id")
-        else:
-            selected.add("sample_id")
         merged["select_columns"] = _ordered_projection(selected)
         merged["scalar_columns"] = sorted(columns - {"sample_id"})
         merged["strict_projection"] = bool(delta.get("strict_projection", False))
@@ -1828,6 +1826,10 @@ def update_short_term_memory(
     previous_last_scope = deepcopy(updated.get("last_result_scope") or _empty_scope())
     previous_parent_scope = deepcopy(updated.get("parent_result_scope") or _empty_scope())
     source_ids = list(dict.fromkeys(query_spec.get("sample_ids", [])))
+    # 严格投影可以合法地省略 sample_id。若该查询已绑定唯一实体且
+    # 确实返回了记录，仍可安全地维持单样本指代锚点。
+    if not sample_ids and len(source_ids) == 1 and row_count > 0:
+        sample_ids = source_ids
 
     if delta.get("dependency") == "previous_result_set":
         # 只有真正从较大候选集缩小结果时才建立父层级；仅换展示字段且集合不变时不制造重复父集合。

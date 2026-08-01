@@ -1777,6 +1777,15 @@ def build_query_spec(
 
     if explicit_full_table is not None:
         columns = set(catalog["tables"][explicit_full_table]["columns"])
+        # 全表读取仍可带显式、可校验的展示顺序。它不属于业务排序，
+        # 因此独立保存为列表，避免把多键排序压缩成单个 QuerySpec order_by。
+        table_columns = list(catalog["tables"][explicit_full_table]["columns"])
+        ordered_columns = [
+            column for column in table_columns
+            if re.search(rf"(?<![A-Za-z0-9_]){re.escape(column)}(?![A-Za-z0-9_])", question, re.IGNORECASE)
+        ]
+        direction_match = re.search(r"(?:按|按照).{0,80}?(升序|降序|ASC|DESC)", question, re.IGNORECASE)
+        direction = "DESC" if direction_match and direction_match.group(1).upper() in {"DESC", "降序"} else "ASC"
         result.update(
             {
                 "eligible": True,
@@ -1784,6 +1793,11 @@ def build_query_spec(
                 "query_type": "full_table",
                 "table": explicit_full_table,
                 "select_columns": _ordered_columns_for_table(explicit_full_table, columns),
+                "order_by": (
+                    {"kind": "column", "column": ordered_columns[0], "direction": direction}
+                    if ordered_columns else None
+                ),
+                "order_by_columns": ordered_columns,
                 "confidence": 1.0,
                 "reason": "用户明确点名白名单表并请求全部数据。",
             }
@@ -2274,8 +2288,16 @@ def compile_query_spec_sql(
         predicates.append(_compile_predicate(item, f"{alias}.{item['column']}"))
     if predicates:
         parts.append("WHERE " + " AND ".join(predicates))
+    order_by_columns = list(query_spec.get("order_by_columns", []))
     order_by = query_spec.get("order_by")
-    if order_by:
+    if order_by_columns:
+        direction = str((order_by or {}).get("direction", "ASC"))
+        parts.append(
+            "ORDER BY " + ", ".join(
+                f"{alias}.{column} {direction}" for column in order_by_columns
+            )
+        )
+    elif order_by:
         parts.append(f"ORDER BY {alias}.{order_by['column']} {order_by['direction']}")
     limit = query_spec.get("limit")
     if isinstance(limit, int) and limit > 0:
