@@ -325,9 +325,13 @@ def compile_advanced_analysis_plan(plan: dict[str, Any]) -> str:
             raise ValueError("unknown group_topk field")
         joins = _joins_for_columns(groups + outputs, fact, aliases, owners)
         partition = ", ".join(_qualified(column, aliases, owners) for column in groups)
-        inner_columns = list(dict.fromkeys(groups + outputs))
+        key = catalog["tables"][fact]["key"]
+        # Keep ranking inputs in the CTE even when callers do not request
+        # them.  The outer order must mirror the per-group ranking rather than
+        # reorder a correct Top-K set by incidental projection column order.
+        inner_columns = list(dict.fromkeys(groups + outputs + [metric, key]))
         select = ", ".join(_qualified(column, aliases, owners) for column in inner_columns)
-        final_order = ", ".join(outputs)
+        final_order = ", ".join(groups + [f"{metric} DESC", key])
         return (
             f"WITH ranked AS (SELECT {select}, ROW_NUMBER() OVER (PARTITION BY {partition} "
             f"ORDER BY {fact_alias}.{metric} DESC, {fact_alias}.{catalog['tables'][fact]['key']}) AS row_num "

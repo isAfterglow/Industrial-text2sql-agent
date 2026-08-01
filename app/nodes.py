@@ -1670,12 +1670,19 @@ def validate_sql(
             "execution_error": "",
         }
 
+    # The Guard needs the compiled-plan family to preserve semantics such as
+    # "top K within every group".  QuerySpec itself remains the generic
+    # contract, so carry the advanced plan in an evaluation-only copy.
+    guard_query_spec = dict(state.get("query_spec") or {})
+    if state.get("advanced_plan"):
+        guard_query_spec["advanced_plan"] = state["advanced_plan"]
+
     result = validate_and_normalize_sql(
         sql=state.get("raw_sql", ""),
         allowed_tables=set(get_schema_catalog()["tables"]),
         max_rows=settings.SQL_MAX_ROWS,
         question=effective_question(state),
-        query_spec=state.get("query_spec"),
+        query_spec=guard_query_spec,
     )
 
     if not result.valid:

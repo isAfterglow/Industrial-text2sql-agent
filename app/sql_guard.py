@@ -2761,7 +2761,18 @@ def validate_and_normalize_sql(
     if requested_limit is None and question:
         requested_limit = extract_requested_limit(question)
 
-    if requested_limit is not None:
+    advanced_family = ""
+    if isinstance(query_spec, dict):
+        advanced_plan = query_spec.get("advanced_plan")
+        if isinstance(advanced_plan, dict):
+            advanced_family = str(advanced_plan.get("family", ""))
+
+    if advanced_family == "group_topk":
+        # `group_topk` compiles the user-facing K into `ROW_NUMBER() <= K`
+        # within each partition.  A top-level LIMIT would change that contract
+        # into a global K and silently discard valid rows from other groups.
+        pass
+    elif requested_limit is not None:
         set_limit(
             tree,
             min(
