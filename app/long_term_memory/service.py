@@ -9,7 +9,7 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from app.schema import get_schema_catalog
+from app.schema import active_profile_name, get_schema_catalog
 from app.query_enhancement import (
     build_query_signature,
     hard_signature_compatible,
@@ -23,7 +23,10 @@ from .models import MemoryRecord, MemoryWriteResult
 from .repository import SQLiteMemoryRepository
 
 
-VALID_MEMORY_TYPES = {"semantic", "episodic", "procedural"}
+VALID_MEMORY_TYPES = {
+    "semantic", "episodic", "procedural", "candidate_episodic",
+    "candidate_procedural", "failure",
+}
 
 
 def _compact_text(text: str) -> str:
@@ -173,6 +176,7 @@ def _episodic_dedupe_key(query_spec: dict[str, Any]) -> str:
         ),
         "has_limit": query_spec.get("limit") is not None,
         "scalar_tables": sorted(query_spec.get("scalar_tables", [])),
+        "advanced_plan": query_spec.get("advanced_plan", {}),
     }
     digest = hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -190,7 +194,13 @@ class LongTermMemoryService:
         self.settings = settings or get_long_term_memory_settings()
         self.repository = SQLiteMemoryRepository(self.settings.db_path)
         self.embedding = EmbeddingProvider(self.settings)
-        self.schema_hash = _schema_hash()
+    @property
+    def namespace(self) -> str:
+        return f"{self.settings.namespace}:{active_profile_name()}"
+
+    @property
+    def schema_hash(self) -> str:
+        return _schema_hash()
 
     @property
     def enabled(self) -> bool:
@@ -219,7 +229,7 @@ class LongTermMemoryService:
         return self.repository.upsert(
             MemoryRecord(
                 memory_id="",
-                namespace=self.settings.namespace,
+                namespace=self.namespace,
                 memory_type=memory_type,
                 title=title,
                 content=content,
@@ -302,6 +312,153 @@ class LongTermMemoryService:
             source=source,
             dedupe_key=_episodic_dedupe_key(query_spec),
         )
+
+    def remember_candidate_case(
+        self,
+        *,
+        question: str,
+        resolved_question: str,
+        query_spec: dict[str, Any],
+        sql: str,
+        approval_id: str = "",
+        source: str = "approved_query",
+        approval_reason: str = "",
+    ) -> MemoryWriteResult:
+        """Store a validated case outside the retrieval pool until promotion."""
+
+        query_type = str(query_spec.get("query_type", "advanced_analysis"))
+        metadata = {
+            "question": question, "resolved_question": resolved_question,
+            "query_spec": query_spec,
+            "query_signature": build_query_signature(query_spec, resolved_question or question),
+            "sql": sql, "sql_template": _parameterize_sql(sql),
+            "approval_id": approval_id, "approval_reason": approval_reason,
+            "promotion_status": "candidate", "validation": "guard_execution_result_contract",
+        }
+        return self._upsert(
+            memory_type="candidate_episodic", title=f"候选案例：{query_type}",
+            content=f"用户问题：{question}\n消解问题：{resolved_question}\n已验证SQL：{sql}",
+            metadata=metadata, source=source,
+            dedupe_key="candidate:" + _episodic_dedupe_key(query_spec),
+        )
+
+    def promote_candidate(self, memory_id: str, *, evidence: str) -> MemoryWriteResult:
+        candidate = self.repository.get(memory_id)
+        if candidate is None or candidate.memory_type != "candidate_episodic":
+            raise ValueError("只能晋升候选情景记忆。")
+        metadata = dict(candidate.metadata)
+        validations = metadata.get("independent_validations", [])
+        if not isinstance(validations, list) or len(validations) < 3:
+            raise ValueError("候选案例至少需要3条独立成功验证后才能晋升。")
+        plan = metadata.get("advanced_plan") or dict(metadata.get("query_spec", {})).get("advanced_plan", {})
+        if isinstance(plan, dict) and plan:
+            metadata.update({
+                "memory_role": "advanced_plan_example",
+                "advanced_plan": plan,
+                "schema_tables": sorted(get_schema_catalog().get("tables", {})),
+                "quality": {"retrieval_count": 0, "success_count": 0, "failure_count": 0},
+            })
+        metadata.update({"promotion_status": "promoted", "promotion_evidence": evidence, "candidate_memory_id": memory_id})
+        return self._upsert(
+            memory_type="episodic", title=candidate.title.replace("候选", "正式"),
+            content=candidate.content, metadata=metadata, source="candidate_promoted",
+            dedupe_key=_episodic_dedupe_key(dict(metadata.get("query_spec", {}))),
+        )
+
+    def create_approval_request(self, *, profile: str, payload: dict[str, object]) -> dict[str, object]:
+        return self.repository.create_approval_request(namespace=self.namespace, profile=profile, payload=payload)
+
+    def decide_approval_request(self, approval_id: str, decision: dict[str, object]) -> dict[str, object] | None:
+        return self.repository.decide_approval_request(approval_id, decision)
+
+    def list_approval_requests(self, status: str | None = None, limit: int = 50) -> list[dict[str, object]]:
+        return self.repository.list_approval_requests(
+            namespace=self.namespace, status=status, limit=limit
+        )
+
+    def record_candidate_validation(
+        self, memory_id: str, *, question: str, plan: dict[str, Any], evidence: str
+    ) -> None:
+        """Attach independent successful validation evidence without making it retrievable."""
+
+        record = self.repository.get(memory_id)
+        if record is None or record.memory_type != "candidate_episodic":
+            raise ValueError("只能为候选情景记忆记录验证。")
+        metadata = dict(record.metadata)
+        validations = list(metadata.get("independent_validations", []))
+        fingerprint = hashlib.sha256(
+            json.dumps({"question": question, "plan": plan}, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+        if not any(item.get("fingerprint") == fingerprint for item in validations if isinstance(item, dict)):
+            validations.append({"fingerprint": fingerprint, "question": question, "plan": plan, "evidence": evidence})
+        metadata["independent_validations"] = validations
+        metadata["validated_variant_count"] = len(validations)
+        self.repository.update_memory_metadata(memory_id, metadata)
+
+    def retrieve_advanced_plan_examples(
+        self, question: str, family: str, *, max_examples: int = 2
+    ) -> tuple[list[MemoryRecord], dict[str, Any]]:
+        """Retrieve only curated, promoted AdvancedPlan examples for completion."""
+
+        candidates = self.search(question, memory_types=["episodic"], top_k=20, min_score=0.0)
+        selected: list[MemoryRecord] = []
+        rejected: dict[str, int] = {}
+        current_tables = set(get_schema_catalog().get("tables", {}))
+        for record in candidates:
+            metadata = dict(record.metadata or {})
+            plan = metadata.get("advanced_plan") or metadata.get("query_spec", {}).get("advanced_plan")
+            if metadata.get("memory_role") != "advanced_plan_example":
+                rejected["not_advanced_example"] = rejected.get("not_advanced_example", 0) + 1
+                continue
+            if not isinstance(plan, dict) or plan.get("family") != family:
+                rejected["family_mismatch"] = rejected.get("family_mismatch", 0) + 1
+                continue
+            tables = set(metadata.get("schema_tables", []))
+            if tables and not tables.issubset(current_tables):
+                rejected["schema_mismatch"] = rejected.get("schema_mismatch", 0) + 1
+                continue
+            quality = metadata.get("quality", {}) if isinstance(metadata.get("quality"), dict) else {}
+            success_rate = float(quality.get("success_count", 0)) / max(1, int(quality.get("retrieval_count", 0)))
+            record.score = 0.8 * float(record.score) + 0.2 * success_rate
+            selected.append(record)
+        selected.sort(key=lambda item: item.score, reverse=True)
+        selected = selected[:max(1, max_examples)]
+        return selected, {
+            "candidate_count": len(candidates), "selected_count": len(selected),
+            "family": family, "rejected_reasons": rejected,
+        }
+
+    def build_advanced_plan_few_shot_context(self, memories: list[MemoryRecord]) -> str:
+        if not memories:
+            return ""
+        blocks = [
+            "Approved structural examples for the selected family follow.",
+            "Adapt only the structure to the current question and schema; never copy values blindly.",
+        ]
+        for index, record in enumerate(memories, start=1):
+            metadata = record.metadata
+            blocks.append(
+                "Example %d:\nQuestion: %s\nAdvancedPlan: %s\nSchema tables: %s" % (
+                    index,
+                    metadata.get("resolved_question") or metadata.get("question", ""),
+                    json.dumps(metadata.get("advanced_plan", {}), ensure_ascii=False, sort_keys=True),
+                    ", ".join(metadata.get("schema_tables", [])),
+                )
+            )
+        return "\n\n".join(blocks)[: self.settings.max_prompt_chars]
+
+    def record_advanced_plan_usage(self, memory_ids: list[str], *, success: bool) -> None:
+        for memory_id in memory_ids:
+            record = self.repository.get(memory_id)
+            if record is None or record.memory_type != "episodic":
+                continue
+            metadata = dict(record.metadata)
+            quality = dict(metadata.get("quality", {}))
+            quality["retrieval_count"] = int(quality.get("retrieval_count", 0)) + 1
+            quality["success_count"] = int(quality.get("success_count", 0)) + int(success)
+            quality["failure_count"] = int(quality.get("failure_count", 0)) + int(not success)
+            metadata["quality"] = quality
+            self.repository.update_memory_metadata(memory_id, metadata)
 
     def remember_case_from_short_memory(
         self,
@@ -405,7 +562,7 @@ class LongTermMemoryService:
         if memory_type and memory_type not in VALID_MEMORY_TYPES:
             raise ValueError("memory_type只支持semantic、episodic、procedural。")
         return self.repository.list(
-            namespace=self.settings.namespace,
+            namespace=self.namespace,
             memory_type=memory_type,
             active_only=True,
             limit=limit,
@@ -413,7 +570,7 @@ class LongTermMemoryService:
 
     def forget(self, memory_id_prefix: str) -> tuple[bool, str]:
         return self.repository.deactivate_by_prefix(
-            self.settings.namespace,
+            self.namespace,
             memory_id_prefix.strip(),
         )
 
@@ -442,7 +599,7 @@ class LongTermMemoryService:
             return []
 
         candidates = self.repository.candidates(
-            namespace=self.settings.namespace,
+            namespace=self.namespace,
             memory_types=types,
             schema_hash=self.schema_hash,
         )
@@ -824,32 +981,27 @@ class LongTermMemoryService:
             return {"enabled": False, "saved": []}
 
         saved: list[dict[str, Any]] = []
-        if self.should_auto_save_case(state):
-            result = self.remember_case(
+        if self.should_auto_save_case(state) or state.get("approval_approved"):
+            query_spec = dict(state.get("query_spec", {}))
+            if state.get("advanced_plan"):
+                query_spec["advanced_plan"] = dict(state["advanced_plan"])
+                query_spec["query_type"] = "advanced_" + str(state["advanced_plan"].get("family", "analysis"))
+            result = self.remember_candidate_case(
                 question=str(state.get("question", "")),
                 resolved_question=str(
                     state.get("resolved_question")
                     or state.get("normalized_question")
                     or state.get("question", "")
                 ),
-                query_spec=dict(state.get("query_spec", {})),
+                query_spec=query_spec,
                 sql=str(state.get("validated_sql", "")),
-                source=(
-                    "repaired_query"
-                    if state.get("retry_count", 0) > 0
-                    else "successful_query"
-                ),
-                repaired=bool(state.get("retry_count", 0) > 0),
-                case_context={
-                    "dependency": (state.get("query_delta") or {}).get("dependency", ""),
-                    "memory_used": bool(state.get("memory_used", False)),
-                    "independent_case": True,
-                },
+                approval_id=str((state.get("approval_request") or {}).get("approval_id", "")),
+                source="approved_query" if state.get("approval_approved") else "validated_query",
             )
             saved.append(
                 {
                     "memory_id": result.record.memory_id,
-                    "memory_type": "episodic",
+                    "memory_type": "candidate_episodic",
                     "created": result.created,
                 }
             )
@@ -894,13 +1046,13 @@ class LongTermMemoryService:
         return "\n".join(lines).rstrip("-\n")
 
     def status_summary(self) -> str:
-        counts = self.repository.count(self.settings.namespace)
+        counts = self.repository.count(self.namespace)
         embedding_status = self.embedding.status()
         return "\n".join(
             [
                 f"长期记忆启用: {'是' if self.enabled else '否'}",
                 f"SQLite: {self.settings.db_path}",
-                f"namespace: {self.settings.namespace}",
+                f"namespace: {self.namespace}",
                 f"schema_hash: {self.schema_hash}",
                 "记忆数量: "
                 + ", ".join(
@@ -919,7 +1071,14 @@ class LongTermMemoryService:
 
 
 @lru_cache(maxsize=1)
+def _cached_long_term_memory_service() -> LongTermMemoryService:
+    return LongTermMemoryService()
+
+
 def get_long_term_memory_service() -> LongTermMemoryService:
-    service = LongTermMemoryService()
+    service = _cached_long_term_memory_service()
+    # The service is cached for embeddings/SQLite handles, while the current
+    # Profile is part of its namespace. Seed generic procedural safeguards for
+    # each Profile on first use without cross-domain retrieval.
     service.ensure_default_memories()
     return service

@@ -10,6 +10,11 @@ class Text2SQLState(TypedDict, total=False):
     normalized_question: str
     resolved_question: str
     session_id: str
+    domain_profile: str
+    query_intent: str
+    intent_confidence: float
+    intent_evidence: list[str]
+    intent_related_tables: list[str]
 
     # V0.7.3 澄清感知短期记忆与上下文解析
     conversation_memory: dict[str, Any]
@@ -31,6 +36,7 @@ class Text2SQLState(TypedDict, total=False):
     inherited_fields: list[str]
     overridden_fields: list[str]
     memory_update_summary: dict[str, Any]
+    session_store_summary: dict[str, Any]
 
 
     # V0.8.1 持久化长期记忆与Few-shot检索
@@ -42,6 +48,8 @@ class Text2SQLState(TypedDict, total=False):
     episodic_memory_matches: list[dict[str, Any]]
     few_shot_context: str
     few_shot_retrieval_diagnostics: dict[str, Any]
+    advanced_plan_memory_matches: list[dict[str, Any]]
+    advanced_plan_memory_diagnostics: dict[str, Any]
     query_signature: dict[str, Any]
     procedural_memory_matches: list[dict[str, Any]]
     procedural_memory_context: str
@@ -57,6 +65,12 @@ class Text2SQLState(TypedDict, total=False):
     query_plan_mode: str
     query_plan_reason: str
     deterministic_sql: str
+    advanced_plan: dict[str, Any]
+    advanced_plan_raw: str
+    advanced_plan_error: str
+    query_expectation: dict[str, Any]
+    query_spec_json_raw: str
+    query_spec_json_error: str
     unsupported_query: bool
     unsupported_query_reason: str
     unsupported_query_suggestions: list[str]
@@ -121,6 +135,17 @@ class Text2SQLState(TypedDict, total=False):
     rows: list[list[Any]]
     row_count: int
     truncated: bool
+    result_assertion: dict[str, Any]
+    result_assertion_passed: bool
+
+    # Human-in-the-loop approval; decisions edit plans rather than raw SQL.
+    approval_required: bool
+    approval_mode: str
+    force_approval: bool
+    approval_request: dict[str, Any]
+    approval_decision: dict[str, Any]
+    approval_approved: bool
+    approval_summary: dict[str, Any]
 
     # 修复控制与修复观测
     retry_count: int
@@ -129,6 +154,12 @@ class Text2SQLState(TypedDict, total=False):
     repair_action: str
     repair_bad_sql: str
     repair_raw_output: str
+    repair_model_role: str
+    repair_plan_mode: str
+
+    # Stable, append-only failure telemetry for routing and evaluation.
+    failure_events: Annotated[list[dict[str, Any]], operator.add]
+    model_calls: list[dict[str, Any]]
 
     # Trace
     trace_id: str

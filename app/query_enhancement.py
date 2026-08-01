@@ -11,6 +11,7 @@ from sqlglot import exp
 from sqlglot.errors import ParseError
 
 from app.schema import (
+    canonical_metric_alias,
     get_schema_catalog,
     infer_requested_output_columns,
     match_question_semantic_columns,
@@ -27,33 +28,17 @@ _TABLE_ALIASES = {
     "thermal_response": "tr",
 }
 
-_FIELD_TERMS: dict[str, tuple[str, ...]] = {
-    "rhov_i": ("原始材料密度", "原始密度"),
-    "rhoc_i": ("碳化材料密度", "碳化密度"),
-    "porosity_v": ("原始孔隙率",),
-    "porosity_c": ("碳化孔隙率",),
-    "permeability_v": ("原始渗透率",),
-    "permeability_c": ("碳化渗透率",),
-    "kv_list": ("原始材料热导率", "原始热导率"),
-    "kc_list": ("碳化材料热导率", "碳化热导率"),
-    "surface_emissivity": ("表面发射率", "发射率"),
-    "pyrolysis_heat": ("热解热",),
-    "surface_temperature": ("表面温度", "表温"),
-    "back_temperature": ("背面温度", "背温"),
-    "mass": ("质量",),
-}
-
-_METRIC_PATTERNS: tuple[tuple[str, str, str, str], ...] = (
-    (r"峰值表面温度|表面温度峰值|峰值表温", "surface_temperature", "MAX", "peak_surface_temperature"),
-    (r"峰值背面温度|背面温度峰值|峰值背温", "back_temperature", "MAX", "peak_back_temperature"),
-    (r"平均表面温度|表面温度平均值|平均表温", "surface_temperature", "AVG", "average_surface_temperature"),
-    (r"平均背面温度|背面温度平均值|平均背温", "back_temperature", "AVG", "average_back_temperature"),
-    (r"初始质量", "mass", "INITIAL", "initial_mass"),
-    (r"最终质量|末时刻质量", "mass", "FINAL", "final_mass"),
-    (r"初始背面温度|初始背温", "back_temperature", "INITIAL", "initial_back_temperature"),
-    (r"最终背面温度|最终背温|末时刻背面温度|末时刻背温", "back_temperature", "FINAL", "final_back_temperature"),
-    (r"初始表面温度|初始表温", "surface_temperature", "INITIAL", "initial_surface_temperature"),
-    (r"最终表面温度|最终表温|末时刻表面温度|末时刻表温", "surface_temperature", "FINAL", "final_surface_temperature"),
+_METRIC_PATTERNS: tuple[tuple[str, str, str], ...] = (
+    (r"峰值表面温度|表面温度峰值|峰值表温", "surface_temperature", "MAX"),
+    (r"峰值背面温度|背面温度峰值|峰值背温", "back_temperature", "MAX"),
+    (r"平均表面温度|表面温度平均值|平均表温", "surface_temperature", "AVG"),
+    (r"平均背面温度|背面温度平均值|平均背温", "back_temperature", "AVG"),
+    (r"初始质量", "mass", "INITIAL"),
+    (r"最终质量|末时刻质量", "mass", "FINAL"),
+    (r"初始背面温度|初始背温", "back_temperature", "INITIAL"),
+    (r"最终背面温度|最终背温|末时刻背面温度|末时刻背温", "back_temperature", "FINAL"),
+    (r"初始表面温度|初始表温", "surface_temperature", "INITIAL"),
+    (r"最终表面温度|最终表温|末时刻表面温度|末时刻表温", "surface_temperature", "FINAL"),
 )
 
 _RANKING_METRICS: tuple[tuple[str, str], ...] = (
@@ -74,6 +59,7 @@ _STAGE_METRICS: tuple[tuple[str, str], ...] = (
     (r"最终背面温度|最终背温", "最终背面温度"),
     (r"原始密度", "原始密度"),
     (r"碳化密度", "碳化密度"),
+    (r"表面发射率|发射率", "表面发射率"),
     (r"质量损失率", "质量损失率"),
     (r"背温抬升|背面温度抬升", "背温抬升"),
 )
@@ -85,6 +71,17 @@ def _owner_map() -> dict[str, str]:
         for column in table_info.get("columns", {}):
             result.setdefault(str(column), str(table_name))
     return result
+
+
+def _field_terms() -> dict[str, tuple[str, ...]]:
+    """Read field vocabulary from the schema catalog instead of copying it."""
+
+    semantic_terms = get_schema_catalog().get("semantic_terms", {})
+    return {
+        str(column): tuple(dict.fromkeys([*terms, str(column)]))
+        for column, terms in semantic_terms.items()
+        if column not in {"sample_id", "point_index"}
+    }
 
 
 def _dedupe_dicts(items: Iterable[dict[str, Any]], keys: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -199,13 +196,13 @@ def extract_common_temporal_metrics(question: str) -> tuple[list[dict[str, Any]]
     metrics: list[dict[str, Any]] = []
     derived: list[dict[str, Any]] = []
 
-    for pattern, column, aggregation, alias in _METRIC_PATTERNS:
+    for pattern, column, aggregation in _METRIC_PATTERNS:
         if re.search(pattern, question, flags=re.IGNORECASE):
             metrics.append(
                 {
                     "column": column,
                     "aggregation": aggregation,
-                    "alias": alias,
+                    "alias": canonical_metric_alias(column, aggregation),
                 }
             )
 
@@ -276,7 +273,8 @@ def extract_common_filters(
     )
     number_pattern = r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?"
 
-    for column, terms in _FIELD_TERMS.items():
+    field_terms = _field_terms()
+    for column, terms in field_terms.items():
         term_pattern = "|".join(re.escape(term) for term in sorted(terms, key=len, reverse=True))
         for comparator_pattern, operator in comparator_patterns:
             pattern = re.compile(
@@ -296,13 +294,13 @@ def extract_common_filters(
             )
             break
 
-    columns = list(_FIELD_TERMS)
+    columns = list(field_terms)
     for left_column in columns:
         for right_column in columns:
             if left_column == right_column:
                 continue
-            left_terms = "|".join(re.escape(term) for term in _FIELD_TERMS[left_column])
-            right_terms = "|".join(re.escape(term) for term in _FIELD_TERMS[right_column])
+            left_terms = "|".join(re.escape(term) for term in field_terms[left_column])
+            right_terms = "|".join(re.escape(term) for term in field_terms[right_column])
             for comparator_pattern, operator in comparator_patterns[:4]:
                 pattern = re.compile(
                     rf"(?:{left_terms})\s*(?:{comparator_pattern})\s*(?:{right_terms})",
@@ -341,13 +339,13 @@ def _extract_explicit_order(question: str) -> dict[str, Any] | None:
     for metric_pattern, alias in _RANKING_METRICS:
         if re.search(metric_pattern, target, flags=re.IGNORECASE):
             metric = next(
-                (item for item in _METRIC_PATTERNS if item[3] == alias),
+                (item for item in _METRIC_PATTERNS if canonical_metric_alias(item[1], item[2]) == alias),
                 None,
             )
             if metric:
                 return {
                     "kind": "metric",
-                    "column": metric[1],
+                "column": metric[1],
                     "alias": alias,
                     "direction": direction,
                 }
@@ -358,7 +356,7 @@ def _extract_explicit_order(question: str) -> dict[str, Any] | None:
                 "direction": direction,
             }
 
-    for column, terms in _FIELD_TERMS.items():
+    for column, terms in _field_terms().items():
         if any(term in target for term in terms):
             return {"kind": "column", "column": column, "direction": direction}
     return None
@@ -366,9 +364,9 @@ def _extract_explicit_order(question: str) -> dict[str, Any] | None:
 
 def _requested_metric_aliases(question: str) -> set[str]:
     aliases: set[str] = set()
-    for pattern, _column, _aggregation, alias in _METRIC_PATTERNS:
+    for pattern, column, aggregation in _METRIC_PATTERNS:
         if re.search(pattern, question, flags=re.IGNORECASE):
-            aliases.add(alias)
+            aliases.add(canonical_metric_alias(column, aggregation))
     if re.search(r"质量损失率", question):
         aliases.add("mass_loss_rate")
     if re.search(r"背温抬升|背面温度抬升|背温升高量", question):
@@ -425,9 +423,11 @@ def augment_common_query_spec(
     extracted_metrics, extracted_derived = extract_common_temporal_metrics(question)
     existing_metrics = list(spec.get("all_temporal_metrics") or spec.get("temporal_metrics") or [])
     delta_metrics = list(delta.get("temporal_metrics") or [])
+    # A metric is defined by its source column and aggregation. Different
+    # aliases for AVG(back_temperature) must not create duplicate SQL columns.
     metrics = _dedupe_dicts(
-        [*existing_metrics, *delta_metrics, *extracted_metrics],
-        ("column", "aggregation", "alias"),
+        [*extracted_metrics, *existing_metrics, *delta_metrics],
+        ("column", "aggregation"),
     )
     metrics = [
         item

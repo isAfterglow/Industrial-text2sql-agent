@@ -1,9 +1,13 @@
 from copy import deepcopy
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
+from pathlib import Path
+from contextvars import ContextVar
 import re
 from typing import Any
 
 import sqlglot
+import yaml
 from sqlglot import exp
 from sqlglot.errors import ParseError
 
@@ -52,7 +56,71 @@ def normalize_numeric_literal(value: object) -> str:
     return str(normalized)
 
 
-def get_schema_catalog() -> dict[str, Any]:
+_ACTIVE_PROFILE: ContextVar[str] = ContextVar("active_profile", default="resin")
+
+
+def set_active_profile(name: str) -> None:
+    _load_profile(name)
+    _ACTIVE_PROFILE.set(name)
+
+
+def active_profile_name() -> str:
+    return _ACTIVE_PROFILE.get()
+
+
+def resolve_profile(question: str) -> str:
+    """Route known domain vocabulary deterministically; resin remains default."""
+    text = question.lower()
+    steel_profile = _load_profile("steel_industry")
+    resin_profile = _load_profile("resin")
+
+    def score(profile: dict[str, Any]) -> int:
+        semantic_terms = profile.get("semantic_terms", {})
+        vocabulary = [
+            term
+            for values in semantic_terms.values()
+            for term in values
+        ] + list(profile.get("routing_terms", []))
+        return sum(str(term).lower() in text for term in vocabulary)
+
+    steel_score, resin_score = score(steel_profile), score(resin_profile)
+    return "steel_industry" if steel_score > resin_score and steel_score else "resin"
+
+
+@lru_cache(maxsize=4)
+def _load_profile(name: str = "resin") -> dict[str, Any]:
+    """Load a domain profile; the query engine never owns domain vocabulary."""
+
+    path = Path(__file__).resolve().parents[1] / "profiles" / f"{name}.yaml"
+    with path.open(encoding="utf-8") as handle:
+        profile = yaml.safe_load(handle)
+    if not isinstance(profile, dict) or not profile.get("tables"):
+        raise ValueError(f"Invalid domain profile: {path}")
+    return profile
+
+
+def _profile_catalog() -> dict[str, Any]:
+    profile = _load_profile(active_profile_name())
+    relationships = []
+    for item in profile.get("relationships", []):
+        relationships.append(
+            f"{item['left']} = {item['right']}，"
+            + ("1对1" if item.get("cardinality") == "one_to_one" else "1对多")
+        )
+    return {
+        "database_type": profile.get("database_type", "MySQL"),
+        "tables": profile["tables"],
+        "relationships": relationships,
+        "semantic_terms": profile.get("semantic_terms", {}),
+        "domain_conventions": profile.get("domain_conventions", []),
+        "aggregations": profile.get("aggregations", {}),
+        "derived_metrics": profile.get("derived_metrics", {}),
+        "temporal_semantics": profile.get("temporal_semantics", {}),
+        "policy": profile.get("policy", {}),
+    }
+
+
+def _legacy_resin_catalog() -> dict[str, Any]:
     """返回机器可读的数据库Schema。
 
     表、字段、推荐别名、表粒度、关系和业务术语集中维护在这里。
@@ -300,7 +368,10 @@ def get_schema_catalog() -> dict[str, Any]:
         }
     )
 
+def get_schema_catalog() -> dict[str, Any]:
+    """Return the active domain catalog from its declarative profile."""
 
+    return deepcopy(_profile_catalog())
 
 
 SAMPLE_ID_PATTERNS = (
@@ -434,10 +505,14 @@ def match_question_semantic_columns(
     for column, terms in catalog[
         "semantic_terms"
     ].items():
+        # Field identifiers are part of the public schema vocabulary as well.
+        # This keeps mixed Chinese/English engineering questions on the same
+        # structured path as their natural-language equivalents.
+        candidates = list(dict.fromkeys([*terms, column]))
         matched_terms = [
             term
             for term in sorted(
-                terms,
+                candidates,
                 key=len,
                 reverse=True,
             )
@@ -467,7 +542,7 @@ def infer_question_ranking_column(
     for column, terms in catalog[
         "semantic_terms"
     ].items():
-        for term in terms:
+        for term in dict.fromkeys([*terms, column]):
             start = 0
 
             while True:
@@ -821,11 +896,14 @@ def extract_requested_limit_from_question(
     """提取明确的Top-K或最多返回数量。"""
 
     patterns = (
+        r"(?:top|bottom)\s*(\d+)\s*(?:个|条)?",
         r"(?:最高|最低|最大|最小)(?:的)?\s*(\d+)\s*个",
+        r"(?:最高|最低|最大|最小)(?:的)?\s*(\d+)\s*条(?:记录|数据)?",
         r"前\s*(\d+)\s*(?:个|条)?",
         r"最多(?:返回)?\s*(\d+)\s*(?:个|条)?",
         r"(?:限制|limit)\s*(?:为|=)?\s*(\d+)",
         r"(\d+)\s*个样本",
+        r"(\d+)\s*(?:个|条|笔).{0,12}(?:最高|最低|最大|最小)",
     )
     for pattern in patterns:
         match = re.search(
@@ -835,6 +913,9 @@ def extract_requested_limit_from_question(
         )
         if match:
             return int(match.group(1))
+    chinese = re.search(r"(?:前|最高的?|最低的?|最大的?|最小的?)\s*([一二三四五六七八九十])\s*(?:个|条|笔)", question)
+    if chinese:
+        return {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}[chinese.group(1)]
     return None
 
 
@@ -880,7 +961,7 @@ def _extract_simple_filters(
     seen: set[tuple[str, str, str, str]] = set()
 
     comparison_patterns = (
-        (r"大于等于|不小于|至少|不少于", ">="),
+        (r"大于等于|不小于|不低于|至少|不少于", ">="),
         (r"小于等于|不大于|至多|不超过", "<="),
         (r"大于|高于|超过", ">"),
         (r"小于|低于", "<"),
@@ -977,32 +1058,35 @@ def _extract_simple_filters(
     return filters, consumed_numbers
 
 
-def _response_table_info() -> tuple[str, dict[str, Any]]:
+def _response_table_info() -> tuple[str, dict[str, Any]] | None:
     """返回时序响应表名及其Schema信息。"""
 
     catalog = get_schema_catalog()
     for table_name, info in catalog["tables"].items():
         if info["grain"] == "many_rows_per_sample":
             return table_name, info
-    raise ValueError("Schema中没有many_rows_per_sample时序表。")
+    return None
 
 
 def _ranking_direction(question: str) -> str | None:
     """提取结果排名或显式排序方向。"""
 
-    if re.search(r"最低|最小|升序|从低到高", question):
+    if re.search(r"最低|最小|升序|从低到高|\bbottom\b", question, re.IGNORECASE):
         return "ASC"
-    if re.search(r"最高|最大|降序|从高到低", question):
+    if re.search(r"最高|最大|降序|从高到低|\btop\b", question, re.IGNORECASE):
         return "DESC"
     return None
 
 
-def _metric_alias(column: str, aggregation: str) -> str:
+def canonical_metric_alias(column: str, aggregation: str) -> str:
+    """Return the single public alias for a temporal aggregation."""
+
     prefixes = {
         "MAX": "peak",
-        "AVG": "avg",
+        "AVG": "average",
         "MIN": "min",
         "SUM": "sum",
+        "INITIAL": "initial",
         "FINAL": "final",
     }
     return f"{prefixes[aggregation]}_{column}"
@@ -1037,7 +1121,10 @@ def _infer_temporal_metrics(
     “峰值背面温度和最终质量”把背温误判为FINAL。
     """
 
-    _, response_info = _response_table_info()
+    response = _response_table_info()
+    if response is None:
+        return []
+    _, response_info = response
     matches = match_question_semantic_columns(question)
     catalog = get_schema_catalog()
     cue_patterns = (
@@ -1112,7 +1199,7 @@ def _infer_temporal_metrics(
                 {
                     "column": column,
                     "aggregation": aggregation,
-                    "alias": _metric_alias(column, aggregation),
+                    "alias": canonical_metric_alias(column, aggregation),
                 }
             )
 
@@ -1163,7 +1250,10 @@ def _build_temporal_query_spec(
 
     catalog = get_schema_catalog()
     owners = get_column_owner_map()
-    response_table, response_info = _response_table_info()
+    response = _response_table_info()
+    if response is None:
+        return None
+    response_table, response_info = response
     response_columns = set(response_info["columns"])
     response_value_columns = response_columns - {"sample_id", "point_index"}
     metrics = _infer_temporal_metrics(question)
@@ -1344,6 +1434,298 @@ def _build_temporal_query_spec(
     }
 
 
+def _build_fact_aggregate_query_spec(
+    question: str,
+    matches: dict[str, list[str]],
+    requested_outputs: set[str],
+    strict_projection: bool,
+) -> dict[str, Any] | None:
+    """Compile common fact/dimension rollups declared by a Profile.
+
+    This deliberately covers only unambiguous SUM/AVG aggregates. More complex
+    analytical questions continue through the constrained LLM path.
+    """
+    catalog = get_schema_catalog()
+    profile_relationships = _load_profile(active_profile_name()).get("relationships", [])
+    fact_tables = [name for name, info in catalog["tables"].items() if info["grain"] == "fact"]
+    if len(fact_tables) != 1:
+        return None
+    if not re.search(r"统计|总(?:计|量)|合计|平均|均值", question):
+        return None
+
+    aggregation = "AVG" if re.search(r"平均|均值", question) else "SUM"
+    owners = get_column_owner_map()
+    metric_candidates = [
+        column for column in matches
+        if aggregation in set(catalog.get("aggregations", {}).get(column, []))
+    ]
+    if len(metric_candidates) != 1:
+        return None
+    metric = metric_candidates[0]
+    fact_table = fact_tables[0]
+    if fact_table not in owners.get(metric, set()):
+        return None
+
+    group_candidates = [
+        column for column in matches
+        if column != metric and re.search(r"按.{0,16}" + re.escape(next(iter(matches[column]))), question)
+    ]
+    # A group column is normally written directly after "按"; fall back to a
+    # single matched dimension field for compact Chinese phrasing.
+    if not group_candidates:
+        group_candidates = [
+            column for column in matches
+            if column != metric and any(catalog["tables"][table]["grain"] == "dimension" for table in owners.get(column, set()))
+        ]
+    if len(group_candidates) > 1:
+        return None
+    group_column = group_candidates[0] if group_candidates else ""
+    group_table = next(iter(owners.get(group_column, set())), "") if group_column else ""
+
+    if group_column and catalog["tables"].get(group_table, {}).get("grain") != "dimension":
+        return None
+    if group_column:
+        related = any(
+            {str(rel["left"]).split(".")[0], str(rel["right"]).split(".")[0]} == {fact_table, group_table}
+            for rel in profile_relationships
+        )
+        if not related:
+            return None
+
+    alias = canonical_metric_alias(metric, aggregation)
+    selected = [group_column] if group_column else []
+    selected.append(alias)
+    return {
+        "eligible": True,
+        "mode": "deterministic",
+        "query_type": "fact_aggregate",
+        "table": fact_table,
+        "group_column": group_column,
+        "group_table": group_table,
+        "metric": metric,
+        "aggregation": aggregation,
+        "metric_alias": alias,
+        "select_columns": selected if strict_projection else selected,
+        "filters": [], "where_filters": [], "having_filters": [],
+        "order_by": {"kind": "metric", "alias": alias, "direction": "DESC"} if group_column and re.search(r"降序|最高|最大", question) else None,
+        "limit": None, "sample_ids": [], "strict_projection": strict_projection,
+        "temporal_metrics": [], "scalar_columns": [], "scalar_tables": [],
+        "confidence": 1.0,
+        "reason": "事实表指标、聚合函数和维度关系均由Profile明确声明，使用通用聚合快路径。",
+    }
+
+
+def _profile_fact_filters(question: str) -> list[dict[str, Any]]:
+    """Extract portable fact/dimension constraints from a Profile vocabulary."""
+    filters: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    def add(column: str, operator: str, value: Any, value2: Any = None) -> None:
+        key = (column, operator, str(value), str(value2 or ""))
+        if key not in seen:
+            item: dict[str, Any] = {"column": column, "operator": operator, "value": value}
+            if value2 is not None:
+                item["value2"] = value2
+            filters.append(item)
+            seen.add(key)
+
+    # Common calendar expressions. The physical values remain Profile data,
+    # while this parser intentionally only recognizes universal calendar forms.
+    year = re.search(r"(20\d{2})年", question)
+    if year:
+        add("year", "=", year.group(1))
+    month = re.search(r"(?<!\d)(1[0-2]|[1-9])月", question)
+    if month:
+        add("month", "=", month.group(1))
+    if re.search(r"第一季度|第1季度", question):
+        add("month", "BETWEEN", 1, 3)
+    elif re.search(r"第二季度|第2季度", question):
+        add("month", "BETWEEN", 4, 6)
+    elif re.search(r"第三季度|第3季度", question):
+        add("month", "BETWEEN", 7, 9)
+    elif re.search(r"第四季度|第4季度", question):
+        add("month", "BETWEEN", 10, 12)
+    hour_range = re.search(r"(\d{1,2})点\s*(?:到|至|~|～)\s*(\d{1,2})点?", question)
+    if hour_range:
+        add("hour", "BETWEEN", hour_range.group(1), hour_range.group(2))
+    elif (hour := re.search(r"(?<!\d)(\d{1,2})点", question)):
+        add("hour", "=", hour.group(1))
+    status_is_group = bool(re.search(r"按工作日状态|工作日.*周末|平日.*周末", question))
+    if not status_is_group and ("工作日" in question or "平日" in question or re.search(r"\bWeekday\b", question, re.I)):
+        add("week_status", "=", "Weekday")
+    elif not status_is_group and ("周末" in question or re.search(r"\bWeekend\b", question, re.I)):
+        add("week_status", "=", "Weekend")
+    for name in ("Maximum_Load", "Medium_Load", "Light_Load"):
+        if name.lower() in question.lower():
+            add("load_type_name", "=", name)
+    return filters
+
+
+def _build_profile_fact_query_spec(
+    question: str,
+    matches: dict[str, list[str]],
+    requested_outputs: set[str],
+    ranking: tuple[str, str] | None,
+    strict_projection: bool,
+    numeric_filters: list[dict[str, Any]],
+    limit: int | None,
+) -> dict[str, Any] | None:
+    """Compile a normalized fact table plus declared dimensions from a Profile."""
+    catalog = get_schema_catalog()
+    facts = [name for name, info in catalog["tables"].items() if info["grain"] == "fact"]
+    if len(facts) != 1:
+        return None
+    fact_table = facts[0]
+    owners = get_column_owner_map()
+    profile = _load_profile(active_profile_name())
+    aggregations = catalog.get("aggregations", {})
+    all_filters = list(numeric_filters) + _profile_fact_filters(question)
+    has_aggregate = bool(re.search(r"统计|总(?:计|量)|合计|汇总|平均|均值|记录数|数量|多少", question))
+    derived_requested = bool(re.search(r"碳强度", question)) and "carbon_intensity" in catalog.get("derived_metrics", {})
+    mentioned = set(matches)
+
+    # Only take ownership of queries that genuinely need Profile fact/dimension
+    # semantics; resin's dedicated planner remains untouched.
+    used_columns = mentioned | requested_outputs | {item["column"] for item in all_filters}
+    used_tables = {fact_table}
+    for column in used_columns:
+        used_tables.update(owners.get(column, set()))
+    # Grouping words can be unambiguous even when they use a colloquial form
+    # (for example "每个月" instead of the Profile term "月份").
+    if re.search(r"月(?:份|度|各|的|个)|每个月|按月|\d+个月", question):
+        used_tables.update(owners.get("month", set()))
+    if re.search(r"负荷(?:类型)?|各负荷", question):
+        used_tables.update(owners.get("load_type_name", set()))
+    if re.search(r"工作日.*周末|平日.*周末|按工作日状态", question):
+        used_tables.update(owners.get("week_status", set()))
+    dimensions = sorted(table for table in used_tables if table != fact_table and catalog["tables"].get(table, {}).get("grain") == "dimension")
+    needs_profile_plan = bool(dimensions or derived_requested or len(numeric_filters) > 1 or (has_aggregate and len([c for c in mentioned if c in aggregations]) > 1))
+    if not needs_profile_plan:
+        return None
+    if any(table != fact_table and table not in dimensions for table in used_tables):
+        return None
+
+    grouping_cue = bool(re.search(r"按|每(?:个|月|年|天|小时|种)|不同(?:负荷|类型)|各(?:负荷|类型)|比较.+和|\d+个月|平日.*周末|工作日.*周末", question))
+    filter_columns = {item["column"] for item in all_filters}
+    group_columns = [
+        column for column in mentioned
+        if column in owners and any(owner in dimensions for owner in owners[column])
+        and column not in filter_columns
+    ]
+    if grouping_cue:
+        inferred_groups = []
+        if re.search(r"月(?:份|度|各|的|个)|每个月|按月|\d+个月", question):
+            inferred_groups.append("month")
+        if re.search(r"负荷(?:类型)?|各负荷", question):
+            inferred_groups.append("load_type_name")
+        if re.search(r"工作日.*周末|平日.*周末|按工作日状态", question):
+            inferred_groups.append("week_status")
+        group_columns.extend(
+            column for column in inferred_groups
+            if column not in filter_columns and column in owners
+        )
+    group_columns = sorted(dict.fromkeys(group_columns))
+    if not grouping_cue:
+        group_columns = []
+
+    # A field used solely as a predicate ("耗电量大于100的平均排放")
+    # constrains the population; it is not an implicitly requested aggregate.
+    metric_columns = [
+        column for column in mentioned
+        if fact_table in owners.get(column, set())
+        and column in aggregations
+        and (column not in filter_columns or column in requested_outputs)
+    ]
+    metric_columns = sorted(dict.fromkeys(metric_columns))
+    aggregation = "AVG" if re.search(r"平均|均值", question) else "SUM"
+    metrics = [
+        {"column": column, "aggregation": aggregation, "alias": canonical_metric_alias(column, aggregation)}
+        for column in metric_columns
+        if has_aggregate and not derived_requested
+        if aggregation in set(aggregations.get(column, []))
+    ]
+    is_count = bool(re.search(r"记录数|数量|多少", question))
+    if has_aggregate and not metrics and not derived_requested and not is_count:
+        return None
+
+    select_columns: list[str] = []
+    if has_aggregate or derived_requested:
+        select_columns.extend(group_columns)
+        select_columns.extend(metric["alias"] for metric in metrics)
+        if is_count:
+            select_columns.append("record_count")
+        if derived_requested:
+            select_columns.append("carbon_intensity")
+    else:
+        selected = set(requested_outputs) or ({ranking[0]} if ranking is not None else set(metric_columns))
+        if ranking is not None:
+            selected.add(ranking[0])
+        if not strict_projection:
+            selected.add(catalog["tables"][fact_table]["key"])
+        if not selected:
+            return None
+        select_columns = _ordered_columns_for_table(fact_table, selected)
+
+    order_by: dict[str, str] | None = None
+    direction = _ranking_direction(question)
+    if derived_requested and re.search(r"最高|最大|最低|最小|前\s*\d+", question) and direction:
+        order_by = {"kind": "derived", "alias": "carbon_intensity", "direction": direction}
+    elif ranking is not None and direction:
+        ranking_column = ranking[0]
+        ranking_positions = [match.start() for match in re.finditer(r"最高|最低|最大|最小", question)]
+        if ranking_positions:
+            ranking_position = ranking_positions[-1]
+            candidates: list[tuple[int, str]] = []
+            for column, terms in matches.items():
+                for term in terms:
+                    positions = [match.start() for match in re.finditer(re.escape(term), question)]
+                    if positions:
+                        candidates.append((min(abs(position - ranking_position) for position in positions), column))
+            if candidates:
+                ranking_column = min(candidates)[1]
+        if not has_aggregate and not requested_outputs:
+            select_columns = _ordered_columns_for_table(fact_table, {catalog["tables"][fact_table]["key"], ranking_column})
+        order_by = {"kind": "metric" if has_aggregate else "column", "column": ranking_column, "alias": canonical_metric_alias(ranking_column, aggregation), "direction": direction}
+    elif metrics and group_columns and re.search(r"最高|最大|最低|最小", question) and direction:
+        order_by = {"kind": "metric", "alias": metrics[0]["alias"], "direction": direction}
+
+    if limit is not None and order_by is None:
+        return None
+    relationships = []
+    for dimension in dimensions:
+        relation = next((rel for rel in profile.get("relationships", []) if {str(rel["left"]).split(".")[0], str(rel["right"]).split(".")[0]} == {fact_table, dimension}), None)
+        if relation is None:
+            return None
+        relationships.append(relation)
+    return {
+        "eligible": True, "mode": "deterministic", "query_type": "profile_fact_query",
+        "table": fact_table, "fact_table": fact_table, "dimension_tables": dimensions,
+        "relationships": relationships, "select_columns": select_columns, "filters": all_filters,
+        "metrics": metrics, "group_columns": group_columns, "is_count": is_count,
+        "derived_metrics": ([{"alias": "carbon_intensity", "formula": "co2_tco2 / NULLIF(usage_kwh, 0)", "dependencies": ["co2_tco2", "usage_kwh"]}] if derived_requested else []),
+        "order_by": order_by, "limit": limit, "sample_ids": [],
+        "strict_projection": strict_projection, "temporal_metrics": [], "scalar_columns": [], "scalar_tables": [],
+        "confidence": 1.0,
+        "reason": "Profile声明的事实表、维度关系、过滤、聚合和派生指标可确定编译。",
+    }
+
+
+def requires_llm_query_planning(question: str) -> bool:
+    """Return True for analytic operators outside the constrained QuerySpec DSL."""
+
+    advanced_patterns = (
+        r"相较上个月|环比|变化率",
+        r"累计.*(?:贡献|占比)|(?:贡献|占比).*累计",
+        r"相关系数|标准差",
+        r"占当月总.*(?:比例|占比)|占.*总.*(?:比例|占比)",
+        r"连续\s*\d+\s*(?:个)?小时",
+        r"差异及其百分比|百分比差异",
+        r"(?:每种|各).{0,12}(?:最高|最低).{0,12}(?:读数|记录)",
+        r"所属负荷类型.*平均|各负荷类型.*平均",
+    )
+    return any(re.search(pattern, question) for pattern in advanced_patterns)
+
+
 def build_query_spec(
     question: str,
 ) -> dict[str, Any]:
@@ -1408,6 +1790,10 @@ def build_query_spec(
         )
         return result
 
+    if requires_llm_query_planning(question):
+        result["reason"] = "问题包含窗口、相关性、累计、份额或分组内排名等高级分析算子，需要LLM规划。"
+        return result
+
     temporal = _build_temporal_query_spec(
         question=question,
         matches=matches,
@@ -1421,6 +1807,18 @@ def build_query_spec(
     )
     if temporal is not None:
         return temporal
+
+    profile_fact = _build_profile_fact_query_spec(
+        question, matches, requested_outputs, ranking, strict_projection, filters, limit
+    )
+    if profile_fact is not None:
+        return profile_fact
+
+    fact_aggregate = _build_fact_aggregate_query_spec(
+        question, matches, requested_outputs, strict_projection
+    )
+    if fact_aggregate is not None:
+        return fact_aggregate
 
     # 其他明确复杂算子继续交给RSL。
     if re.search(r"峰值|平均|均值|每个样本|分组|占比|比例|最终|最后一个点", question):
@@ -1449,6 +1847,10 @@ def build_query_spec(
         # 多表问题继续进入RSL，但保留已经确定的查询类型与字段角色，
         # 供Guard和Trace使用。这里不生成固定SQL，也不改变RSL路由。
         if len(candidate_tables) > 1:
+            one_to_one = all(
+                catalog["tables"][table]["grain"] == "one_row_per_sample"
+                for table in candidate_tables
+            )
             if ranking is not None and limit is not None:
                 result["query_type"] = "multi_table_topk"
             elif filters:
@@ -1458,6 +1860,19 @@ def build_query_spec(
 
             result["scalar_columns"] = sorted(business_columns)
             result["scalar_tables"] = sorted(candidate_tables)
+            if one_to_one and _all_question_numbers_consumed(question, consumed_numbers, limit):
+                selected = set(requested_outputs) or {"sample_id", *business_columns}
+                if ranking is not None and not strict_projection:
+                    selected.add(ranking[0])
+                result.update({
+                    "eligible": True, "mode": "deterministic",
+                    "query_type": "one_to_one_join",
+                    "select_columns": ["sample_id", *sorted(selected - {"sample_id"})],
+                    "order_by": partial_order_by,
+                    "reason": "字段均位于sample_id一对一关系表，使用通用Join编译器。",
+                    "confidence": 1.0,
+                })
+                return result
             result["reason"] = (
                 "已识别多表字段、返回字段、排序和数量约束，"
                 "但SQL连接结构仍交由RSL双候选生成。"
@@ -1465,7 +1880,7 @@ def build_query_spec(
         return result
 
     table_name = next(iter(candidate_tables))
-    if catalog["tables"][table_name]["grain"] != "one_row_per_sample":
+    if catalog["tables"][table_name]["grain"] not in {"one_row_per_sample", "fact"}:
         return result
 
     query_type = "single_table_filter"
@@ -1488,18 +1903,18 @@ def build_query_spec(
     if requested_outputs:
         selected = set(requested_outputs)
     elif query_type == "single_table_topk" and ranking is not None:
-        selected = {"sample_id", ranking[0]}
+        selected = {catalog["tables"][table_name]["key"], ranking[0]}
     elif query_type == "exact_sample":
-        selected = {"sample_id"} | business_columns
+        selected = {catalog["tables"][table_name]["key"]} | business_columns
     else:
-        selected = {"sample_id"} | business_columns
+        selected = {catalog["tables"][table_name]["key"]} | business_columns
 
     if not strict_projection:
-        selected.add("sample_id")
+        selected.add(catalog["tables"][table_name]["key"])
     if not selected:
         return result
     if any(
-        column != "sample_id" and table_name not in owners.get(column, set())
+        column != catalog["tables"][table_name]["key"] and table_name not in owners.get(column, set())
         for column in selected
     ):
         return result
@@ -1535,10 +1950,15 @@ def _compile_predicate(
     item: dict[str, Any],
     column_sql: str,
 ) -> str:
+    def literal(value: Any) -> str:
+        if parse_decimal_literal(value) is not None:
+            return str(value)
+        return "'" + str(value).replace("'", "''") + "'"
+
     operator = item["operator"]
     if operator == "BETWEEN":
-        return f"{column_sql} BETWEEN {item['value']} AND {item['value2']}"
-    return f"{column_sql} {operator} {item['value']}"
+        return f"{column_sql} BETWEEN {literal(item['value'])} AND {literal(item['value2'])}"
+    return f"{column_sql} {operator} {literal(item['value'])}"
 
 
 def _final_metrics_subquery(
@@ -1597,6 +2017,36 @@ def compile_query_spec_sql(
         limit = query_spec.get("limit")
         if isinstance(limit, int) and limit > 0:
             parts.append(f"LIMIT {limit}")
+        return " ".join(parts)
+
+    if query_type == "one_to_one_join":
+        tables = list(query_spec.get("scalar_tables", []))
+        if not tables:
+            return ""
+        base = tables[0]
+        base_alias = catalog["tables"][base]["alias"]
+        selected = []
+        for column in query_spec.get("select_columns", []):
+            if column == "sample_id":
+                selected.append(f"{base_alias}.sample_id")
+            else:
+                selected.append(_qualified_column(column, _column_owner(column)))
+        parts = ["SELECT " + ", ".join(selected), f"FROM {base} AS {base_alias}"]
+        for table in tables[1:]:
+            alias = catalog["tables"][table]["alias"]
+            parts.append(f"JOIN {table} AS {alias} ON {base_alias}.sample_id = {alias}.sample_id")
+        predicates = []
+        for sample_id in query_spec.get("sample_ids", []):
+            predicates.append(f"{base_alias}.sample_id = '{sample_id}'")
+        for item in query_spec.get("filters", []):
+            predicates.append(_compile_predicate(item, _qualified_column(item["column"], _column_owner(item["column"]))))
+        if predicates:
+            parts.append("WHERE " + " AND ".join(predicates))
+        order_by = query_spec.get("order_by")
+        if order_by:
+            parts.append(f"ORDER BY {_qualified_column(order_by['column'], _column_owner(order_by['column']))} {order_by['direction']}")
+        if isinstance(query_spec.get("limit"), int) and query_spec["limit"] > 0:
+            parts.append(f"LIMIT {query_spec['limit']}")
         return " ".join(parts)
 
     if query_type == "per_sample_temporal_aggregate":
@@ -1711,6 +2161,95 @@ def compile_query_spec_sql(
             parts.append(f"LIMIT {limit}")
         return " ".join(parts)
 
+    if query_type == "fact_aggregate":
+        fact_table = str(query_spec["table"])
+        fact_alias = catalog["tables"][fact_table]["alias"]
+        metric = str(query_spec["metric"])
+        aggregation = str(query_spec["aggregation"])
+        metric_alias = str(query_spec["metric_alias"])
+        group_column = str(query_spec.get("group_column", ""))
+        group_table = str(query_spec.get("group_table", ""))
+        metric_sql = f"{aggregation}({fact_alias}.{metric}) AS {metric_alias}"
+        if not group_column:
+            return f"SELECT {metric_sql} FROM {fact_table} AS {fact_alias}"
+
+        group_alias = catalog["tables"][group_table]["alias"]
+        relation = next(
+            (
+                rel for rel in _load_profile(active_profile_name()).get("relationships", [])
+                if {str(rel["left"]).split(".")[0], str(rel["right"]).split(".")[0]} == {fact_table, group_table}
+            ),
+            None,
+        )
+        if relation is None:
+            return ""
+        left_table, left_column = str(relation["left"]).split(".", 1)
+        right_table, right_column = str(relation["right"]).split(".", 1)
+        left_alias = catalog["tables"][left_table]["alias"]
+        right_alias = catalog["tables"][right_table]["alias"]
+        parts = [
+            f"SELECT {group_alias}.{group_column}, {metric_sql}",
+            f"FROM {fact_table} AS {fact_alias}",
+            f"JOIN {group_table} AS {group_alias} ON {left_alias}.{left_column} = {right_alias}.{right_column}",
+            f"GROUP BY {group_alias}.{group_column}",
+        ]
+        order_by = query_spec.get("order_by")
+        if order_by:
+            parts.append(f"ORDER BY {metric_alias} {order_by['direction']}")
+        return " ".join(parts)
+
+    if query_type == "profile_fact_query":
+        fact_table = str(query_spec["fact_table"])
+        fact_alias = catalog["tables"][fact_table]["alias"]
+        dimensions = list(query_spec.get("dimension_tables", []))
+        aliases = {fact_table: fact_alias}
+        aliases.update({table: catalog["tables"][table]["alias"] for table in dimensions})
+        parts: list[str] = []
+        group_columns = list(query_spec.get("group_columns", []))
+        metrics = list(query_spec.get("metrics", []))
+        derived = {
+            str(item.get("alias", "")) if isinstance(item, dict) else str(item)
+            for item in query_spec.get("derived_metrics", [])
+        }
+        select_parts: list[str] = []
+        if metrics or derived or query_spec.get("is_count"):
+            for column in group_columns:
+                select_parts.append(_qualified_column(column, _column_owner(column)))
+            for metric in metrics:
+                select_parts.append(f"{metric['aggregation']}({fact_alias}.{metric['column']}) AS {metric['alias']}")
+            if query_spec.get("is_count"):
+                select_parts.append("COUNT(*) AS record_count")
+            if "carbon_intensity" in derived:
+                select_parts.append(f"SUM({fact_alias}.co2_tco2) / NULLIF(SUM({fact_alias}.usage_kwh), 0) AS carbon_intensity")
+        else:
+            select_parts = [f"{fact_alias}.{column}" for column in query_spec.get("select_columns", [])]
+        if not select_parts:
+            return ""
+        parts.extend(["SELECT " + ", ".join(select_parts), f"FROM {fact_table} AS {fact_alias}"])
+        for relation in query_spec.get("relationships", []):
+            left_table, left_column = str(relation["left"]).split(".", 1)
+            right_table, right_column = str(relation["right"]).split(".", 1)
+            dimension = right_table if left_table == fact_table else left_table
+            parts.append(f"JOIN {dimension} AS {aliases[dimension]} ON {aliases[left_table]}.{left_column} = {aliases[right_table]}.{right_column}")
+        predicates = [
+            _compile_predicate(item, _qualified_column(item["column"], _column_owner(item["column"])))
+            for item in query_spec.get("filters", [])
+        ]
+        if predicates:
+            parts.append("WHERE " + " AND ".join(predicates))
+        if group_columns:
+            parts.append("GROUP BY " + ", ".join(_qualified_column(column, _column_owner(column)) for column in group_columns))
+        order_by = query_spec.get("order_by")
+        if order_by:
+            if order_by["kind"] in {"metric", "derived"}:
+                expression = order_by["alias"]
+            else:
+                expression = _qualified_column(order_by["column"], _column_owner(order_by["column"]))
+            parts.append(f"ORDER BY {expression} {order_by['direction']}")
+        if isinstance(query_spec.get("limit"), int) and query_spec["limit"] > 0:
+            parts.append(f"LIMIT {query_spec['limit']}")
+        return " ".join(parts)
+
     table_name = str(query_spec["table"])
     alias = catalog["tables"][table_name]["alias"]
     select_columns = list(query_spec["select_columns"])
@@ -1720,11 +2259,12 @@ def compile_query_spec_sql(
     parts = [f"SELECT {select_sql}", f"FROM {table_name} AS {alias}"]
     predicates: list[str] = []
     sample_ids = list(query_spec.get("sample_ids", []))
-    if len(sample_ids) == 1:
-        predicates.append(f"{alias}.sample_id = '{sample_ids[0]}'")
-    elif len(sample_ids) > 1:
-        values = ", ".join(f"'{sample_id}'" for sample_id in sample_ids)
-        predicates.append(f"{alias}.sample_id IN ({values})")
+    if catalog["tables"][table_name]["key"] == "sample_id":
+        if len(sample_ids) == 1:
+            predicates.append(f"{alias}.sample_id = '{sample_ids[0]}'")
+        elif len(sample_ids) > 1:
+            values = ", ".join(f"'{sample_id}'" for sample_id in sample_ids)
+            predicates.append(f"{alias}.sample_id IN ({values})")
     for item in query_spec.get("filters", []):
         predicates.append(_compile_predicate(item, f"{alias}.{item['column']}"))
     if predicates:
@@ -1851,6 +2391,7 @@ def build_schema_context_for_tables(
     """为SQL2构建严格的表级和列级裁剪Schema。"""
 
     catalog = get_schema_catalog()
+    is_resin_profile = active_profile_name() == "resin"
     owners = get_column_owner_map()
     selected_tables = {
         table_name
@@ -1879,7 +2420,8 @@ def build_schema_context_for_tables(
                 if column in info["columns"]
                 and table_name in owners.get(column, set())
             }
-            allowed_columns.add("sample_id")
+            if is_resin_profile:
+                allowed_columns.add("sample_id")
 
         grain_text = (
             "每个样本一行"
@@ -1898,18 +2440,20 @@ def build_schema_context_for_tables(
         lines.append("必要连接关系：")
         lines.extend(f"- {item}" for item in relationships)
 
-    lines.extend(
-        [
-            build_question_field_hint(question),
-            "生成约束：",
-            "- 只能使用以上列出的表和字段。",
+    constraints = [
+        build_question_field_hint(question),
+        "生成约束：",
+        "- 只能使用以上列出的表和字段。",
+        "- 普通记录级Top-K直接ORDER BY目标字段并LIMIT。",
+        "- 禁止SELECT *，必须严格遵守用户返回字段要求。",
+    ]
+    if is_resin_profile:
+        constraints.extend([
             "- 不得因为sample_id是公共连接键而引入无关表。",
-            "- 普通样本级Top-K直接ORDER BY目标字段并LIMIT。",
             "- 一行一个样本的字段Top-K不使用MAX、GROUP BY或IN子查询。",
             "- 只有时序峰值才使用MAX并按sample_id分组。",
-            "- 禁止SELECT *，必须严格遵守用户返回字段要求。",
-        ]
-    )
+        ])
+    lines.extend(constraints)
     return "\n".join(lines)
 
 
@@ -1959,10 +2503,12 @@ def build_robust_schema_linking(
         robust_tables = set(forward_tables) | accepted_backward_tables
         rejected_backward_tables = set(backward_tables) - robust_tables
 
-    if len(robust_tables) > 1 or re.search(
-        r"样本|sample_id|sample_",
-        question,
-        flags=re.IGNORECASE,
+    if active_profile_name() == "resin" and (
+        len(robust_tables) > 1 or re.search(
+            r"样本|sample_id|sample_",
+            question,
+            flags=re.IGNORECASE,
+        )
     ):
         robust_columns.add("sample_id")
 
@@ -2105,15 +2651,17 @@ def build_schema_context() -> str:
     """
 
     catalog = get_schema_catalog()
+    profile = _load_profile(active_profile_name())
+    database_purpose = profile.get(
+        "description",
+        f"查询{profile.get('database_name', '当前数据库')}中的白名单业务数据。",
+    )
 
     lines: list[str] = [
         "数据库类型：MySQL",
         "",
         "数据库用途：",
-        (
-            "查询树脂基防热材料的静态参数、"
-            "热物性参数和时序热响应。"
-        ),
+        str(database_purpose),
         "",
         "表结构：",
     ]

@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -23,6 +24,21 @@ class Settings(BaseSettings):
     LLM_API_KEY: str
     LLM_MODEL: str
     LLM_BASE_URL: str
+    # Each stage has its own budget.  The case-level evaluator remains the
+    # final circuit breaker, while this prevents a local model stall from
+    # consuming the entire repair budget.
+    LLM_REQUEST_TIMEOUT_SECONDS: int = 15
+    LLM_7B_API_KEY: str = ""
+    LLM_7B_MODEL: str = "qwen2.5:7b"
+    LLM_7B_BASE_URL: str = ""
+    LLM_7B_REQUEST_TIMEOUT_SECONDS: int = 30
+    DEEPSEEK_API_KEY: str = ""
+    DEEPSEEK_MODEL: str = ""
+    DEEPSEEK_BASE_URL: str = ""
+    DEEPSEEK_REQUEST_TIMEOUT_SECONDS: int = 30
+    # Optional OpenAI-compatible env file. This avoids duplicating API keys in
+    # the project .env while keeping the router portable across deployments.
+    DEEPSEEK_ENV_FILE: str = ""
 
     # ==================================================
     # Resin Database
@@ -53,7 +69,18 @@ class Settings(BaseSettings):
     SQL_TIMEOUT_SECONDS: int = 10
 
     # SQL校验或执行失败后，最多允许LLM修复多少次
-    SQL_MAX_REPAIR_ATTEMPTS: int = 1
+    SQL_MAX_REPAIR_ATTEMPTS: int = 3
+
+    # ==================================================
+    # Session memory (Redis preferred, SQLite fallback)
+    # ==================================================
+    SESSION_STORE_MODE: str = "auto"
+    REDIS_URL: str = ""
+    SESSION_MEMORY_TTL_SECONDS: int = 86400
+    SESSION_MEMORY_DB_PATH: str = "data/session_memory.sqlite3"
+
+    # off: no gate; risk: advanced/free-form plans; always: every valid SQL.
+    APPROVAL_MODE: str = "off"
 
     @property
     def allowed_tables(self) -> tuple[str, ...]:

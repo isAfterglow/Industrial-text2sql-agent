@@ -71,6 +71,19 @@ class SQLiteMemoryRepository:
 
                 CREATE INDEX IF NOT EXISTS idx_ltm_schema
                 ON long_term_memories(namespace, schema_hash, is_active);
+
+                CREATE TABLE IF NOT EXISTS approval_requests (
+                    approval_id TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    profile TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    decision_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    decided_at TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_approval_status
+                ON approval_requests(namespace, status, created_at);
                 """
             )
 
@@ -255,3 +268,68 @@ class SQLiteMemoryRepository:
                 (namespace,),
             ).fetchall()
         return {row["memory_type"]: int(row["n"]) for row in rows}
+
+    def create_approval_request(
+        self, *, namespace: str, profile: str, payload: dict[str, object]
+    ) -> dict[str, object]:
+        approval_id = "approval-" + uuid.uuid4().hex[:16]
+        now = _utc_now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO approval_requests(approval_id, namespace, profile, status, payload_json, created_at) VALUES (?, ?, ?, 'pending', ?, ?)",
+                (approval_id, namespace, profile, json.dumps(payload, ensure_ascii=False, sort_keys=True), now),
+            )
+        return {"approval_id": approval_id, "status": "pending", "created_at": now, "payload": payload}
+
+    def decide_approval_request(
+        self, approval_id: str, decision: dict[str, object]
+    ) -> dict[str, object] | None:
+        now = _utc_now_iso()
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM approval_requests WHERE approval_id = ?", (approval_id,)).fetchone()
+            if row is None:
+                return None
+            status = str(decision.get("action", "pending"))
+            connection.execute(
+                "UPDATE approval_requests SET status = ?, decision_json = ?, decided_at = ? WHERE approval_id = ?",
+                (status, json.dumps(decision, ensure_ascii=False, sort_keys=True), now, approval_id),
+            )
+            row = connection.execute("SELECT * FROM approval_requests WHERE approval_id = ?", (approval_id,)).fetchone()
+        return self._approval_row(row) if row else None
+
+    def get_approval_request(self, approval_id: str) -> dict[str, object] | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM approval_requests WHERE approval_id = ?", (approval_id,)).fetchone()
+        return self._approval_row(row) if row else None
+
+    def list_approval_requests(
+        self, *, namespace: str, status: str | None = None, limit: int = 50
+    ) -> list[dict[str, object]]:
+        clauses = ["namespace = ?"]
+        parameters: list[object] = [namespace]
+        if status:
+            clauses.append("status = ?")
+            parameters.append(status)
+        parameters.append(int(limit))
+        sql = (
+            "SELECT * FROM approval_requests WHERE " + " AND ".join(clauses)
+            + " ORDER BY created_at DESC LIMIT ?"
+        )
+        with self._connect() as connection:
+            rows = connection.execute(sql, parameters).fetchall()
+        return [self._approval_row(row) for row in rows]
+
+    def update_memory_metadata(self, memory_id: str, metadata: dict[str, object]) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE long_term_memories SET metadata_json = ?, updated_at = ? WHERE memory_id = ?",
+                (json.dumps(metadata, ensure_ascii=False, sort_keys=True), _utc_now_iso(), memory_id),
+            )
+
+    @staticmethod
+    def _approval_row(row: sqlite3.Row) -> dict[str, object]:
+        return {
+            "approval_id": row["approval_id"], "namespace": row["namespace"], "profile": row["profile"],
+            "status": row["status"], "payload": json.loads(row["payload_json"] or "{}"),
+            "decision": json.loads(row["decision_json"] or "{}"), "created_at": row["created_at"], "decided_at": row["decided_at"],
+        }

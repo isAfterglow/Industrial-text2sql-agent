@@ -8,6 +8,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
 
+from app.schema import set_active_profile
+
 
 _LOG_LOCK = threading.Lock()
 
@@ -769,6 +771,12 @@ def traced_node(
     def wrapped(
         state: dict[str, Any],
     ) -> dict[str, Any]:
+        # LangGraph can run nodes in fresh ContextVar contexts. Profile is
+        # request state, so restore it before every node rather than relying on
+        # the router node's ContextVar mutation to survive graph boundaries.
+        profile = state.get("domain_profile")
+        if profile:
+            set_active_profile(str(profile))
         if not trace_enabled():
             return node_function(state)
 
@@ -909,6 +917,11 @@ def build_trace_record(
         "query_delta": result.get("query_delta", {}),
         "query_delta_source": result.get("query_delta_source", ""),
         "query_delta_llm_called": result.get("query_delta_llm_called", False),
+        "query_plan_mode": result.get("query_plan_mode", ""),
+        "advanced_plan": result.get("advanced_plan", {}),
+        "model_calls": result.get("model_calls", []),
+        "failure_events": result.get("failure_events", []),
+        "result_assertion": result.get("result_assertion", {}),
         "context_resolution_valid": result.get("context_resolution_valid", True),
         "current_turn_coverage": result.get("current_turn_coverage", {}),
         "inherited_fields": result.get("inherited_fields", []),

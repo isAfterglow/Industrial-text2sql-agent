@@ -10,6 +10,7 @@ from typing import Any
 from app.schema import (
     NUMERIC_LITERAL_PATTERN,
     build_query_spec,
+    canonical_metric_alias,
     extract_requested_limit_from_question,
     extract_requested_sample_ids,
     get_schema_catalog,
@@ -250,17 +251,6 @@ def _ordered_projection(columns: set[str] | list[str]) -> list[str]:
     priority = [column for column in ("sample_id", "point_index") if column in values]
     rest = sorted(column for column in values if column not in {"sample_id", "point_index"})
     return priority + rest
-
-
-def _metric_alias(column: str, aggregation: str) -> str:
-    prefix = {
-        "MAX": "peak",
-        "MIN": "minimum",
-        "AVG": "average",
-        "SUM": "sum",
-        "FINAL": "final",
-    }.get(aggregation, aggregation.lower())
-    return f"{prefix}_{column}"
 
 
 def _is_meaningful_spec(spec: dict[str, Any]) -> bool:
@@ -1065,7 +1055,7 @@ def build_deterministic_query_delta(
             {
                 "column": column,
                 "aggregation": aggregation,
-                "alias": _metric_alias(column, aggregation),
+                "alias": canonical_metric_alias(column, aggregation),
             }
             for column in sorted(response_columns)
         ]

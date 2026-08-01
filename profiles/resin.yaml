@@ -1,0 +1,51 @@
+name: resin
+database_type: MySQL
+description: 查询树脂基防热材料的静态参数、热物性参数和时序热响应。
+tables:
+  material_static:
+    alias: ms
+    grain: one_row_per_sample
+    key: sample_id
+    description: 材料样本的静态材料参数，每个sample_id只有一行。
+    columns: {sample_id: 样本编号, rhov_i: 原始材料密度, rhoc_i: 碳化材料密度, porosity_v: 原始材料孔隙率, porosity_c: 碳化材料孔隙率, permeability_v: 原始材料渗透率, permeability_c: 碳化材料渗透率}
+  material_thermal_property:
+    alias: mtp
+    grain: one_row_per_sample
+    key: sample_id
+    description: 材料热物性和热解参数，每个sample_id只有一行。
+    columns: {sample_id: 样本编号, kv_list: 原始材料热导率, kc_list: 碳化材料热导率, cpv_list: 原始材料比热容, cpc_list: 碳化材料比热容, pyrolysis_heat: 热解热, surface_emissivity: 表面发射率}
+  thermal_response:
+    alias: tr
+    grain: many_rows_per_sample
+    key: sample_id
+    sequence_column: point_index
+    description: 样本的时序热响应。
+    columns: {sample_id: 样本编号, point_index: 序列点编号, surface_temperature: 表面温度, back_temperature: 背面温度, mass: 质量}
+relationships:
+  - {left: material_static.sample_id, right: material_thermal_property.sample_id, cardinality: one_to_one}
+  - {left: material_static.sample_id, right: thermal_response.sample_id, cardinality: one_to_many}
+  - {left: material_thermal_property.sample_id, right: thermal_response.sample_id, cardinality: one_to_many}
+semantic_terms:
+  sample_id: [样本编号, 样本ID, 它们的编号]
+  rhov_i: [原始材料密度, 原始密度]
+  rhoc_i: [碳化材料密度, 碳化密度]
+  porosity_v: [原始材料孔隙率, 原始孔隙率]
+  porosity_c: [碳化材料孔隙率, 碳化孔隙率]
+  permeability_v: [原始材料渗透率, 原始渗透率]
+  permeability_c: [碳化材料渗透率, 碳化渗透率]
+  kv_list: [原始材料热导率, 原始热导率, 原始导热率, 原始导热系数]
+  kc_list: [碳化材料热导率, 碳化热导率, 碳化导热率, 碳化导热系数]
+  cpv_list: [原始材料比热容, 原始比热容]
+  cpc_list: [碳化材料比热容, 碳化比热容]
+  pyrolysis_heat: [热解热]
+  surface_emissivity: [表面发射率, 发射率]
+  point_index: [point_index, 序列点编号, 点位编号]
+  surface_temperature: [表面温度, 表温]
+  back_temperature: [背面温度, 背温]
+  mass: [质量]
+aggregations: {surface_temperature: [MAX, MIN, AVG], back_temperature: [MAX, MIN, AVG], mass: [MAX, MIN, AVG, SUM]}
+derived_metrics:
+  mass_loss_rate: {formula: '(initial_mass-final_mass)/NULLIF(initial_mass,0)', dependencies: [initial_mass, final_mass]}
+  back_temperature_rise: {formula: 'final_back_temperature-initial_back_temperature', dependencies: [initial_back_temperature, final_back_temperature]}
+temporal_semantics: {initial: 'MIN(point_index)', final: 'MAX(point_index)'}
+policy: {allowed_tables: [material_static, material_thermal_property, thermal_response], sensitive_columns: [], forbidden_operations: [INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, SLEEP]}

@@ -50,6 +50,8 @@ WELCOME_TEXT = """
 - /remember-case：保存最后一次成功查询为情节记忆；
 - /memories：查看全部长期记忆；
 - /memories semantic|episodic|procedural：按类型查看；
+- /approvals [pending]：查看本Profile的人工审批队列；
+- /approval <id>：查看审批请求详情；
 - /forget <memory_id或唯一前缀>：停用一条长期记忆；
 - /ltm-status：查看SQLite、Schema版本与Embedding状态。
 
@@ -96,6 +98,23 @@ def _handle_long_term_memory_command(
             print(f"\n{exc}")
         return True
 
+    if lowered == "/approvals" or lowered.startswith("/approvals "):
+        status = question.split(maxsplit=1)[1].strip() if " " in question else None
+        records = service.list_approval_requests(status=status or None)
+        if not records:
+            print("\n当前没有匹配的审批请求。")
+        else:
+            for item in records:
+                print(f"\n[{item['approval_id']}] {item['status']} | {item['created_at']}")
+                print(str(item["payload"].get("question", "")))
+        return True
+
+    if lowered.startswith("/approval "):
+        approval_id = question.split(maxsplit=1)[1].strip()
+        record = service.repository.get_approval_request(approval_id)
+        print("\n" + (str(record) if record else "没有找到该审批请求。"))
+        return True
+
     if lowered == "/remember-case":
         try:
             result = service.remember_case_from_short_memory(conversation_memory)
@@ -135,7 +154,7 @@ def main() -> None:
 
         try:
             question = input("请输入问题：").strip()
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, EOFError):
             print("\n已退出。")
             break
 

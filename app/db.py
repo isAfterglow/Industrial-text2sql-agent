@@ -7,13 +7,15 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine, URL
 
 from app.config import get_settings
+from app.schema import _load_profile, active_profile_name
 
 
-@lru_cache(maxsize=1)
-def get_engine() -> Engine:
+@lru_cache(maxsize=4)
+def get_engine(profile_name: str | None = None) -> Engine:
     """创建并缓存 SQLAlchemy Engine。"""
 
     settings = get_settings()
+    profile = _load_profile(profile_name or active_profile_name())
 
     database_url = URL.create(
         drivername="mysql+pymysql",
@@ -21,7 +23,7 @@ def get_engine() -> Engine:
         password=settings.RESIN_DB_PASSWORD,
         host=settings.RESIN_DB_HOST,
         port=settings.RESIN_DB_PORT,
-        database=settings.RESIN_DB_NAME,
+        database=profile.get("database_name", settings.RESIN_DB_NAME),
         query={"charset": "utf8mb4"},
     )
 

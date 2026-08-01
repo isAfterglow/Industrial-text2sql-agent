@@ -8,3 +8,4 @@ pydantic
 pydantic-settings
 sqlglot
 tabulate
+redis>=5.0

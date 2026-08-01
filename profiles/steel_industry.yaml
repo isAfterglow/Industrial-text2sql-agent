@@ -1,0 +1,41 @@
+name: steel_industry
+database_name: SteelIndustry
+database_type: MySQL
+description: 查询钢铁行业耗电、功率和二氧化碳排放的事实与维度数据。
+routing_terms: [碳强度]
+tables:
+  energy_readings:
+    alias: er
+    grain: fact
+    key: reading_id
+    description: 钢铁行业每个时点的耗电、无功功率、功率因数和二氧化碳排放事实记录。
+    columns: {reading_id: 读数编号, recorded_at: 记录时间, usage_kwh: 耗电量千瓦时, reactive_power: 无功功率, power_factor: 功率因数, co2_tco2: 二氧化碳排放吨, calendar_id: 时间维度编号, load_type_id: 负荷类型编号}
+  calendar_dim:
+    alias: cd
+    grain: dimension
+    key: calendar_id
+    description: 记录时间的日历维度。
+    columns: {calendar_id: 时间维度编号, date: 日期时间, year: 年份, month: 月份, day: 日期, hour: 小时, day_of_week: 星期, week_status: 工作日状态}
+  load_type_dim:
+    alias: ltd
+    grain: dimension
+    key: load_type_id
+    description: 工业负荷类型维度。
+    columns: {load_type_id: 负荷类型编号, load_type_name: 负荷类型}
+relationships:
+  - {left: energy_readings.calendar_id, right: calendar_dim.calendar_id, cardinality: many_to_one}
+  - {left: energy_readings.load_type_id, right: load_type_dim.load_type_id, cardinality: many_to_one}
+semantic_terms:
+  usage_kwh: [耗电量, 耗电, 用电量, 用电, 电力消耗, 能耗]
+  co2_tco2: [二氧化碳排放, 碳排放, 排放量, 排放]
+  reactive_power: [无功功率]
+  power_factor: [功率因数]
+  load_type_name: [负荷类型]
+  year: [年份]
+  month: [月份]
+  hour: [小时]
+  day_of_week: [星期]
+  week_status: [工作日状态, 工作日, 平日, 周末]
+aggregations: {usage_kwh: [SUM, AVG, MAX, MIN], co2_tco2: [SUM, AVG, MAX, MIN], reactive_power: [SUM, AVG, MAX, MIN]}
+derived_metrics: {carbon_intensity: {formula: 'co2_tco2 / NULLIF(usage_kwh, 0)', dependencies: [co2_tco2, usage_kwh]}}
+policy: {allowed_tables: [energy_readings, calendar_dim, load_type_dim], sensitive_columns: [], forbidden_operations: [INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, SLEEP]}

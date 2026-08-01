@@ -1,4 +1,5 @@
 import re
+import json
 from typing import Any, Literal
 
 import sqlglot
@@ -13,8 +14,18 @@ from tabulate import tabulate
 
 from app.config import get_settings
 from app.db import execute_readonly_query
-from app.llm import get_llm
+from app.llm import invoke_model, model_call_log, reset_model_call_log
+from app.advanced_plan import (
+    advanced_plan_completion_prompt,
+    advanced_plan_family_prompt,
+    advanced_plan_prompt,
+    compile_advanced_analysis_plan,
+    parse_advanced_plan_family,
+    parse_advanced_plan,
+)
+from app.query_expectations import assert_query_expectation, build_query_expectation
 from app.long_term_memory.service import get_long_term_memory_service
+from app.result_assertions import assert_advanced_result
 from app.query_enhancement import (
     augment_common_query_spec,
     compile_extended_query_sql,
@@ -25,11 +36,13 @@ from app.memory import (
     build_deterministic_query_delta,
     build_query_delta_prompts,
     mark_current_turn_status,
+    new_short_term_memory,
     parse_query_delta_response,
     record_user_turn,
     resolve_conversation_context as resolve_memory_context,
     update_short_term_memory,
 )
+from app.session_store import get_session_memory_store
 from app.schema import (
     build_compact_sql_context,
     build_query_spec,
@@ -39,8 +52,15 @@ from app.schema import (
     build_schema_context,
     extract_requested_sample_ids,
     extract_sql_schema_elements,
+    get_schema_catalog,
+    get_column_owner_map,
+    infer_requested_output_columns,
+    match_question_semantic_columns,
     infer_relevant_tables,
     normalize_question_sample_ids,
+    resolve_profile,
+    requires_llm_query_planning,
+    set_active_profile,
 )
 from app.sql_guard import (
     assess_deterministic_semantic_coverage,
@@ -63,6 +83,22 @@ def effective_question(state: Text2SQLState) -> str:
         or state.get("memory_augmented_question")
         or state.get("normalized_question")
         or state.get("question", "")
+    )
+
+
+def resolved_query_spec(state: Text2SQLState, question: str) -> dict[str, Any]:
+    """Return the context-resolved QuerySpec, building it only as a fallback."""
+
+    if state.get("domain_profile") != "resin":
+        return build_query_spec(question)
+
+    spec = state.get("resolved_query_spec")
+    if isinstance(spec, dict) and spec:
+        return spec
+    return augment_common_query_spec(
+        question,
+        build_query_spec(question),
+        state.get("query_delta", {}),
     )
 
 def message_content_to_text(content: Any) -> str:
@@ -91,17 +127,48 @@ def message_content_to_text(content: Any) -> str:
 def invoke_text(
     system_prompt: str,
     user_prompt: str,
+    *,
+    purpose: str = "planning",
+    repair_attempt: int = 0,
 ) -> str:
-    response = get_llm().invoke(
+    return invoke_model(
         [
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_prompt),
-        ]
+        ],
+        purpose=purpose,
+        repair_attempt=repair_attempt,
     )
 
-    return message_content_to_text(
-        response.content
-    ).strip()
+
+def failure_event(
+    stage: str,
+    error: str,
+    error_type: str,
+    repairable: bool,
+) -> dict[str, Any]:
+    """Emit a stable failure taxonomy for traces and evaluation reports."""
+
+    normalized_type = error_type or "unknown"
+    if stage == "plan":
+        category = "plan_contract"
+    elif normalized_type == "policy":
+        category = "policy"
+    elif stage == "review":
+        category = "semantic_review"
+    elif stage == "execution":
+        category = "database_execution"
+    elif normalized_type in {"syntax", "schema", "generation"}:
+        category = f"guard_{normalized_type}"
+    else:
+        category = f"validation_{normalized_type}"
+    return {
+        "stage": stage,
+        "category": category,
+        "error_type": normalized_type,
+        "repairable": repairable,
+        "message": error[:500],
+    }
 
 
 def parse_review_line(
@@ -209,7 +276,11 @@ FAIL: 简短且具体的原因
 def load_schema(
     state: Text2SQLState,
 ) -> dict[str, Any]:
+    reset_model_call_log()
+    profile = resolve_profile(state["question"])
+    set_active_profile(profile)
     return {
+        "domain_profile": profile,
         "normalized_question": (
             normalize_question_sample_ids(
                 state["question"]
@@ -253,9 +324,14 @@ def load_schema(
         "inherited_fields": [],
         "overridden_fields": [],
         "memory_update_summary": {},
+        "session_store_summary": {},
         "query_spec": {},
         "query_plan_mode": "",
         "query_plan_reason": "",
+        "advanced_plan": {},
+        "advanced_plan_raw": "",
+        "advanced_plan_error": "",
+        "query_expectation": {},
         "deterministic_sql": "",
         "full_schema_context": "",
         "full_generator_raw_output": "",
@@ -299,6 +375,13 @@ def load_schema(
         "review_note": "",
         "review_input_summary": "",
         "execution_error": "",
+        "result_assertion": {},
+        "result_assertion_passed": True,
+        "approval_required": False,
+        "approval_request": state.get("approval_request", {}),
+        "approval_decision": state.get("approval_decision", {}),
+        "approval_approved": False,
+        "approval_summary": {},
         "columns": [],
         "rows": [],
         "row_count": 0,
@@ -309,8 +392,88 @@ def load_schema(
         "repair_action": "",
         "repair_bad_sql": "",
         "repair_raw_output": "",
+        "repair_model_role": "",
+        "repair_plan_mode": "",
+        "failure_events": [],
+        "model_calls": [],
         "final_status": "",
         "final_answer": "",
+    }
+
+
+def hydrate_session_memory(state: Text2SQLState) -> dict[str, Any]:
+    """Hydrate only when the caller did not provide authoritative memory."""
+
+    supplied = state.get("conversation_memory", {})
+    session_id = str(state.get("session_id", ""))
+    if supplied:
+        return {"session_store_summary": {"loaded": False, "reason": "caller_memory"}}
+    if not session_id:
+        return {"session_store_summary": {"loaded": False, "reason": "no_session_id"}}
+    try:
+        stored = get_session_memory_store().load(session_id, state.get("domain_profile", ""))
+        return {
+            "conversation_memory": stored or new_short_term_memory(session_id),
+            "session_store_summary": {
+                "loaded": bool(stored),
+                "backend": get_session_memory_store().backend,
+                "profile": state.get("domain_profile", ""),
+            },
+        }
+    except Exception as exc:
+        return {"session_store_summary": {"loaded": False, "error": f"{type(exc).__name__}: {exc}"}}
+
+
+def identify_query_intent(state: Text2SQLState) -> dict[str, Any]:
+    """Classify the request without invoking an LLM or changing the SQL plan.
+
+    The classification is an observable decision signal for routing, evaluation,
+    and a future approval workflow. SQL planning remains the source of truth.
+    """
+    question = state.get("normalized_question") or state.get("question", "")
+    policy_error = validate_question_policy(question)
+    matches = match_question_semantic_columns(question)
+    requested = infer_requested_output_columns(question)
+    owners = get_column_owner_map()
+    related_tables = set()
+    for column in set(matches) | requested:
+        related_tables.update(owners.get(column, set()))
+    has_aggregation = bool(re.search(r"统计|总(?:计|量)|合计|平均|均值|数量|多少|计数|COUNT", question, re.I))
+    has_ranking = bool(re.search(r"最高|最低|最大|最小|top\s*\d+|bottom\s*\d+|前\s*\d+", question, re.I))
+    has_grouping = bool(re.search(r"按|每(?:个|月|年|天|小时|种)|不同(?:负荷|类型)|各(?:负荷|类型)|比较.+和|(?:平日|工作日).*(?:周末)|每月.*各", question))
+    has_explicit_time_filter = bool(
+        re.search(r"(?:20\d{2}年|\d{1,2}月|\d{1,2}点).*(?:的|到|至|之间)|(?:第一|第[一二三四])季度", question)
+    )
+
+    if policy_error:
+        intent, confidence, evidence = "unsafe_request", 1.0, ["policy_precheck"]
+    elif re.search(r"^(再|这些|它们|其中|同样|取消)", question.strip()):
+        intent, confidence, evidence = "follow_up", 0.95, ["conversation_reference"]
+    elif has_ranking:
+        intent, confidence, evidence = "topk", 0.98, ["ranking_cue"]
+    elif has_explicit_time_filter and not has_grouping:
+        intent, confidence, evidence = "time_filter", 0.92, ["time_constraint"]
+    elif has_aggregation:
+        if has_grouping:
+            intent, confidence, evidence = "group_by", 0.96, ["aggregation", "grouping_cue"]
+        else:
+            intent, confidence, evidence = "aggregate", 0.96, ["aggregation"]
+    elif has_grouping:
+        intent, confidence, evidence = "group_by", 0.78, ["grouping_cue"]
+    elif len(related_tables) > 1:
+        intent, confidence, evidence = "cross_table", 0.88, ["multiple_field_owners"]
+    elif re.search(r"年|月|日|小时|工作日|周末|时间|日期|recorded_at", question, re.I):
+        intent, confidence, evidence = "time_filter", 0.80, ["time_cue"]
+    elif matches or re.search(r"查询|查看|列出|显示|给我", question):
+        intent, confidence, evidence = "lookup", 0.82, ["lookup_cue"]
+    else:
+        intent, confidence, evidence = "ambiguous", 0.60, ["no_reliable_schema_signal"]
+
+    return {
+        "query_intent": intent,
+        "intent_confidence": confidence,
+        "intent_evidence": evidence,
+        "intent_related_tables": sorted(related_tables),
     }
 
 
@@ -466,6 +629,34 @@ def resolve_conversation_context(
 
     query_delta = state.get("query_delta", {})
 
+    # The existing deterministic resolver encodes resin-specific field and
+    # sample conventions. Applying its "unknown field" clarification to a
+    # newly onboarded Profile blocks legitimate advanced requests before the
+    # Profile-aware planner can inspect them. Independent non-resin questions
+    # therefore enter their own schema/planning path directly.
+    if (
+        state.get("domain_profile") != "resin"
+        and not query_delta.get("explicit_reference")
+        and query_delta.get("dependency", "independent") == "independent"
+    ):
+        direct_spec = build_query_spec(original_question)
+        return {
+            "conversation_memory": state.get("conversation_memory", {}),
+            "resolved_question": original_question,
+            "resolved_query_spec": direct_spec,
+            "turn_type": "new_query",
+            "memory_used": False,
+            "context_resolution": {"reason": "non_resin_independent_profile_guard"},
+            "context_resolution_valid": True,
+            "clarification_required": False,
+            "clarification_cancelled": False,
+            "clarification_question": "",
+            "pending_clarification": {},
+            "current_turn_coverage": {"passed": True, "mode": "non_resin_independent"},
+            "inherited_fields": [],
+            "overridden_fields": [],
+        }
+
     # 能力边界应基于原始问题、且早于历史状态合并判断。
     # 一个复杂查询可能暂时不支持执行，但仍然是完整独立的新查询；
     # 不能因为QuerySpec暂时为complex_or_uncertain就继承上一轮过滤和范围。
@@ -570,11 +761,16 @@ def resolve_conversation_context(
         memory["pending_clarification"] = {}
 
     resolved_question = resolved.get("resolved_question", "") or original_question
-    resolved_spec = augment_common_query_spec(
-        original_question,
-        resolved.get("resolved_query_spec", {}),
-        query_delta,
-    )
+    if state.get("domain_profile") == "resin":
+        resolved_spec = augment_common_query_spec(
+            original_question,
+            resolved.get("resolved_query_spec", {}),
+            query_delta,
+        )
+    else:
+        # The resin enhancement layer encodes temporal/sample conventions that
+        # do not apply to normalized fact/dimension Profiles.
+        resolved_spec = build_query_spec(resolved_question)
 
     return {
         "conversation_memory": memory,
@@ -622,12 +818,8 @@ def retrieve_few_shot_memory(
     try:
         service = get_long_term_memory_service()
         question = effective_question(state)
-        query_spec = augment_common_query_spec(
-            question,
-            state.get("resolved_query_spec") or build_query_spec(question),
-            state.get("query_delta", {}),
-        )
-        capability = query_spec.get("capability_check") or detect_unsupported_nested_topk(question)
+        query_spec = resolved_query_spec(state, question)
+        capability = query_spec.get("capability_check", {})
         if capability.get("unsupported"):
             diagnostics = {
                 "candidate_count": 0,
@@ -701,12 +893,8 @@ def build_query_plan(
     """构建查询计划；常见时序派生指标走确定性扩展路径。"""
 
     question = effective_question(state)
-    spec = augment_common_query_spec(
-        question,
-        state.get("resolved_query_spec") or build_query_spec(question),
-        state.get("query_delta", {}),
-    )
-    capability = spec.get("capability_check") or detect_unsupported_nested_topk(question)
+    spec = resolved_query_spec(state, question)
+    capability = spec.get("capability_check", {})
     if capability.get("unsupported"):
         return {
             "query_spec": spec,
@@ -751,6 +939,143 @@ def route_after_query_plan(
     return "rsl"
 
 
+def generate_structured_query_spec(state: Text2SQLState) -> dict[str, Any]:
+    """Ask the LLM for a constrained QuerySpec before allowing free-form SQL."""
+
+    question = effective_question(state)
+    if requires_llm_query_planning(question):
+        raw = invoke_text(
+            "You classify one analytical query family. Return JSON only.",
+            advanced_plan_family_prompt(state["schema_context"], question),
+        )
+        try:
+            family = parse_advanced_plan_family(clean_llm_sql(raw))
+            service = get_long_term_memory_service()
+            examples, diagnostics = service.retrieve_advanced_plan_examples(question, family)
+            example_context = service.build_advanced_plan_few_shot_context(examples)
+            completed_raw = invoke_text(
+                "Complete one constrained AdvancedAnalysisPlan JSON object, never SQL.",
+                advanced_plan_completion_prompt(
+                    state["schema_context"], question, family, example_context
+                ),
+                purpose="advanced_plan_completion",
+            )
+            plan = parse_advanced_plan(clean_llm_sql(completed_raw))
+            if plan["family"] != family:
+                raise ValueError("completed plan family differs from the 3B classification")
+            sql = compile_advanced_analysis_plan(plan)
+            return {
+                "advanced_plan_raw": completed_raw,
+                "advanced_plan": plan,
+                "advanced_plan_error": "",
+                "query_expectation": build_query_expectation(question, plan),
+                "query_plan_mode": "advanced_analysis_plan",
+                "query_plan_reason": "3B选择分析族，升级模型在受限骨架中补全计划并编译。",
+                "deterministic_sql": sql,
+                "advanced_plan_memory_matches": [item.to_public_dict() for item in examples],
+                "advanced_plan_memory_diagnostics": diagnostics,
+            }
+        except Exception as exc:
+            return {
+                "advanced_plan_raw": raw,
+                "advanced_plan_error": f"{type(exc).__name__}: {exc}",
+                "failure_events": [
+                    failure_event(
+                        "plan",
+                        f"{type(exc).__name__}: {exc}",
+                        "contract",
+                        True,
+                    )
+                ],
+                "deterministic_sql": "",
+            }
+
+    prompt = (
+        "Return JSON only: {\"query_spec\": {...}}. Use only schema fields. "
+        "Supported query_type: single_table_filter, single_table_topk, exact_sample, "
+        "response_detail, one_to_one_join, per_sample_temporal_aggregate. "
+        "Include eligible=true, table, select_columns, filters, order_by, limit, sample_ids as applicable.\n"
+        f"Schema:\n{state['schema_context']}\nQuestion:\n{question}"
+    )
+    raw = invoke_text("You produce validated Text2SQL QuerySpec JSON, never SQL.", prompt)
+    try:
+        payload = json.loads(clean_llm_sql(raw).strip().removeprefix("```json").removesuffix("```").strip())
+        spec = payload.get("query_spec", payload)
+        if not isinstance(spec, dict) or not spec.get("eligible"):
+            raise ValueError("missing eligible QuerySpec")
+        allowed = {"single_table_filter", "single_table_topk", "exact_sample", "response_detail", "one_to_one_join", "per_sample_temporal_aggregate"}
+        if spec.get("query_type") not in allowed:
+            raise ValueError("unsupported QuerySpec type")
+        sql = compile_query_spec_sql(spec)
+        if not sql:
+            raise ValueError("QuerySpec cannot compile")
+        return {"query_spec_json_raw": raw, "query_spec": spec, "query_plan_mode": "llm_query_spec", "query_plan_reason": "LLM constrained QuerySpec compiled successfully.", "deterministic_sql": sql}
+    except Exception as exc:
+        return {"query_spec_json_raw": raw, "query_spec_json_error": f"{type(exc).__name__}: {exc}", "deterministic_sql": ""}
+
+
+def route_after_structured_query_spec(state: Text2SQLState) -> Literal["structured", "sql", "regenerate"]:
+    if (
+        requires_llm_query_planning(effective_question(state))
+        and state.get("advanced_plan_error")
+    ):
+        return "regenerate"
+    return "structured" if state.get("deterministic_sql") else "sql"
+
+
+def regenerate_advanced_plan(state: Text2SQLState) -> dict[str, Any]:
+    """Escalate an invalid 3B plan to a strong model before free SQL fallback."""
+
+    question = effective_question(state)
+    prior = state.get("advanced_plan_raw", "")
+    error = state.get("advanced_plan_error", "invalid advanced plan")
+    prompt = f"""{advanced_plan_prompt(state['schema_context'], question)}
+
+The small model output below failed the plan contract. Regenerate from the user question and schema.
+The `family` key is mandatory. Do not preserve wrong fields and do not output SQL.
+Contract error: {error}
+Bad output:
+{prior}
+"""
+    failures: list[str] = []
+    for repair_attempt in (2, 3):
+        try:
+            raw = invoke_text(
+                "Return only one valid AdvancedAnalysisPlan JSON object.",
+                prompt,
+                purpose="repair",
+                repair_attempt=repair_attempt,
+            )
+            plan = parse_advanced_plan(clean_llm_sql(raw))
+            return {
+                "advanced_plan": plan,
+                "advanced_plan_raw": raw,
+                "advanced_plan_error": "",
+                "query_expectation": build_query_expectation(question, plan),
+                "query_plan_mode": "advanced_analysis_plan",
+                "query_plan_reason": "3B计划契约失败后由升级模型重生成并编译。",
+                "deterministic_sql": compile_advanced_analysis_plan(plan),
+                "retry_count": 1,
+                "repair_source": "计划契约升级重生成",
+                "repair_plan_mode": "regenerate_plan",
+            }
+        except Exception as exc:
+            failures.append(f"{type(exc).__name__}: {exc}")
+    reason = " | ".join(failures)
+    return {
+        "advanced_plan_error": reason,
+        "validation_error": f"高级计划重生成失败：{reason}",
+        "validation_error_type": "plan_contract",
+        "validation_repairable": False,
+        "deterministic_sql": "",
+        "failure_events": [failure_event("plan", reason, "contract", False)],
+    }
+
+
+def route_after_regenerated_plan(state: Text2SQLState) -> Literal["structured", "error"]:
+    return "structured" if state.get("deterministic_sql") else "error"
+
+
 def generate_simple_sql(
     state: Text2SQLState,
 ) -> dict[str, Any]:
@@ -760,7 +1085,11 @@ def generate_simple_sql(
     selected_label = (
         "deterministic_extended"
         if state.get("query_plan_mode") == "deterministic_extended"
-        else "deterministic"
+        else (
+            "advanced_analysis_plan"
+            if state.get("query_plan_mode") == "advanced_analysis_plan"
+            else "deterministic"
+        )
     )
     return {
         "selected_candidate": selected_label,
@@ -796,7 +1125,7 @@ def _generation_system_prompt(
     )
 
     return f"""
-你是材料数据库Text2SQL生成器。
+你是受限Profile的Text2SQL生成器。
 
 {mode_instruction}
 
@@ -805,26 +1134,19 @@ def _generation_system_prompt(
 要求：
 1. 只输出SQL；
 2. 使用Schema中的真实表名和真实字段；
-3. ms、mtp、tr只能作为真实表名之后的别名；
+3. 只能使用当前Schema声明的真实表名、字段和别名；
 4. 严格使用提供的业务字段对应关系；
 5. 只返回用户要求的字段，只使用必要数据表；
 6. 不增加用户未要求的LIKE、IS NOT NULL或其他过滤；
-7. 普通样本级Top-K直接返回sample_id和所需字段，使用ORDER BY目标字段加LIMIT，不使用MAX、GROUP BY或IN子查询；
-8. 只有一个样本多行的时序峰值才使用MAX并按sample_id分组；
-9. 峰值查询不得用固定point_index代替完整序列峰值；
-10. 时序明细不聚合；
-11. 用户明确指定样本编号时，必须使用对应sample_id等值或IN过滤；
-12. 用户没有指定样本编号时，禁止添加任何固定sample_id过滤；
-13. 固定样本查询禁止使用LIKE；
-14. 用户明确请求某个白名单表全部数据时，只查询该表并显式列出全部字段；
+7. 普通记录级Top-K使用ORDER BY目标字段加LIMIT，不使用无意义MAX、GROUP BY或IN子查询；
+8. 仅在Schema确有样本时序粒度时，才使用sample_id和point_index规则；
+9. 用户明确请求某个白名单表全部数据时，只查询该表并显式列出全部字段；
 15. 禁止SELECT *、写操作和跨库查询；
 16. 科学计数法是一个完整数值，例如2e-12不得拆成2和12；
 17. 用户没有要求数量时，不得自行添加LIMIT 1或其他限制性LIMIT，系统会统一添加资源上限；
-18. INITIAL表示每个sample_id最小point_index对应的记录，FINAL表示最大point_index对应的记录；
-19. 质量损失率固定为(initial_mass-final_mass)/NULLIF(initial_mass,0)，背温抬升固定为final_back_temperature-initial_back_temperature；
-20. 字段与字段比较必须保留为真实字段比较，例如ms.porosity_c > ms.porosity_v；
-21. Few-shot结构与当前QuerySpec不一致时不得复制；没有可靠结构时以QuerySpec和Schema为准；
-22. 若问题包含“前N个中再取前M个”等多阶段Top-K，不得猜测或拼接多个ORDER BY/LIMIT。
+13. Profile未声明的领域指标、时序口径或字段不得猜测；
+14. Few-shot结构与当前Schema不一致时不得复制；没有可靠结构时以Schema为准；
+15. 若问题包含“前N个中再取前M个”等多阶段Top-K，不得猜测或拼接多个ORDER BY/LIMIT。
 """.strip()
 
 
@@ -1063,9 +1385,7 @@ def _evaluate_candidate(
     settings = get_settings()
     result = validate_and_normalize_sql(
         sql=sql,
-        allowed_tables=set(
-            settings.allowed_tables
-        ),
+        allowed_tables=set(get_schema_catalog()["tables"]),
         max_rows=settings.SQL_MAX_ROWS,
         question=question,
         query_spec=query_spec,
@@ -1276,22 +1596,23 @@ def validate_sql(
         "context_resolution_valid", True
     ):
         coverage = state.get("current_turn_coverage", {})
+        error = "短期记忆合并未完整覆盖当前轮明确语义：" + str(coverage)
         return {
-            "validation_error": (
-                "短期记忆合并未完整覆盖当前轮明确语义："
-                + str(coverage)
-            ),
+            "validation_error": error,
             "validation_repairable": False,
             "validation_error_type": "context",
             "validated_sql": "",
             "execution_error": "",
+            "failure_events": [
+                failure_event("validation", error, "context", False)
+            ],
         }
 
     if state.get("query_plan_mode") == "deterministic_extended":
         valid, normalized_sql, error = validate_compiled_extended_sql(
             state.get("raw_sql", ""),
             state.get("query_spec", {}),
-            set(settings.allowed_tables),
+            set(get_schema_catalog()["tables"]),
             settings.SQL_MAX_ROWS,
         )
         if not valid:
@@ -1301,6 +1622,9 @@ def validate_sql(
                 "validation_error_type": "deterministic_extended",
                 "validated_sql": "",
                 "execution_error": "",
+                "failure_events": [
+                    failure_event("validation", error, "deterministic_extended", False)
+                ],
             }
         return {
             "validation_error": "",
@@ -1312,9 +1636,7 @@ def validate_sql(
 
     result = validate_and_normalize_sql(
         sql=state.get("raw_sql", ""),
-        allowed_tables=set(
-            settings.allowed_tables
-        ),
+        allowed_tables=set(get_schema_catalog()["tables"]),
         max_rows=settings.SQL_MAX_ROWS,
         question=effective_question(state),
         query_spec=state.get("query_spec"),
@@ -1327,6 +1649,14 @@ def validate_sql(
             "validation_error_type": result.error_type,
             "validated_sql": "",
             "execution_error": "",
+            "failure_events": [
+                failure_event(
+                    "validation",
+                    result.error,
+                    result.error_type,
+                    result.repairable,
+                )
+            ],
         }
 
     return {
@@ -1335,6 +1665,70 @@ def validate_sql(
         "validation_error_type": "",
         "validated_sql": result.sql,
         "execution_error": "",
+    }
+
+
+def approval_gate(state: Text2SQLState) -> dict[str, Any]:
+    """Pause risky execution for an auditable plan-level human decision."""
+
+    mode = str(state.get("approval_mode") or get_settings().APPROVAL_MODE).lower()
+    decision = dict(state.get("approval_decision") or {})
+    risky = state.get("query_plan_mode") in {"advanced_analysis_plan", "rsl", "llm_query_spec"}
+    required = bool(state.get("force_approval", False) or mode == "always" or (mode == "risk" and risky))
+    if not required and not decision:
+        return {"approval_required": False, "approval_approved": False, "approval_summary": {"required": False, "reason": "approval_mode_off_or_low_risk"}}
+
+    payload = {
+        "question": effective_question(state), "profile": state.get("domain_profile", ""),
+        "intent": state.get("query_intent", ""), "query_plan_mode": state.get("query_plan_mode", ""),
+        "query_spec": state.get("query_spec", {}), "advanced_plan": state.get("advanced_plan", {}),
+        "compiled_sql": state.get("validated_sql", ""), "schema_tables": state.get("intent_related_tables", []),
+        "model_calls": state.get("model_calls", []), "failure_events": state.get("failure_events", []),
+        "risk_reason": "forced" if state.get("force_approval") else "advanced_or_freeform_plan",
+    }
+    service = get_long_term_memory_service()
+    request = dict(state.get("approval_request") or {})
+    if not request:
+        request = service.create_approval_request(profile=str(state.get("domain_profile", "")), payload=payload)
+
+    action = str(decision.get("action", "")).lower()
+    if action in {"approve", "approved"}:
+        decided = service.decide_approval_request(str(request["approval_id"]), {**decision, "action": "approved"})
+        return {"approval_required": False, "approval_request": decided or request, "approval_approved": True, "approval_summary": {"required": True, "action": "approved", "approval_id": request["approval_id"]}}
+    if action in {"reject", "rejected"}:
+        decided = service.decide_approval_request(str(request["approval_id"]), {**decision, "action": "rejected"})
+        return {"approval_required": False, "approval_request": decided or request, "approval_approved": False, "validation_error": "人工审批拒绝执行该查询计划。", "validation_error_type": "approval", "validation_repairable": False, "approval_summary": {"required": True, "action": "rejected", "approval_id": request["approval_id"]}}
+    if action == "edit_plan":
+        edited = decision.get("advanced_plan")
+        if not isinstance(edited, dict):
+            return {"approval_required": True, "approval_request": request, "approval_summary": {"required": True, "error": "edit_plan requires advanced_plan"}}
+        try:
+            plan = parse_advanced_plan(json.dumps(edited, ensure_ascii=False))
+            sql = compile_advanced_analysis_plan(plan)
+            decided = service.decide_approval_request(str(request["approval_id"]), {**decision, "action": "edited_plan"})
+            return {"approval_required": False, "approval_request": decided or request, "approval_approved": True, "advanced_plan": plan, "query_expectation": build_query_expectation(effective_question(state), plan), "raw_sql": sql, "validated_sql": "", "approval_summary": {"required": True, "action": "edited_plan", "approval_id": request["approval_id"]}}
+        except Exception as exc:
+            return {"approval_required": True, "approval_request": request, "approval_summary": {"required": True, "error": f"invalid edited plan: {type(exc).__name__}: {exc}"}}
+    return {"approval_required": True, "approval_request": request, "approval_approved": False, "approval_summary": {"required": True, "action": "pending", "approval_id": request["approval_id"]}}
+
+
+def route_after_approval(state: Text2SQLState) -> Literal["review", "revalidate", "pending", "error"]:
+    if state.get("approval_required"):
+        return "pending"
+    if state.get("validation_error"):
+        return "error"
+    if state.get("approval_summary", {}).get("action") == "edited_plan":
+        return "revalidate"
+    return "review"
+
+
+def format_approval_required(state: Text2SQLState) -> dict[str, Any]:
+    request = state.get("approval_request", {})
+    approval_id = request.get("approval_id", "")
+    return {
+        "final_status": "approval_required",
+        "final_answer": "查询已通过 SQL Guard，正在等待人工审批 QueryPlan。审批编号：" + str(approval_id),
+        "model_calls": model_call_log(),
     }
 
 
@@ -1352,6 +1746,15 @@ def review_sql(
             "review_note": (
                 "INITIAL/FINAL、白名单派生指标、字段间比较、排序和LIMIT均由确定性编译器生成并校验。"
             ),
+            "review_input_summary": "",
+        }
+
+    if state.get("query_plan_mode") == "advanced_analysis_plan":
+        return {
+            "review_called": False,
+            "review_passed": True,
+            "review_reason": "受限高级AnalysisPlan编译并通过SQL Guard。",
+            "review_note": "查询族、字段、Join和高级算子已由Plan校验后编译，无需自由LLM复审。",
             "review_input_summary": "",
         }
 
@@ -1404,6 +1807,14 @@ def review_sql(
             "review_reason": "复杂SQL语义审查未能返回可信结论。",
             "review_note": "review_unavailable",
             "review_input_summary": review_input_summary,
+            "failure_events": [
+                failure_event(
+                    "review",
+                    "复杂SQL语义审查未能返回可信结论。",
+                    "unavailable",
+                    False,
+                )
+            ],
         }
 
     return {
@@ -1412,6 +1823,11 @@ def review_sql(
         "review_reason": reason,
         "review_note": "llm_review",
         "review_input_summary": review_input_summary,
+        "failure_events": (
+            []
+            if passed
+            else [failure_event("review", reason, "semantic", True)]
+        ),
     }
 
 
@@ -1531,12 +1947,57 @@ def build_explicit_repair_action(
     )
 
 
+def _repair_advanced_plan(
+    state: Text2SQLState,
+    *,
+    question: str,
+    reason: str,
+    source: str,
+    repair_attempt: int,
+) -> tuple[dict[str, Any] | None, str, str]:
+    """Repair an advanced query through its bounded JSON contract first."""
+
+    prior_plan = state.get("advanced_plan", {})
+    if not isinstance(prior_plan, dict) or not prior_plan:
+        return None, "", "no prior advanced plan"
+    prompt = advanced_plan_prompt(state["schema_context"], question)
+    repair_prompt = f"""{prompt}
+
+This is repair attempt {repair_attempt}. Return a replacement advanced_plan JSON only.
+Failure source: {source}
+Failure reason: {reason}
+Previous validated-plan candidate:
+{json.dumps(prior_plan, ensure_ascii=False)}
+
+Only change fields needed to resolve the stated failure. Do not output SQL."""
+    try:
+        raw = invoke_text(
+            "You repair only the constrained AdvancedAnalysisPlan JSON contract, never SQL.",
+            repair_prompt,
+            purpose="repair",
+            repair_attempt=repair_attempt,
+        )
+        plan = parse_advanced_plan(clean_llm_sql(raw))
+        sql = compile_advanced_analysis_plan(plan)
+        return plan, sql, raw
+    except Exception as exc:
+        return None, "", f"{type(exc).__name__}: {exc}"
+
+
 def repair_sql(
     state: Text2SQLState,
 ) -> dict[str, Any]:
     """只根据可信的Guard、数据库或一次语义审查错误重写SQL。"""
 
-    if state.get("validation_error"):
+    if not state.get("result_assertion_passed", True):
+        source = "结果级断言"
+        reason = str(
+            state.get("result_assertion", {}).get(
+                "reason", "结果性质不满足计划约束"
+            )
+        )
+        bad_sql = state.get("validated_sql") or state.get("raw_sql", "")
+    elif state.get("validation_error"):
         source = "确定性Guard"
         reason = state["validation_error"]
         bad_sql = state.get("raw_sql", "")
@@ -1574,6 +2035,86 @@ def repair_sql(
             reason=reason,
         )
     )
+
+    # Advanced queries keep their SQL syntax out of the repair model. A valid
+    # replacement plan is recompiled and still goes through the common Guard.
+    repaired_plan, compiled_plan_sql, plan_output = _repair_advanced_plan(
+        state,
+        question=question,
+        reason=reason,
+        source=source,
+        repair_attempt=next_retry_count,
+    )
+    if repaired_plan is not None:
+        calls = model_call_log()
+        role = str(calls[-1].get("role", "")) if calls else ""
+        return {
+            "raw_sql": compiled_plan_sql,
+            "validated_sql": "",
+            "advanced_plan": repaired_plan,
+            "advanced_plan_raw": plan_output,
+            "advanced_plan_error": "",
+            "query_expectation": build_query_expectation(question, repaired_plan),
+            "selected_candidate": "repair_plan",
+            "candidate_selection_reason": "受限AdvancedAnalysisPlan修复后重新编译SQL。",
+            "retry_count": next_retry_count,
+            "last_repair_reason": f"{source}: {reason}",
+            "repair_source": source,
+            "repair_action": repair_action,
+            "repair_bad_sql": bad_sql,
+            "repair_raw_output": plan_output,
+            "repair_model_role": role,
+            "repair_plan_mode": "advanced_analysis_plan",
+            "validation_error": "",
+            "validation_repairable": True,
+            "validation_error_type": "",
+            "review_called": False,
+            "review_passed": False,
+            "review_reason": "",
+            "review_note": "",
+            "review_input_summary": "",
+            "execution_error": "",
+            "columns": [],
+            "rows": [],
+            "row_count": 0,
+            "truncated": False,
+        }
+
+    # The first constrained repair is intentionally not followed by another
+    # free-SQL attempt on the same 3B model. Its failure advances the graph to
+    # the configured DeepSeek repair route on the next retry.
+    if state.get("advanced_plan") and next_retry_count == 1:
+        return {
+            "raw_sql": "",
+            "validated_sql": "",
+            "advanced_plan_error": plan_output,
+            "selected_candidate": "repair_plan_failed",
+            "candidate_selection_reason": "3B受限计划修复失败，升级到DeepSeek API。",
+            "retry_count": next_retry_count,
+            "last_repair_reason": f"{source}: {reason}",
+            "repair_source": source,
+            "repair_action": repair_action,
+            "repair_bad_sql": bad_sql,
+            "repair_raw_output": plan_output,
+            "repair_model_role": "primary_3b",
+            "repair_plan_mode": "advanced_plan_failed_escalate_api",
+            "validation_error": "",
+            "validation_repairable": True,
+            "validation_error_type": "",
+            "review_called": False,
+            "review_passed": False,
+            "review_reason": "",
+            "review_note": "",
+            "review_input_summary": "",
+            "execution_error": "",
+            "columns": [],
+            "rows": [],
+            "row_count": 0,
+            "truncated": False,
+            "failure_events": [
+                failure_event("plan", plan_output, "contract", True)
+            ],
+        }
 
     procedural_memories = []
     procedural_context = ""
@@ -1625,7 +2166,14 @@ def repair_sql(
 
     repair_raw_output = invoke_text(
         system_prompt,
-        user_prompt,
+        user_prompt + (
+            "\n受限高级计划修复未通过，现允许最后的自由SQL兜底。原因："
+            + plan_output
+            if plan_output and state.get("advanced_plan")
+            else ""
+        ),
+        purpose="repair",
+        repair_attempt=next_retry_count,
     )
     repaired_sql = normalize_sample_id_literals(
         clean_llm_sql(
@@ -1633,6 +2181,8 @@ def repair_sql(
         )
     )
 
+    calls = model_call_log()
+    role = str(calls[-1].get("role", "")) if calls else ""
     return {
         "raw_sql": repaired_sql,
         "validated_sql": "",
@@ -1649,6 +2199,8 @@ def repair_sql(
         "repair_action": repair_action,
         "repair_bad_sql": bad_sql,
         "repair_raw_output": repair_raw_output,
+        "repair_model_role": role,
+        "repair_plan_mode": "free_sql_fallback" if state.get("advanced_plan") else "free_sql",
         "procedural_memory_matches": [
             record.to_public_dict() for record in procedural_memories
         ],
@@ -1680,14 +2232,16 @@ def execute_sql(
             max_rows=settings.SQL_MAX_ROWS,
         )
     except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
         return {
-            "execution_error": (
-                f"{type(exc).__name__}: {exc}"
-            ),
+            "execution_error": error,
             "columns": [],
             "rows": [],
             "row_count": 0,
             "truncated": False,
+            "failure_events": [
+                failure_event("execution", error, "database", True)
+            ],
         }
 
     order_ids = list(state.get("query_spec", {}).get("result_order_sample_ids", []))
@@ -1702,6 +2256,55 @@ def execute_sql(
     return {
         "execution_error": "",
         **result,
+    }
+
+
+def validate_result_assertions(
+    state: Text2SQLState,
+) -> dict[str, Any]:
+    """Validate result invariants for a constrained advanced plan."""
+
+    plan_assertion = assert_advanced_result(
+        state.get("advanced_plan", {}),
+        list(state.get("columns", [])),
+        list(state.get("rows", [])),
+    )
+    expectation = state.get("query_expectation") or build_query_expectation(
+        effective_question(state), state.get("advanced_plan", {}),
+    )
+    question_assertion = assert_query_expectation(
+        expectation, list(state.get("columns", [])),
+    )
+    passed = bool(plan_assertion["passed"] and question_assertion["passed"])
+    reasons = [
+        value.get("reason", "")
+        for value in (plan_assertion, question_assertion)
+        if value.get("reason")
+    ]
+    assertion = {
+        "checked": bool(plan_assertion.get("checked") or question_assertion.get("checked")),
+        "passed": passed,
+        "family": plan_assertion.get("family", ""),
+        "plan_invariants": plan_assertion,
+        "question_expectation": question_assertion,
+        "reason": "；".join(reasons),
+    }
+    if passed:
+        return {
+            "result_assertion": assertion,
+            "result_assertion_passed": True,
+        }
+    return {
+        "result_assertion": assertion,
+        "result_assertion_passed": False,
+        "failure_events": [
+            failure_event(
+                "result_assertion",
+                assertion["reason"],
+                "result_invariant",
+                True,
+            )
+        ],
     }
 
 
@@ -1754,6 +2357,19 @@ def update_session_memory(
     }
 
 
+def persist_session_memory(state: Text2SQLState) -> dict[str, Any]:
+    """Persist only the structured successful-session state, never raw traces."""
+
+    memory = state.get("conversation_memory", {})
+    if not memory:
+        return {"session_store_summary": {"saved": False, "reason": "empty_memory"}}
+    try:
+        return {"session_store_summary": get_session_memory_store().save(memory, state.get("domain_profile", ""))}
+    except Exception as exc:
+        # Session persistence is an availability enhancement, not a query blocker.
+        return {"session_store_summary": {"saved": False, "error": f"{type(exc).__name__}: {exc}"}}
+
+
 def update_long_term_memory(
     state: Text2SQLState,
 ) -> dict[str, Any]:
@@ -1762,6 +2378,11 @@ def update_long_term_memory(
     try:
         service = get_long_term_memory_service()
         summary = service.auto_save_from_state(dict(state))
+        used_examples = state.get("advanced_plan_memory_matches", [])
+        example_ids = [item.get("memory_id", "") for item in used_examples if isinstance(item, dict)]
+        if example_ids:
+            service.record_advanced_plan_usage(example_ids, success=True)
+            summary["advanced_plan_memory_usage"] = {"used": example_ids, "success": True}
         return {"long_term_memory_write_summary": summary}
     except Exception as exc:
         return {
@@ -1867,6 +2488,8 @@ def format_result(
 
 {result_text}{truncate_notice}{review_section}
 """.strip()
+        ,
+        "model_calls": model_call_log(),
     }
 
 
@@ -1893,6 +2516,7 @@ def format_unsupported_query(
             + suggestion_text
             + "\n\n拆分后系统会通过短期记忆自动保留上一轮样本集合。"
         ).strip(),
+        "model_calls": model_call_log(),
     }
 
 
@@ -1927,6 +2551,14 @@ def format_error(
         status=final_status,
         resolved_question=effective_question(state),
     )
+    used_examples = state.get("advanced_plan_memory_matches", [])
+    example_ids = [item.get("memory_id", "") for item in used_examples if isinstance(item, dict)]
+    if example_ids:
+        try:
+            get_long_term_memory_service().record_advanced_plan_usage(example_ids, success=False)
+        except Exception:
+            # Memory telemetry must never hide the primary query error.
+            pass
 
     return {
         "conversation_memory": memory,
@@ -1952,6 +2584,7 @@ def format_error(
 {state.get("raw_sql") or "未生成SQL"}
 ```
 """.strip(),
+        "model_calls": model_call_log(),
     }
 
 
@@ -2014,4 +2647,14 @@ def route_after_execution(
     ):
         return "repair"
 
+    return "error"
+
+
+def route_after_result_assertions(
+    state: Text2SQLState,
+) -> Literal["success", "repair", "error"]:
+    if state.get("result_assertion_passed", True):
+        return "success"
+    if state.get("retry_count", 0) < get_settings().SQL_MAX_REPAIR_ATTEMPTS:
+        return "repair"
     return "error"

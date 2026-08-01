@@ -16,6 +16,7 @@ from app.schema import (
     extract_numeric_literals,
     extract_requested_limit_from_question,
     normalize_numeric_literal,
+    parse_decimal_literal,
     is_strict_projection_request,
     match_question_semantic_columns,
     remove_requested_sample_mentions,
@@ -24,18 +25,18 @@ from app.schema import (
 
 
 SYSTEM_SCHEMA_PATTERN = re.compile(
-    r"\b(?:mysql|information_schema|performance_schema|sys)"
-    r"\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\b",
+    r"(?<![A-Za-z0-9_])(?:mysql|information_schema|performance_schema|sys)"
+    r"\s*\.\s*[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_])",
     flags=re.IGNORECASE,
 )
 
 QUESTION_DANGEROUS_PATTERN = re.compile(
     r"""
-    \b(
+    (?<![A-Za-z0-9_])(
         INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|
         TRUNCATE|REPLACE|MERGE|CALL|GRANT|REVOKE|
         LOAD_FILE|SLEEP|BENCHMARK
-    )\b
+    )(?![A-Za-z0-9_])
     |INTO\s+OUTFILE
     |INTO\s+DUMPFILE
     """,
@@ -424,7 +425,15 @@ def validate_question_field_semantics(
         )
         allowed_selected = set(requested_outputs)
         if not strict_projection:
-            allowed_selected.add("sample_id")
+            catalog = get_schema_catalog()
+            used_tables = {
+                table.name for table in tree.find_all(exp.Table)
+            }
+            allowed_selected.update(
+                str(info["key"])
+                for table_name, info in catalog["tables"].items()
+                if table_name in used_tables
+            )
             # 非严格投影时，排名字段可作为解释性结果返回。
             if ranking_info is not None:
                 allowed_selected.add(ranking_info[0])
@@ -446,12 +455,16 @@ def validate_question_field_semantics(
 
     catalog = get_schema_catalog()
     response_table = next(
-        table_name
-        for table_name, info
-        in catalog["tables"].items()
-        if info["grain"]
-        == "many_rows_per_sample"
+        (
+            table_name
+            for table_name, info
+            in catalog["tables"].items()
+            if info["grain"] == "many_rows_per_sample"
+        ),
+        None,
     )
+    if response_table is None:
+        return list(dict.fromkeys(errors))
     response_columns = set(
         catalog["tables"][
             response_table
@@ -676,6 +689,10 @@ def _query_spec_expected_numbers(
             value = item.get(key)
             if value is None:
                 continue
+            # Dimension enums (for example Weekday) are validated by the SQL
+            # AST/schema layer, not the numeric-literal consistency check.
+            if parse_decimal_literal(value) is None:
+                continue
             expected.setdefault(
                 normalize_numeric_literal(value),
                 str(value),
@@ -762,6 +779,16 @@ def validate_question_numeric_values(
         ]
 
     return []
+
+
+def has_advanced_analytic_cue(question: str) -> bool:
+    """Numeric literals in analytic formulas are not necessarily SQL predicates."""
+
+    return bool(re.search(
+        r"环比|变化率|累计|相关系数|标准差|百分比|占比|占.*比例|连续\s*\d+\s*(?:个)?小时|"
+        r"(?:每种|各).{0,12}(?:最高|最低).{0,12}(?:读数|记录)|所属负荷类型",
+        question,
+    ))
 
 
 def _normalize_sample_literal(
@@ -1105,10 +1132,28 @@ def get_subquery_outputs(
     return outputs
 
 
+def get_cte_outputs(tree: exp.Expression) -> dict[str, set[str]]:
+    """Return CTE names and the columns visible to the outer query."""
+
+    outputs: dict[str, set[str]] = {}
+    for cte in tree.find_all(exp.CTE):
+        alias = cte.alias
+        body = cte.this
+        if not alias or not isinstance(body, exp.Select):
+            continue
+        outputs[alias] = {
+            projection.alias_or_name
+            for projection in body.expressions
+            if projection.alias_or_name
+        }
+    return outputs
+
+
 def validate_select_scope(
     select: exp.Select,
     table_columns: dict[str, set[str]],
     column_owners: dict[str, set[str]],
+    cte_outputs: dict[str, set[str]],
 ) -> list[str]:
     """在单个SELECT作用域内校验字段归属和歧义。
 
@@ -1118,16 +1163,18 @@ def validate_select_scope(
     errors: list[str] = []
 
     physical_aliases: dict[str, str] = {}
+    derived_aliases: dict[str, set[str]] = {}
 
     for table in direct_scope_nodes(
         select,
         exp.Table,
     ):
+        if table.name in cte_outputs:
+            derived_aliases[table.alias_or_name] = cte_outputs[table.name]
+            continue
         physical_aliases[
             table.alias_or_name
         ] = table.name
-
-    derived_aliases: dict[str, set[str]] = {}
 
     for subquery in direct_scope_nodes(
         select,
@@ -1252,6 +1299,7 @@ def validate_column_ownership(
     column_owners = build_column_owners(
         table_columns
     )
+    cte_outputs = get_cte_outputs(tree)
 
     errors: list[str] = []
 
@@ -1261,6 +1309,7 @@ def validate_column_ownership(
                 select=select,
                 table_columns=table_columns,
                 column_owners=column_owners,
+                cte_outputs=cte_outputs,
             )
         )
 
@@ -2590,9 +2639,7 @@ def validate_and_normalize_sql(
 
         used_tables.add(table.name)
 
-    unknown_tables = (
-        used_tables - allowed_tables
-    )
+    unknown_tables = used_tables - allowed_tables - set(get_cte_outputs(tree))
 
     if unknown_tables:
         return SQLValidationResult(
@@ -2610,6 +2657,13 @@ def validate_and_normalize_sql(
         )
 
     errors: list[str] = []
+    # AdvancedPlan parameters (for example a 1.25 group threshold) are
+    # compiler semantics rather than WHERE/LIMIT constraints.  Relying only on
+    # Chinese cue words made valid plans fail when a user phrased the same
+    # operation as "高于均值25%".
+    advanced_analytic = bool(
+        isinstance(query_spec, dict) and query_spec.get("advanced_plan")
+    ) or has_advanced_analytic_cue(question)
 
     if projection_contains_star(tree):
         errors.append(
@@ -2644,7 +2698,7 @@ def validate_and_normalize_sql(
                     tree, question, query_spec
                 )
             )
-        else:
+        elif not advanced_analytic:
             errors.extend(
                 validate_question_field_semantics(
                     tree,
@@ -2675,13 +2729,14 @@ def validate_and_normalize_sql(
                     query_spec=query_spec,
                 )
             )
-        errors.extend(
-            validate_question_numeric_values(
-                tree,
-                question,
-                query_spec=query_spec,
+        if not advanced_analytic:
+            errors.extend(
+                validate_question_numeric_values(
+                    tree,
+                    question,
+                    query_spec=query_spec,
+                )
             )
-        )
         errors.extend(
             validate_requested_sample_filters(
                 tree,
