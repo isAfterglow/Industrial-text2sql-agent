@@ -1292,7 +1292,9 @@ def _apply_query_delta(
     previous_columns = set(merged.get("select_columns", [])) | set(merged.get("scalar_columns", []))
     if action == "replace" and columns:
         selected = set(columns)
-        if not delta.get("strict_projection"):
+        # 结果集合的后续轮必须带回实体键，用户才能识别每个值属于
+        # 哪个成员；单样本严格投影则可只返回请求指标。
+        if not delta.get("strict_projection") or dependency == "previous_result_set":
             selected.add("sample_id")
         merged["select_columns"] = _ordered_projection(selected)
         merged["scalar_columns"] = sorted(columns - {"sample_id"})

@@ -691,7 +691,12 @@ def resolve_conversation_context(
     # 一个复杂查询可能暂时不支持执行，但仍然是完整独立的新查询；
     # 不能因为QuerySpec暂时为complex_or_uncertain就继承上一轮过滤和范围。
     raw_capability = detect_unsupported_nested_topk(original_question)
-    if raw_capability.get("unsupported"):
+    inline_multistage = bool(
+        re.search(r"(?:先|首先).{0,80}(?:再|然后).{0,80}(?:这些样本|它们)", original_question)
+    )
+    if raw_capability.get("unsupported") and (
+        not query_delta.get("explicit_reference") or inline_multistage
+    ):
         authoritative_spec = augment_common_query_spec(
             original_question,
             query_delta.get("current_spec") or build_query_spec(original_question),
@@ -736,10 +741,20 @@ def resolve_conversation_context(
     # than generic conversational wording such as "同时返回它们".  Do not ask
     # for clarification when the Profile can already compile the request.
     direct_spec = query_delta.get("current_spec") or build_query_spec(original_question)
+    # “原始密度最高的5个样本，同时返回它们的热解热”中的“它们”
+    # 指向同一句刚定义的集合；它不是跨轮记忆引用。单数代词和“这些样本”
+    # 则必须保留澄清，避免在没有历史锚点时扩大查询范围。
+    inline_plural_reference = bool(
+        "它们" in original_question
+        and re.search(r"(?:最高|最低|最大|最小|前\s*\d+|\d+\s*个样本)", original_question)
+    )
     if (
         resolved.get("clarification_required")
         and direct_spec.get("eligible")
-        and not query_delta.get("explicit_reference")
+        and (
+            not query_delta.get("explicit_reference")
+            or inline_plural_reference
+        )
         and (
             query_delta.get("independent_complete")
             or not state.get("conversation_memory", {}).get("last_successful_query_state")
