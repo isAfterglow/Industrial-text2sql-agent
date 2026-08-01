@@ -23,6 +23,13 @@ from app.advanced_plan import (
     parse_advanced_plan_family,
     parse_advanced_plan,
 )
+from app.material_plan import (
+    MATERIAL_PLAN_FAMILY,
+    compile_material_plan,
+    is_material_plan_candidate,
+    material_plan_prompt,
+    parse_material_plan,
+)
 from app.query_expectations import assert_query_expectation, build_query_expectation
 from app.long_term_memory.service import get_long_term_memory_service
 from app.result_assertions import assert_advanced_result
@@ -943,6 +950,49 @@ def generate_structured_query_spec(state: Text2SQLState) -> dict[str, Any]:
     """Ask the LLM for a constrained QuerySpec before allowing free-form SQL."""
 
     question = effective_question(state)
+    if state.get("domain_profile") == "resin" and is_material_plan_candidate(question):
+        service = get_long_term_memory_service()
+        try:
+            examples, diagnostics = service.retrieve_advanced_plan_examples(
+                question, MATERIAL_PLAN_FAMILY
+            )
+            context = service.build_advanced_plan_few_shot_context(examples)
+            raw = invoke_text(
+                "Complete one constrained MaterialAnalysisPlan JSON object, never SQL.",
+                material_plan_prompt(state["schema_context"], question, context),
+                purpose="planning",
+            )
+            plan = parse_material_plan(clean_llm_sql(raw))
+            sql = compile_material_plan(plan)
+            memory_summary = dict(state.get("long_term_memory_retrieval_summary", {}))
+            memory_summary["advanced_plan"] = {
+                "family": MATERIAL_PLAN_FAMILY,
+                "selected_count": len(examples),
+                "memory_ids": [item.memory_id for item in examples],
+                "stage": "3b_material_completion",
+            }
+            return {
+                "advanced_plan_raw": raw,
+                "advanced_plan": plan,
+                "advanced_plan_error": "",
+                "query_expectation": build_query_expectation(question, plan),
+                "query_plan_mode": "advanced_analysis_plan",
+                "query_plan_reason": "3B结合材料Profile生成受限时序聚合计划。",
+                "deterministic_sql": sql,
+                "advanced_plan_family": MATERIAL_PLAN_FAMILY,
+                "advanced_plan_memory_matches": [item.to_public_dict() for item in examples],
+                "advanced_plan_memory_diagnostics": diagnostics,
+                "long_term_memory_retrieval_summary": memory_summary,
+            }
+        except Exception as exc:
+            return {
+                "advanced_plan_raw": locals().get("raw", ""),
+                "advanced_plan_family": MATERIAL_PLAN_FAMILY,
+                "advanced_plan_error": f"{type(exc).__name__}: {exc}",
+                "failure_events": [failure_event("plan", f"{type(exc).__name__}: {exc}", "contract", True)],
+                "deterministic_sql": "",
+            }
+
     if requires_llm_query_planning(question):
         raw = invoke_text(
             "You classify one analytical query family. Return JSON only.",
@@ -1029,10 +1079,7 @@ def generate_structured_query_spec(state: Text2SQLState) -> dict[str, Any]:
 
 
 def route_after_structured_query_spec(state: Text2SQLState) -> Literal["structured", "sql", "regenerate"]:
-    if (
-        requires_llm_query_planning(effective_question(state))
-        and state.get("advanced_plan_error")
-    ):
+    if state.get("advanced_plan_family") and state.get("advanced_plan_error"):
         return "regenerate"
     return "structured" if state.get("deterministic_sql") else "sql"
 
@@ -1050,9 +1097,14 @@ def regenerate_advanced_plan(state: Text2SQLState) -> dict[str, Any]:
         if family else ([], {"family": "", "selected_count": 0, "skip_reason": "family_unknown"})
     )
     context = service.build_advanced_plan_few_shot_context(examples)
+    is_material = family == MATERIAL_PLAN_FAMILY
     base_prompt = (
-        advanced_plan_completion_prompt(state["schema_context"], question, family, context)
-        if family else advanced_plan_prompt(state["schema_context"], question)
+        material_plan_prompt(state["schema_context"], question, context)
+        if is_material
+        else (
+            advanced_plan_completion_prompt(state["schema_context"], question, family, context)
+            if family else advanced_plan_prompt(state["schema_context"], question)
+        )
     )
     prompt = f"""{base_prompt}
 
@@ -1071,7 +1123,7 @@ Bad output:
                 purpose="repair",
                 repair_attempt=repair_attempt,
             )
-            plan = parse_advanced_plan(clean_llm_sql(raw))
+            plan = parse_material_plan(clean_llm_sql(raw)) if is_material else parse_advanced_plan(clean_llm_sql(raw))
             if family and plan["family"] != family:
                 raise ValueError("regenerated plan family differs from selected family")
             memory_summary = dict(state.get("long_term_memory_retrieval_summary", {}))
@@ -1086,7 +1138,7 @@ Bad output:
                 "query_expectation": build_query_expectation(question, plan),
                 "query_plan_mode": "advanced_analysis_plan",
                 "query_plan_reason": "3B计划失败后由升级模型结合正式案例重生成并编译。",
-                "deterministic_sql": compile_advanced_analysis_plan(plan),
+                "deterministic_sql": compile_material_plan(plan) if is_material else compile_advanced_analysis_plan(plan),
                 "advanced_plan_family": plan["family"],
                 "advanced_plan_memory_matches": [item.to_public_dict() for item in examples],
                 "advanced_plan_memory_diagnostics": diagnostics,
@@ -1676,6 +1728,8 @@ def validate_sql(
     guard_query_spec = dict(state.get("query_spec") or {})
     if state.get("advanced_plan"):
         guard_query_spec["advanced_plan"] = state["advanced_plan"]
+        if guard_query_spec.get("limit") is None and state["advanced_plan"].get("limit") is not None:
+            guard_query_spec["limit"] = state["advanced_plan"]["limit"]
 
     result = validate_and_normalize_sql(
         sql=state.get("raw_sql", ""),
@@ -2003,7 +2057,8 @@ def _repair_advanced_plan(
     prior_plan = state.get("advanced_plan", {})
     if not isinstance(prior_plan, dict) or not prior_plan:
         return None, "", "no prior advanced plan"
-    prompt = advanced_plan_prompt(state["schema_context"], question)
+    is_material = str(prior_plan.get("family", "")) == MATERIAL_PLAN_FAMILY
+    prompt = material_plan_prompt(state["schema_context"], question) if is_material else advanced_plan_prompt(state["schema_context"], question)
     repair_prompt = f"""{prompt}
 
 This is repair attempt {repair_attempt}. Return a replacement advanced_plan JSON only.
@@ -2020,8 +2075,8 @@ Only change fields needed to resolve the stated failure. Do not output SQL."""
             purpose="repair",
             repair_attempt=repair_attempt,
         )
-        plan = parse_advanced_plan(clean_llm_sql(raw))
-        sql = compile_advanced_analysis_plan(plan)
+        plan = parse_material_plan(clean_llm_sql(raw)) if is_material else parse_advanced_plan(clean_llm_sql(raw))
+        sql = compile_material_plan(plan) if is_material else compile_advanced_analysis_plan(plan)
         return plan, sql, raw
     except Exception as exc:
         return None, "", f"{type(exc).__name__}: {exc}"

@@ -32,6 +32,16 @@ def build_query_expectation(question: str, plan: dict[str, Any]) -> dict[str, An
         calculated = [str(plan.get("output_alias", ""))]
     elif family == "conditional_comparison":
         calculated = [str(plan.get("difference_alias", "")), str(plan.get("percentage_alias", ""))]
+    elif family == "static_filter_temporal_aggregate":
+        metric_aliases = {
+            str(item.get("column", "")): str(item.get("alias", ""))
+            for item in plan.get("temporal_metrics", [])
+            if isinstance(item, dict)
+        }
+        # A material temporal aggregate exposes its declared alias rather than
+        # the raw per-point response column.
+        expected.difference_update(metric_aliases)
+        calculated = list(metric_aliases.values())
     expected.update(value for value in calculated if value)
     return {
         "checked": bool(expected),
