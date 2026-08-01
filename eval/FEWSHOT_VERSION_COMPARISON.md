@@ -39,6 +39,21 @@ while its mean latency falls. This is consistent with fewer LLM-routed turns
 and a small number of remaining advanced-plan or repair turns; it should not
 be interpreted as a few-shot-only causal measurement.
 
+### Material Complex-path Latency (per turn)
+
+| Execution path | Before few-shot | Current version | Change |
+|---|---:|---:|---:|
+| All turns | 1081.67 ms (92) | 860.00 ms (92) | -20.5% |
+| Deterministic extended | 431.43 ms (13) | 568.63 ms (14) | +31.8% |
+| RSL / LLM invoked | 10048.05 ms (8) | 9983.26 ms (5) | -0.6%; 3 fewer turns |
+| Complex execution total | 4094.90 ms (21) | 3046.17 ms (19) | -25.6% |
+
+`Deterministic extended` covers semantically complex temporal and derived
+queries that the constrained compiler can execute without an LLM. `RSL / LLM
+invoked` is the expensive residual path: its current P50/P95 are 9738.24 ms /
+12453.73 ms, with 19 model calls across five turns. `Complex execution total`
+combines both paths, and is the useful end-to-end complexity metric.
+
 ## Steel Domain: Standard 60-case Profile Benchmark
 
 | Metric | Before few-shot | Few-shot version | Change |
