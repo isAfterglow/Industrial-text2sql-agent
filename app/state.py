@@ -50,6 +50,7 @@ class Text2SQLState(TypedDict, total=False):
     few_shot_retrieval_diagnostics: dict[str, Any]
     advanced_plan_memory_matches: list[dict[str, Any]]
     advanced_plan_memory_diagnostics: dict[str, Any]
+    advanced_plan_family: str
     query_signature: dict[str, Any]
     procedural_memory_matches: list[dict[str, Any]]
     procedural_memory_context: str

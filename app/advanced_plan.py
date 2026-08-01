@@ -23,6 +23,23 @@ ADVANCED_FAMILIES = {
 }
 
 
+def _json_object_from_text(raw: str) -> dict[str, Any]:
+    """Extract one JSON object from otherwise chatty local-model output."""
+
+    cleaned = raw.strip().removeprefix("```json").removesuffix("```").strip()
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(cleaned):
+        if char != "{":
+            continue
+        try:
+            payload, _ = decoder.raw_decode(cleaned[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    raise ValueError("no JSON object found in model output")
+
+
 class _PlanModel(BaseModel):
     """Strict contract for an LLM-produced advanced plan."""
 
@@ -147,9 +164,17 @@ def advanced_plan_family_prompt(schema_context: str, question: str) -> str:
     """
 
     return f"""Return JSON only: {{\"family\": \"...\"}}.
-Choose exactly one family: group_topk, period_change, group_outlier,
-cumulative_share, conditional_comparison, group_threshold, correlation,
-group_share, rising_sequence. Do not output SQL or any other keys.
+Choose exactly one family:
+- group_topk: top K records inside every group;
+- period_change: period-over-period carbon-intensity change;
+- group_outlier: values below a group mean minus one standard deviation;
+- cumulative_share: minimum records reaching a total metric share;
+- conditional_comparison: compare two named condition values inside each group;
+- group_threshold: records above a multiplier of their group's mean;
+- correlation: Pearson correlation inside each group;
+- group_share: each group's metric share within each period;
+- rising_sequence: a consecutive increasing metric sequence.
+Do not output SQL or any other keys.
 
 Schema:
 {schema_context}
@@ -158,10 +183,7 @@ Question:
 
 
 def parse_advanced_plan_family(raw: str) -> str:
-    cleaned = raw.strip().removeprefix("```json").removesuffix("```").strip()
-    payload = json.loads(cleaned)
-    if not isinstance(payload, dict):
-        raise ValueError("advanced plan family must be an object")
+    payload = _json_object_from_text(raw)
     family = str(payload.get("family", ""))
     if family not in ADVANCED_FAMILIES:
         raise ValueError("unsupported advanced plan family")
@@ -196,8 +218,7 @@ Question:
 
 
 def parse_advanced_plan(raw: str) -> dict[str, Any]:
-    cleaned = raw.strip().removeprefix("```json").removesuffix("```").strip()
-    payload = json.loads(cleaned)
+    payload = _json_object_from_text(raw)
     plan = payload.get("advanced_plan", payload)
     if not isinstance(plan, dict):
         raise ValueError("advanced_plan must be an object")

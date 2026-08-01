@@ -958,26 +958,38 @@ def generate_structured_query_spec(state: Text2SQLState) -> dict[str, Any]:
                 advanced_plan_completion_prompt(
                     state["schema_context"], question, family, example_context
                 ),
-                purpose="advanced_plan_completion",
+                # 3B first: a validated plan executes immediately; expensive
+                # completion is an escalation path, not the default.
+                purpose="planning",
             )
             plan = parse_advanced_plan(clean_llm_sql(completed_raw))
             if plan["family"] != family:
                 raise ValueError("completed plan family differs from the 3B classification")
             sql = compile_advanced_analysis_plan(plan)
+            memory_summary = dict(state.get("long_term_memory_retrieval_summary", {}))
+            memory_summary["advanced_plan"] = {
+                "family": family, "selected_count": len(examples),
+                "memory_ids": [item.memory_id for item in examples], "stage": "3b_completion",
+            }
             return {
                 "advanced_plan_raw": completed_raw,
                 "advanced_plan": plan,
                 "advanced_plan_error": "",
                 "query_expectation": build_query_expectation(question, plan),
                 "query_plan_mode": "advanced_analysis_plan",
-                "query_plan_reason": "3B选择分析族，升级模型在受限骨架中补全计划并编译。",
+                "query_plan_reason": "3B选择分析族并结合正式案例补全受限计划。",
                 "deterministic_sql": sql,
+                "advanced_plan_family": family,
                 "advanced_plan_memory_matches": [item.to_public_dict() for item in examples],
                 "advanced_plan_memory_diagnostics": diagnostics,
+                "long_term_memory_retrieval_summary": memory_summary,
             }
         except Exception as exc:
             return {
                 "advanced_plan_raw": raw,
+                "advanced_plan_family": locals().get("family", ""),
+                "advanced_plan_memory_matches": [item.to_public_dict() for item in locals().get("examples", [])],
+                "advanced_plan_memory_diagnostics": locals().get("diagnostics", {}),
                 "advanced_plan_error": f"{type(exc).__name__}: {exc}",
                 "failure_events": [
                     failure_event(
@@ -1029,10 +1041,21 @@ def regenerate_advanced_plan(state: Text2SQLState) -> dict[str, Any]:
     question = effective_question(state)
     prior = state.get("advanced_plan_raw", "")
     error = state.get("advanced_plan_error", "invalid advanced plan")
-    prompt = f"""{advanced_plan_prompt(state['schema_context'], question)}
+    family = str(state.get("advanced_plan_family", ""))
+    service = get_long_term_memory_service()
+    examples, diagnostics = (
+        service.retrieve_advanced_plan_examples(question, family)
+        if family else ([], {"family": "", "selected_count": 0, "skip_reason": "family_unknown"})
+    )
+    context = service.build_advanced_plan_few_shot_context(examples)
+    base_prompt = (
+        advanced_plan_completion_prompt(state["schema_context"], question, family, context)
+        if family else advanced_plan_prompt(state["schema_context"], question)
+    )
+    prompt = f"""{base_prompt}
 
-The small model output below failed the plan contract. Regenerate from the user question and schema.
-The `family` key is mandatory. Do not preserve wrong fields and do not output SQL.
+The prior local-model output below failed validation. Regenerate from the current question and schema.
+Keep the selected family when one is supplied. Do not preserve wrong fields and do not output SQL.
 Contract error: {error}
 Bad output:
 {prior}
@@ -1047,14 +1070,25 @@ Bad output:
                 repair_attempt=repair_attempt,
             )
             plan = parse_advanced_plan(clean_llm_sql(raw))
+            if family and plan["family"] != family:
+                raise ValueError("regenerated plan family differs from selected family")
+            memory_summary = dict(state.get("long_term_memory_retrieval_summary", {}))
+            memory_summary["advanced_plan"] = {
+                "family": plan["family"], "selected_count": len(examples),
+                "memory_ids": [item.memory_id for item in examples], "stage": "escalated_regeneration",
+            }
             return {
                 "advanced_plan": plan,
                 "advanced_plan_raw": raw,
                 "advanced_plan_error": "",
                 "query_expectation": build_query_expectation(question, plan),
                 "query_plan_mode": "advanced_analysis_plan",
-                "query_plan_reason": "3B计划契约失败后由升级模型重生成并编译。",
+                "query_plan_reason": "3B计划失败后由升级模型结合正式案例重生成并编译。",
                 "deterministic_sql": compile_advanced_analysis_plan(plan),
+                "advanced_plan_family": plan["family"],
+                "advanced_plan_memory_matches": [item.to_public_dict() for item in examples],
+                "advanced_plan_memory_diagnostics": diagnostics,
+                "long_term_memory_retrieval_summary": memory_summary,
                 "retry_count": 1,
                 "repair_source": "计划契约升级重生成",
                 "repair_plan_mode": "regenerate_plan",
