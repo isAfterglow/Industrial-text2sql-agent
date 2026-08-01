@@ -17,6 +17,7 @@ from app.sql_guard import validate_and_normalize_sql
 
 CASES = [
     ("按负荷类型分别列出无功功率最高的两条读数。", {"family":"group_topk","metric":"reactive_power","group_columns":["load_type_name"],"limit":2,"output_columns":["load_type_name","reading_id","reactive_power"]}),
+    ("按工作日状态和负荷类型分别列出无功功率最高的两条读数。", {"family":"group_topk","metric":"reactive_power","group_columns":["week_status","load_type_name"],"limit":2,"output_columns":["week_status","load_type_name","reading_id","reactive_power"]}),
     ("找出碳强度环比增幅最大的四个月。", {"family":"period_change","period_column":"month","derived_metric":"carbon_intensity","limit":4}),
     ("找出各负荷类型中功率因数低于均值一个标准差的读数。", {"family":"group_outlier","metric":"power_factor","group_column":"load_type_name","output_columns":["reading_id","load_type_name","power_factor"]}),
     ("按负荷类型计算无功功率与耗电量的皮尔逊相关系数。", {"family":"correlation","group_column":"load_type_name","x_metric":"reactive_power","y_metric":"usage_kwh","output_alias":"correlation_coefficient"}),
