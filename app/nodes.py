@@ -31,6 +31,7 @@ from app.material_plan import (
     parse_material_plan,
 )
 from app.capabilities import capability_family
+from app.approval import build_approval_snapshot, normalize_approval_decision
 from app.delivery import build_delivery_policy
 from app.query_expectations import assert_query_expectation, build_query_expectation
 from app.long_term_memory.service import get_long_term_memory_service
@@ -389,6 +390,8 @@ def load_schema(
         "result_assertion": {},
         "result_assertion_passed": True,
         "approval_required": False,
+        "approval_mode": state.get("approval_mode", ""),
+        "force_approval": bool(state.get("force_approval", False)),
         "approval_request": state.get("approval_request", {}),
         "approval_decision": state.get("approval_decision", {}),
         "approval_approved": False,
@@ -1862,44 +1865,68 @@ def approval_gate(state: Text2SQLState) -> dict[str, Any]:
     """Pause risky execution for an auditable plan-level human decision."""
 
     mode = str(state.get("approval_mode") or get_settings().APPROVAL_MODE).lower()
-    decision = dict(state.get("approval_decision") or {})
-    risky = state.get("query_plan_mode") in {"advanced_analysis_plan", "rsl", "llm_query_spec"}
-    required = bool(state.get("force_approval", False) or mode == "always" or (mode == "risk" and risky))
-    if not required and not decision:
+    try:
+        decision = normalize_approval_decision(state.get("approval_decision") or {})
+    except ValueError as exc:
+        return {
+            "approval_required": False,
+            "approval_approved": False,
+            "validation_error": str(exc),
+            "validation_error_type": "approval",
+            "validation_repairable": False,
+            "approval_summary": {"required": True, "action": "invalid_decision"},
+        }
+    snapshot = build_approval_snapshot(dict(state))
+    risk = snapshot["risk"]
+    required = bool(
+        state.get("force_approval", False)
+        or mode == "always"
+        or (mode == "risk" and risk["risky"])
+    )
+    resume_requested = bool((state.get("approval_request") or {}).get("approval_id"))
+    if not required and not decision and not resume_requested:
         return {"approval_required": False, "approval_approved": False, "approval_summary": {"required": False, "reason": "approval_mode_off_or_low_risk"}}
 
-    payload = {
-        "question": effective_question(state), "profile": state.get("domain_profile", ""),
-        "intent": state.get("query_intent", ""), "query_plan_mode": state.get("query_plan_mode", ""),
-        "query_spec": state.get("query_spec", {}), "advanced_plan": state.get("advanced_plan", {}),
-        "compiled_sql": state.get("validated_sql", ""), "schema_tables": state.get("intent_related_tables", []),
-        "model_calls": state.get("model_calls", []), "failure_events": state.get("failure_events", []),
-        "risk_reason": "forced" if state.get("force_approval") else "advanced_or_freeform_plan",
-    }
     service = get_long_term_memory_service()
     request = dict(state.get("approval_request") or {})
+    request_id = str(request.get("approval_id", ""))
+    persisted = service.get_approval_request(request_id) if request_id else None
+    plan_changed = bool(
+        persisted
+        and persisted.get("payload", {}).get("plan_fingerprint") != snapshot["plan_fingerprint"]
+    )
+    if plan_changed:
+        request = {}
+        persisted = None
+        decision = {}
+    if persisted:
+        request = persisted
+        if not decision and persisted.get("status") in {"approved", "rejected", "edited_plan"}:
+            decision = normalize_approval_decision(persisted.get("decision") or {})
     if not request:
-        request = service.create_approval_request(profile=str(state.get("domain_profile", "")), payload=payload)
+        request = service.create_approval_request(
+            profile=str(state.get("domain_profile", "")), payload=snapshot
+        )
 
     action = str(decision.get("action", "")).lower()
     if action in {"approve", "approved"}:
         decided = service.decide_approval_request(str(request["approval_id"]), {**decision, "action": "approved"})
-        return {"approval_required": False, "approval_request": decided or request, "approval_approved": True, "approval_summary": {"required": True, "action": "approved", "approval_id": request["approval_id"]}}
+        return {"approval_required": False, "approval_request": decided or request, "approval_approved": True, "approval_summary": {"required": True, "action": "approved", "approval_id": request["approval_id"], "risk": risk, "plan_changed_reapproval": plan_changed}}
     if action in {"reject", "rejected"}:
         decided = service.decide_approval_request(str(request["approval_id"]), {**decision, "action": "rejected"})
-        return {"approval_required": False, "approval_request": decided or request, "approval_approved": False, "validation_error": "人工审批拒绝执行该查询计划。", "validation_error_type": "approval", "validation_repairable": False, "approval_summary": {"required": True, "action": "rejected", "approval_id": request["approval_id"]}}
+        return {"approval_required": False, "approval_request": decided or request, "approval_approved": False, "validation_error": "人工审批拒绝执行该查询计划。", "validation_error_type": "approval", "validation_repairable": False, "approval_summary": {"required": True, "action": "rejected", "approval_id": request["approval_id"], "risk": risk}}
     if action == "edit_plan":
         edited = decision.get("advanced_plan")
         if not isinstance(edited, dict):
-            return {"approval_required": True, "approval_request": request, "approval_summary": {"required": True, "error": "edit_plan requires advanced_plan"}}
+            return {"approval_required": True, "approval_request": request, "approval_summary": {"required": True, "error": "edit_plan requires advanced_plan", "risk": risk}}
         try:
             plan = parse_advanced_plan(json.dumps(edited, ensure_ascii=False))
             sql = compile_advanced_analysis_plan(plan)
             decided = service.decide_approval_request(str(request["approval_id"]), {**decision, "action": "edited_plan"})
-            return {"approval_required": False, "approval_request": decided or request, "approval_approved": True, "advanced_plan": plan, "query_expectation": build_query_expectation(effective_question(state), plan), "raw_sql": sql, "validated_sql": "", "approval_summary": {"required": True, "action": "edited_plan", "approval_id": request["approval_id"]}}
+            return {"approval_required": False, "approval_request": decided or request, "approval_approved": True, "advanced_plan": plan, "query_expectation": build_query_expectation(effective_question(state), plan), "raw_sql": sql, "validated_sql": "", "approval_summary": {"required": True, "action": "edited_plan", "approval_id": request["approval_id"], "risk": risk}}
         except Exception as exc:
-            return {"approval_required": True, "approval_request": request, "approval_summary": {"required": True, "error": f"invalid edited plan: {type(exc).__name__}: {exc}"}}
-    return {"approval_required": True, "approval_request": request, "approval_approved": False, "approval_summary": {"required": True, "action": "pending", "approval_id": request["approval_id"]}}
+            return {"approval_required": True, "approval_request": request, "approval_summary": {"required": True, "error": f"invalid edited plan: {type(exc).__name__}: {exc}", "risk": risk}}
+    return {"approval_required": True, "approval_request": request, "approval_approved": False, "approval_summary": {"required": True, "action": "pending", "approval_id": request["approval_id"], "risk": risk, "plan_changed_reapproval": plan_changed}}
 
 
 def route_after_approval(state: Text2SQLState) -> Literal["review", "revalidate", "pending", "error"]:

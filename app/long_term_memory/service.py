@@ -342,10 +342,21 @@ class LongTermMemoryService:
             dedupe_key="candidate:" + _episodic_dedupe_key(query_spec),
         )
 
-    def promote_candidate(self, memory_id: str, *, evidence: str) -> MemoryWriteResult:
+    def promote_candidate(
+        self,
+        memory_id: str,
+        *,
+        evidence: str,
+        approver: str,
+        approval_reason: str,
+    ) -> MemoryWriteResult:
+        """Promote only after independent evidence and an identified reviewer."""
+
         candidate = self.repository.get(memory_id)
         if candidate is None or candidate.memory_type != "candidate_episodic":
             raise ValueError("只能晋升候选情景记忆。")
+        if not approver.strip() or not approval_reason.strip():
+            raise ValueError("晋升候选记忆必须提供审批人和审批理由。")
         metadata = dict(candidate.metadata)
         validations = metadata.get("independent_validations", [])
         if not isinstance(validations, list) or len(validations) < 3:
@@ -358,7 +369,15 @@ class LongTermMemoryService:
                 "schema_tables": sorted(get_schema_catalog().get("tables", {})),
                 "quality": {"retrieval_count": 0, "success_count": 0, "failure_count": 0},
             })
-        metadata.update({"promotion_status": "promoted", "promotion_evidence": evidence, "candidate_memory_id": memory_id})
+        metadata.update({
+            "promotion_status": "promoted",
+            "promotion_evidence": evidence,
+            "candidate_memory_id": memory_id,
+            "promotion_review": {
+                "approver": approver.strip(),
+                "reason": approval_reason.strip(),
+            },
+        })
         return self._upsert(
             memory_type="episodic", title=candidate.title.replace("候选", "正式"),
             content=candidate.content, metadata=metadata, source="candidate_promoted",
@@ -371,26 +390,43 @@ class LongTermMemoryService:
     def decide_approval_request(self, approval_id: str, decision: dict[str, object]) -> dict[str, object] | None:
         return self.repository.decide_approval_request(approval_id, decision)
 
+    def get_approval_request(self, approval_id: str) -> dict[str, object] | None:
+        return self.repository.get_approval_request(approval_id)
+
     def list_approval_requests(self, status: str | None = None, limit: int = 50) -> list[dict[str, object]]:
         return self.repository.list_approval_requests(
             namespace=self.namespace, status=status, limit=limit
         )
 
     def record_candidate_validation(
-        self, memory_id: str, *, question: str, plan: dict[str, Any], evidence: str
+        self,
+        memory_id: str,
+        *,
+        question: str,
+        plan: dict[str, Any],
+        evidence: str,
+        validator: str,
     ) -> None:
         """Attach independent successful validation evidence without making it retrievable."""
 
         record = self.repository.get(memory_id)
         if record is None or record.memory_type != "candidate_episodic":
             raise ValueError("只能为候选情景记忆记录验证。")
+        if not validator.strip():
+            raise ValueError("候选记忆验证必须记录验证者。")
         metadata = dict(record.metadata)
         validations = list(metadata.get("independent_validations", []))
         fingerprint = hashlib.sha256(
             json.dumps({"question": question, "plan": plan}, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()[:16]
         if not any(item.get("fingerprint") == fingerprint for item in validations if isinstance(item, dict)):
-            validations.append({"fingerprint": fingerprint, "question": question, "plan": plan, "evidence": evidence})
+            validations.append({
+                "fingerprint": fingerprint,
+                "question": question,
+                "plan": plan,
+                "evidence": evidence,
+                "validator": validator.strip(),
+            })
         metadata["independent_validations"] = validations
         metadata["validated_variant_count"] = len(validations)
         self.repository.update_memory_metadata(memory_id, metadata)

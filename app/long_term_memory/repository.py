@@ -289,6 +289,10 @@ class SQLiteMemoryRepository:
             row = connection.execute("SELECT * FROM approval_requests WHERE approval_id = ?", (approval_id,)).fetchone()
             if row is None:
                 return None
+            if str(row["status"]) != "pending":
+                # Decisions are append-only audit events. Repeating a command
+                # is idempotent, but it cannot silently replace an earlier one.
+                return self._approval_row(row)
             status = str(decision.get("action", "pending"))
             connection.execute(
                 "UPDATE approval_requests SET status = ?, decision_json = ?, decided_at = ? WHERE approval_id = ?",

@@ -60,10 +60,13 @@ def main() -> None:
             service.record_candidate_validation(
                 candidate.record.memory_id, question=question, plan=variant_spec,
                 evidence=f"non_benchmark; guard+execution; rows={rows}",
+                validator="curation_runner",
             )
         promoted = service.promote_candidate(
             candidate.record.memory_id,
             evidence="Three independent non-benchmark variants passed compile, Guard and database execution.",
+            approver="curation_reviewer",
+            approval_reason="Three independent non-benchmark variants passed compile, Guard and database execution.",
         )
         print(promoted.record.memory_id, promoted.record.metadata["query_spec"].get("query_type"))
 

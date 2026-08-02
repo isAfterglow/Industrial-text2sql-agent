@@ -80,10 +80,13 @@ def main() -> None:
             service.record_candidate_validation(
                 candidate.record.memory_id, question=question, plan=outcome["plan"],
                 evidence=f"non_benchmark; guard+execution; rows={outcome['row_count']}",
+                validator="curation_runner",
             )
         promoted = service.promote_candidate(
             candidate.record.memory_id,
             evidence="Three independent non-benchmark variants passed compile, Guard and database execution.",
+            approver="curation_reviewer",
+            approval_reason="Three independent non-benchmark variants passed compile, Guard and database execution.",
         )
         print(f"{promoted.record.memory_id} {promoted.record.metadata['advanced_plan']['family']}")
 

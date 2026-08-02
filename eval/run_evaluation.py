@@ -811,6 +811,9 @@ def parent_main(args: argparse.Namespace) -> int:
             "PYTHONUNBUFFERED": "1",
             "LTM_ENABLED": "1",
             "LTM_AUTO_SAVE": "0",
+            # Evaluation measures query quality without requiring an external
+            # reviewer to resume each high-risk case.
+            "APPROVAL_MODE": "off",
             "LTM_EMBEDDING_MODEL": "",
             "LTM_ALLOW_MODEL_DOWNLOAD": "0",
             "TEXT2SQL_TRACE_ENABLED": "1",

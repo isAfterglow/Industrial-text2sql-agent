@@ -53,8 +53,19 @@ def main() -> None:
                 variant["window_size"] = 3 if number < 3 else 4
             variant_question = f"非评测独立变体{number}：{question}"
             validated_plan, _, rows = validate(variant_question, variant)
-            service.record_candidate_validation(candidate.record.memory_id, question=variant_question, plan=validated_plan, evidence=f"non_benchmark; guard+execution; rows={rows}")
-        promoted = service.promote_candidate(candidate.record.memory_id, evidence="Three independent non-benchmark variants passed compile, Guard and database execution.")
+            service.record_candidate_validation(
+                candidate.record.memory_id,
+                question=variant_question,
+                plan=validated_plan,
+                evidence=f"non_benchmark; guard+execution; rows={rows}",
+                validator="curation_runner",
+            )
+        promoted = service.promote_candidate(
+            candidate.record.memory_id,
+            evidence="Three independent non-benchmark variants passed compile, Guard and database execution.",
+            approver="curation_reviewer",
+            approval_reason="Three independent non-benchmark variants passed compile, Guard and database execution.",
+        )
         print(promoted.record.memory_id, plan["family"])
 
 

@@ -80,7 +80,7 @@ class Settings(BaseSettings):
     SESSION_MEMORY_DB_PATH: str = "data/session_memory.sqlite3"
 
     # off: no gate; risk: advanced/free-form plans; always: every valid SQL.
-    APPROVAL_MODE: str = "off"
+    APPROVAL_MODE: str = "risk"
 
     @property
     def allowed_tables(self) -> tuple[str, ...]:
