@@ -22,4 +22,11 @@ env/
 
 # Logs
 *.log
+
+# Runtime state and frontend build artifacts
+data/agent_tasks.sqlite3
+data/session_memory.sqlite3
+data/appendonly.aof
+web/node_modules/
+web/dist/
 logs/

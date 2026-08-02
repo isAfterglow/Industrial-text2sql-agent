@@ -287,7 +287,11 @@ def load_schema(
     state: Text2SQLState,
 ) -> dict[str, Any]:
     reset_model_call_log()
-    profile = resolve_profile(state["question"])
+    requested_profile = str(state.get("requested_profile") or "").strip()
+    if requested_profile in {"resin", "steel_industry"}:
+        profile = requested_profile
+    else:
+        profile = resolve_profile(state["question"])
     set_active_profile(profile)
     return {
         "domain_profile": profile,

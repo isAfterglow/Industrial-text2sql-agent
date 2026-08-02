@@ -3,6 +3,8 @@ import os
 import threading
 import time
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -12,6 +14,31 @@ from app.schema import set_active_profile
 
 
 _LOG_LOCK = threading.Lock()
+_TRACE_EVENT_SINK: ContextVar[Callable[[dict[str, Any]], None] | None] = ContextVar(
+    "trace_event_sink", default=None
+)
+
+
+@contextmanager
+def trace_event_sink(sink: Callable[[dict[str, Any]], None]):
+    """Attach a request-local consumer without changing durable trace logging."""
+
+    token = _TRACE_EVENT_SINK.set(sink)
+    try:
+        yield
+    finally:
+        _TRACE_EVENT_SINK.reset(token)
+
+
+def publish_trace_event(event: dict[str, Any]) -> None:
+    sink = _TRACE_EVENT_SINK.get()
+    if sink is None:
+        return
+    try:
+        sink(safe_json_value(event))
+    except Exception:
+        # Observability must never interrupt query execution.
+        return
 
 
 def _env_bool(
@@ -822,6 +849,7 @@ def traced_node(
                 ),
             }
             append_node_event(event)
+            publish_trace_event(event)
             print_node_event(event)
 
             return {
@@ -855,6 +883,7 @@ def traced_node(
                 ),
             }
             append_node_event(event)
+            publish_trace_event(event)
             print_node_event(event)
             raise
 

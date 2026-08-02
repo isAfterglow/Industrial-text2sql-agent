@@ -10,6 +10,7 @@ class Text2SQLState(TypedDict, total=False):
     normalized_question: str
     resolved_question: str
     session_id: str
+    requested_profile: str
     domain_profile: str
     query_intent: str
     intent_confidence: float

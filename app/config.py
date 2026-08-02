@@ -81,6 +81,8 @@ class Settings(BaseSettings):
 
     # off: no gate; risk: advanced/free-form plans; always: every valid SQL.
     APPROVAL_MODE: str = "risk"
+    AGENT_TASK_DB_PATH: str = "data/agent_tasks.sqlite3"
+    AGENT_MAX_CONCURRENT_TASKS: int = 4
 
     @property
     def allowed_tables(self) -> tuple[str, ...]:
