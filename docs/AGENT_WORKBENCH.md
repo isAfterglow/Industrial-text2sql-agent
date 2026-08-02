@@ -52,3 +52,16 @@ The workbench never edits SQL. It submits a constrained structured
 `AdvancedPlan`, which is parsed and compiled server-side before the existing
 Guard sees it. The approval record remains immutable. See
 `docs/APPROVAL_WORKFLOW.md` for promotion governance and risk policy.
+
+## Acceptance Flows
+
+With the API running and Ollama available, run the three representative browser
+flows through the same HTTP surface used by the workbench:
+
+```bash
+conda run --no-capture-output -n scitime-agent python tools/run_workbench_acceptance.py
+```
+
+It checks a material complex query, a steel advanced-plan query with a reviewed
+structured-plan edit, and a forced-approval deterministic query. The JSON
+report is stored under `eval/runs/` and is intentionally not versioned.

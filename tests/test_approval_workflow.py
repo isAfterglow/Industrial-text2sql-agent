@@ -108,6 +108,38 @@ class ApprovalWorkflowTests(unittest.TestCase):
             promoted.record.metadata["promotion_review"]["approver"], "reviewer_lead"
         )
 
+    def test_edited_plan_is_recompiled_and_approved(self) -> None:
+        state = self._state()
+        state["advanced_plan"] = {
+            "family": "group_topk",
+            "group_columns": ["load_type_name"],
+            "metric": "usage_kwh",
+            "output_columns": ["load_type_name", "reading_id", "usage_kwh"],
+            "limit": 1,
+        }
+        state["domain_profile"] = "steel_industry"
+        set_active_profile("steel_industry")
+        with patch("app.nodes.get_long_term_memory_service", return_value=self.service), patch(
+            "app.nodes.get_settings", return_value=self.settings
+        ):
+            pending = approval_gate(state)
+            approved = approval_gate({
+                **state,
+                "approval_request": pending["approval_request"],
+                "approval_decision": {
+                    "action": "edited_plan", "actor": "reviewer_a",
+                    "advanced_plan": state["advanced_plan"],
+                },
+            })
+        self.assertTrue(approved["approval_approved"])
+        self.assertTrue(approved["raw_sql"].startswith("WITH ranked AS"))
+        revalidated = approval_gate({
+            **state,
+            **approved,
+            "validated_sql": approved["raw_sql"],
+        })
+        self.assertEqual(revalidated["approval_summary"]["action"], "edited_plan_revalidated")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,6 +4,8 @@ sqlalchemy
 pymysql
 cryptography
 python-dotenv
+numpy
+PyYAML
 pydantic
 pydantic-settings
 fastapi

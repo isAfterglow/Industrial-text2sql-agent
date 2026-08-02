@@ -148,6 +148,9 @@ class Text2SQLState(TypedDict, total=False):
     force_approval: bool
     approval_request: dict[str, Any]
     approval_decision: dict[str, Any]
+    approved_execution_plan: dict[str, Any]
+    approval_edit_applied: bool
+    approval_edited_sql: str
     approval_approved: bool
     approval_summary: dict[str, Any]
 

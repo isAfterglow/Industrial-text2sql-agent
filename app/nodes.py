@@ -398,6 +398,9 @@ def load_schema(
         "force_approval": bool(state.get("force_approval", False)),
         "approval_request": state.get("approval_request", {}),
         "approval_decision": state.get("approval_decision", {}),
+        "approved_execution_plan": state.get("approved_execution_plan", {}),
+        "approval_edit_applied": bool(state.get("approval_edit_applied", False)),
+        "approval_edited_sql": state.get("approval_edited_sql", ""),
         "approval_approved": False,
         "approval_summary": {},
         "columns": [],
@@ -973,6 +976,41 @@ def build_query_plan(
     """构建查询计划；常见时序派生指标走确定性扩展路径。"""
 
     question = effective_question(state)
+    approved = state.get("approved_execution_plan")
+    if isinstance(approved, dict) and approved:
+        decision = approved.get("decision") or {}
+        plan = dict(
+            decision.get("advanced_plan")
+            if isinstance(decision, dict) and decision.get("action") == "edited_plan"
+            else approved.get("advanced_plan") or {}
+        )
+        try:
+            if plan:
+                sql = (
+                    compile_material_plan(plan)
+                    if plan.get("family") == MATERIAL_PLAN_FAMILY
+                    else compile_advanced_analysis_plan(plan)
+                )
+            else:
+                sql = str(approved.get("compiled_sql") or "")
+        except Exception as exc:
+            return {
+                "query_plan_mode": "unsupported",
+                "query_plan_reason": f"Approved plan could not be recompiled: {type(exc).__name__}: {exc}",
+                "unsupported_query": True,
+                "unsupported_query_reason": "审批后的结构化计划无法重新编译。",
+                "deterministic_sql": "",
+            }
+        if sql:
+            return {
+                "query_spec": dict(approved.get("query_spec") or {}),
+                "advanced_plan": plan,
+                "query_plan_mode": str(approved.get("query_plan_mode") or "deterministic"),
+                "query_plan_reason": "从不可变审批快照恢复计划，并重新经过Guard和执行。",
+                "deterministic_sql": sql,
+                "unsupported_query": False,
+                "capability_family": "approved_snapshot",
+            }
     spec = resolved_query_spec(state, question)
     capability = spec.get("capability_check", {})
     if capability.get("unsupported"):
@@ -1014,6 +1052,8 @@ def route_after_query_plan(
 ) -> Literal["simple", "rsl", "unsupported"]:
     if state.get("query_plan_mode") == "unsupported":
         return "unsupported"
+    if state.get("approved_execution_plan") and state.get("deterministic_sql"):
+        return "simple"
     if (
         state.get("query_plan_mode") in {"deterministic", "deterministic_extended"}
         and state.get("deterministic_sql")
@@ -1895,8 +1935,10 @@ def approval_gate(state: Text2SQLState) -> dict[str, Any]:
     request = dict(state.get("approval_request") or {})
     request_id = str(request.get("approval_id", ""))
     persisted = service.get_approval_request(request_id) if request_id else None
+    trusted_resume = bool(state.get("approved_execution_plan"))
     plan_changed = bool(
         persisted
+        and not trusted_resume
         and persisted.get("payload", {}).get("plan_fingerprint") != snapshot["plan_fingerprint"]
     )
     if plan_changed:
@@ -1907,6 +1949,21 @@ def approval_gate(state: Text2SQLState) -> dict[str, Any]:
         request = persisted
         if not decision and persisted.get("status") in {"approved", "rejected", "edited_plan"}:
             decision = normalize_approval_decision(persisted.get("decision") or {})
+    if state.get("approval_edit_applied"):
+        if state.get("validated_sql") == state.get("approval_edited_sql"):
+            return {
+                "approval_required": False,
+                "approval_approved": True,
+                "approval_summary": {
+                    "required": True, "action": "edited_plan_revalidated",
+                    "approval_id": request.get("approval_id", ""), "risk": risk,
+                },
+            }
+        # A repair or another node changed the SQL after the edited plan was
+        # revalidated. It is a new executable plan and needs fresh review.
+        request = {}
+        persisted = None
+        decision = {}
     if not request:
         request = service.create_approval_request(
             profile=str(state.get("domain_profile", "")), payload=snapshot
@@ -1919,7 +1976,7 @@ def approval_gate(state: Text2SQLState) -> dict[str, Any]:
     if action in {"reject", "rejected"}:
         decided = service.decide_approval_request(str(request["approval_id"]), {**decision, "action": "rejected"})
         return {"approval_required": False, "approval_request": decided or request, "approval_approved": False, "validation_error": "人工审批拒绝执行该查询计划。", "validation_error_type": "approval", "validation_repairable": False, "approval_summary": {"required": True, "action": "rejected", "approval_id": request["approval_id"], "risk": risk}}
-    if action == "edit_plan":
+    if action == "edited_plan":
         edited = decision.get("advanced_plan")
         if not isinstance(edited, dict):
             return {"approval_required": True, "approval_request": request, "approval_summary": {"required": True, "error": "edit_plan requires advanced_plan", "risk": risk}}
@@ -1927,7 +1984,7 @@ def approval_gate(state: Text2SQLState) -> dict[str, Any]:
             plan = parse_advanced_plan(json.dumps(edited, ensure_ascii=False))
             sql = compile_advanced_analysis_plan(plan)
             decided = service.decide_approval_request(str(request["approval_id"]), {**decision, "action": "edited_plan"})
-            return {"approval_required": False, "approval_request": decided or request, "approval_approved": True, "advanced_plan": plan, "query_expectation": build_query_expectation(effective_question(state), plan), "raw_sql": sql, "validated_sql": "", "approval_summary": {"required": True, "action": "edited_plan", "approval_id": request["approval_id"], "risk": risk}}
+            return {"approval_required": False, "approval_request": decided or request, "approval_approved": True, "advanced_plan": plan, "query_expectation": build_query_expectation(effective_question(state), plan), "raw_sql": sql, "validated_sql": "", "approval_edit_applied": True, "approval_edited_sql": sql, "approval_summary": {"required": True, "action": "edited_plan", "approval_id": request["approval_id"], "risk": risk}}
         except Exception as exc:
             return {"approval_required": True, "approval_request": request, "approval_summary": {"required": True, "error": f"invalid edited plan: {type(exc).__name__}: {exc}", "risk": risk}}
     return {"approval_required": True, "approval_request": request, "approval_approved": False, "approval_summary": {"required": True, "action": "pending", "approval_id": request["approval_id"], "risk": risk, "plan_changed_reapproval": plan_changed}}

@@ -29,4 +29,5 @@ data/session_memory.sqlite3
 data/appendonly.aof
 web/node_modules/
 web/dist/
+eval/harness_runs/
 logs/

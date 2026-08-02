@@ -112,6 +112,12 @@ class AgentTaskRunner:
                 graph_input["approval_mode"] = payload["approval_mode"]
             if task["approval_id"]:
                 graph_input["approval_request"] = {"approval_id": task["approval_id"]}
+                approved = get_long_term_memory_service().get_approval_request(task["approval_id"])
+                if approved:
+                    graph_input["approved_execution_plan"] = {
+                        **dict(approved.get("payload") or {}),
+                        "decision": dict(approved.get("decision") or {}),
+                    }
 
             def event_sink(event: dict[str, Any]) -> None:
                 self.store.append_event(task_id, {"type": "node", "event": event})

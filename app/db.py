@@ -60,7 +60,10 @@ def serialize_value(value: Any) -> Any:
 def ping_database() -> dict[str, Any]:
     """测试数据库连接。"""
 
-    engine = get_engine()
+    # The service can process resin and steel tasks in the same process.  Pass
+    # the active Profile explicitly so the LRU cache cannot reuse an engine
+    # created earlier under the implicit ``None`` key.
+    engine = get_engine(active_profile_name())
 
     with engine.connect() as connection:
         row = connection.execute(
@@ -82,7 +85,7 @@ def execute_readonly_query(
 ) -> dict[str, Any]:
     """执行已经通过安全检查的只读 SQL。"""
 
-    engine = get_engine()
+    engine = get_engine(active_profile_name())
 
     with engine.connect() as connection:
         result = connection.execute(text(sql))
