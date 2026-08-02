@@ -83,6 +83,19 @@ class Settings(BaseSettings):
     APPROVAL_MODE: str = "risk"
     AGENT_TASK_DB_PATH: str = "data/agent_tasks.sqlite3"
     AGENT_MAX_CONCURRENT_TASKS: int = 4
+    AGENT_AUTH_DB_PATH: str = "data/agent_auth.sqlite3"
+    JWT_SECRET: str = "change-this-in-production"
+    JWT_EXPIRE_MINUTES: int = 480
+    AUTH_BOOTSTRAP_DEMO_USERS: bool = True
+    AUTH_DEMO_PASSWORD: str = "agent-demo-password"
+    TASK_QUEUE_MODE: str = "auto"  # auto, redis, local
+    TASK_QUEUE_NAME: str = "text2sql-agent"
+    TASK_JOB_TIMEOUT_SECONDS: int = 180
+    USER_TASKS_PER_MINUTE: int = 20
+    USER_MAX_ACTIVE_TASKS: int = 3
+    MODEL_PRIMARY_3B_CONCURRENCY: int = 1
+    MODEL_FALLBACK_7B_CONCURRENCY: int = 1
+    MODEL_DEEPSEEK_CONCURRENCY: int = 3
 
     @property
     def allowed_tables(self) -> tuple[str, ...]:

@@ -76,6 +76,8 @@ class SQLiteMemoryRepository:
                     approval_id TEXT PRIMARY KEY,
                     namespace TEXT NOT NULL,
                     profile TEXT NOT NULL,
+                    user_id TEXT NOT NULL DEFAULT 'system',
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
                     status TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
                     decision_json TEXT NOT NULL DEFAULT '{}',
@@ -86,6 +88,10 @@ class SQLiteMemoryRepository:
                 ON approval_requests(namespace, status, created_at);
                 """
             )
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(approval_requests)")}
+            for name, definition in (("user_id", "TEXT NOT NULL DEFAULT 'system'"), ("tenant_id", "TEXT NOT NULL DEFAULT 'default'")):
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE approval_requests ADD COLUMN {name} {definition}")
 
     def _row_to_record(self, row: sqlite3.Row) -> MemoryRecord:
         return MemoryRecord(
@@ -270,14 +276,14 @@ class SQLiteMemoryRepository:
         return {row["memory_type"]: int(row["n"]) for row in rows}
 
     def create_approval_request(
-        self, *, namespace: str, profile: str, payload: dict[str, object]
+        self, *, namespace: str, profile: str, payload: dict[str, object], user_id: str = "system", tenant_id: str = "default"
     ) -> dict[str, object]:
         approval_id = "approval-" + uuid.uuid4().hex[:16]
         now = _utc_now_iso()
         with self._connect() as connection:
             connection.execute(
-                "INSERT INTO approval_requests(approval_id, namespace, profile, status, payload_json, created_at) VALUES (?, ?, ?, 'pending', ?, ?)",
-                (approval_id, namespace, profile, json.dumps(payload, ensure_ascii=False, sort_keys=True), now),
+                "INSERT INTO approval_requests(approval_id, namespace, profile, user_id, tenant_id, status, payload_json, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (approval_id, namespace, profile, user_id, tenant_id, json.dumps(payload, ensure_ascii=False, sort_keys=True), now),
             )
         return {"approval_id": approval_id, "status": "pending", "created_at": now, "payload": payload}
 
@@ -307,16 +313,25 @@ class SQLiteMemoryRepository:
         return self._approval_row(row) if row else None
 
     def list_approval_requests(
-        self, *, namespace: str, status: str | None = None, limit: int = 50
+        self, *, namespace: str | None, status: str | None = None, user_id: str | None = None, tenant_id: str | None = None, limit: int = 50
     ) -> list[dict[str, object]]:
-        clauses = ["namespace = ?"]
-        parameters: list[object] = [namespace]
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if namespace:
+            clauses.append("namespace = ?")
+            parameters.append(namespace)
         if status:
             clauses.append("status = ?")
             parameters.append(status)
+        if tenant_id:
+            clauses.append("tenant_id = ?")
+            parameters.append(tenant_id)
+        if user_id:
+            clauses.append("user_id = ?")
+            parameters.append(user_id)
         parameters.append(int(limit))
         sql = (
-            "SELECT * FROM approval_requests WHERE " + " AND ".join(clauses)
+            "SELECT * FROM approval_requests" + (" WHERE " + " AND ".join(clauses) if clauses else "")
             + " ORDER BY created_at DESC LIMIT ?"
         )
         with self._connect() as connection:
@@ -334,6 +349,7 @@ class SQLiteMemoryRepository:
     def _approval_row(row: sqlite3.Row) -> dict[str, object]:
         return {
             "approval_id": row["approval_id"], "namespace": row["namespace"], "profile": row["profile"],
+            "user_id": row["user_id"], "tenant_id": row["tenant_id"],
             "status": row["status"], "payload": json.loads(row["payload_json"] or "{}"),
             "decision": json.loads(row["decision_json"] or "{}"), "created_at": row["created_at"], "decided_at": row["decided_at"],
         }

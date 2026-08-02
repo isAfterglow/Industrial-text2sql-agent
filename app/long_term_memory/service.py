@@ -10,6 +10,7 @@ from typing import Any, Iterable
 import numpy as np
 
 from app.schema import active_profile_name, get_schema_catalog
+from app.request_context import current_identity
 from app.query_enhancement import (
     build_query_signature,
     hard_signature_compatible,
@@ -196,7 +197,8 @@ class LongTermMemoryService:
         self.embedding = EmbeddingProvider(self.settings)
     @property
     def namespace(self) -> str:
-        return f"{self.settings.namespace}:{active_profile_name()}"
+        identity = current_identity()
+        return f"{self.settings.namespace}:{active_profile_name()}:tenant:{identity.tenant_id}:user:{identity.user_id}"
 
     @property
     def schema_hash(self) -> str:
@@ -385,7 +387,11 @@ class LongTermMemoryService:
         )
 
     def create_approval_request(self, *, profile: str, payload: dict[str, object]) -> dict[str, object]:
-        return self.repository.create_approval_request(namespace=self.namespace, profile=profile, payload=payload)
+        identity = current_identity()
+        return self.repository.create_approval_request(
+            namespace=self.namespace, profile=profile, payload=payload,
+            user_id=identity.user_id, tenant_id=identity.tenant_id,
+        )
 
     def decide_approval_request(self, approval_id: str, decision: dict[str, object]) -> dict[str, object] | None:
         return self.repository.decide_approval_request(approval_id, decision)
@@ -393,10 +399,13 @@ class LongTermMemoryService:
     def get_approval_request(self, approval_id: str) -> dict[str, object] | None:
         return self.repository.get_approval_request(approval_id)
 
-    def list_approval_requests(self, status: str | None = None, limit: int = 50) -> list[dict[str, object]]:
+    def list_approval_requests(self, status: str | None = None, limit: int = 50, *, user_id: str | None = None, tenant_id: str | None = None) -> list[dict[str, object]]:
         return self.repository.list_approval_requests(
-            namespace=self.namespace, status=status, limit=limit
+            namespace=self.namespace, status=status, user_id=user_id, tenant_id=tenant_id, limit=limit
         )
+
+    def list_tenant_approval_requests(self, tenant_id: str, status: str | None = None, limit: int = 50) -> list[dict[str, object]]:
+        return self.repository.list_approval_requests(namespace=None, status=status, tenant_id=tenant_id, limit=limit)
 
     def record_candidate_validation(
         self,

@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import lru_cache
 from pathlib import Path
 from threading import Lock
@@ -10,6 +12,7 @@ from langchain_core.messages import BaseMessage
 from langchain_openai import ChatOpenAI
 
 from app.config import get_settings
+from app.model_limiter import model_slot
 
 
 ModelRole = Literal["primary_3b", "deepseek_api", "fallback_7b"]
@@ -17,7 +20,8 @@ ModelRole = Literal["primary_3b", "deepseek_api", "fallback_7b"]
 # evaluation worker is a process, so a lock-protected process-local log keeps
 # call telemetry intact across nodes without leaking across benchmark cases.
 _MODEL_LOG_LOCK = Lock()
-_model_call_log: list[dict[str, object]] = []
+_model_call_logs: dict[str, list[dict[str, object]]] = {}
+_MODEL_LOG_SCOPE: ContextVar[str] = ContextVar("model_log_scope", default="global")
 
 
 class ModelRouteError(RuntimeError):
@@ -35,17 +39,26 @@ class ModelTarget:
 
 def reset_model_call_log() -> None:
     with _MODEL_LOG_LOCK:
-        _model_call_log.clear()
+        _model_call_logs[_MODEL_LOG_SCOPE.get()] = []
 
 
 def model_call_log() -> list[dict[str, object]]:
     with _MODEL_LOG_LOCK:
-        return list(_model_call_log)
+        return list(_model_call_logs.get(_MODEL_LOG_SCOPE.get(), []))
 
 
 def _append_call(record: dict[str, object]) -> None:
     with _MODEL_LOG_LOCK:
-        _model_call_log.append(record)
+        _model_call_logs.setdefault(_MODEL_LOG_SCOPE.get(), []).append(record)
+
+
+@contextmanager
+def model_call_scope(scope: str):
+    token = _MODEL_LOG_SCOPE.set(scope)
+    try:
+        yield
+    finally:
+        _MODEL_LOG_SCOPE.reset(token)
 
 
 @lru_cache(maxsize=1)
@@ -166,7 +179,8 @@ def invoke_model(
 
     started = perf_counter()
     try:
-        response = _get_client(target).invoke(messages)
+        with model_slot(target.role) as queue_wait_ms:
+            response = _get_client(target).invoke(messages)
         content = response.content
         if isinstance(content, str):
             text = content
@@ -185,6 +199,7 @@ def invoke_model(
             "status": "success",
             "fallback_used": len(attempted_roles) > 1,
             "elapsed_ms": round((perf_counter() - started) * 1000, 3),
+            "queue_wait_ms": queue_wait_ms,
         })
         return text
     except Exception as exc:
@@ -201,7 +216,8 @@ def invoke_model(
             fallback = _target_for("fallback_7b")
             retry_started = perf_counter()
             try:
-                response = _get_client(fallback).invoke(messages)
+                with model_slot(fallback.role) as queue_wait_ms:
+                    response = _get_client(fallback).invoke(messages)
                 content = response.content
                 if isinstance(content, str):
                     text = content
@@ -220,6 +236,7 @@ def invoke_model(
                     "status": "success",
                     "fallback_used": True,
                     "elapsed_ms": round((perf_counter() - retry_started) * 1000, 3),
+                    "queue_wait_ms": queue_wait_ms,
                 })
                 return text
             except Exception as fallback_exc:

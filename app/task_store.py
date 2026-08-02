@@ -34,12 +34,16 @@ class AgentTaskStore:
                 """
                 CREATE TABLE IF NOT EXISTS agent_tasks (
                     task_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL DEFAULT 'system',
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
                     status TEXT NOT NULL,
                     profile TEXT NOT NULL,
                     question TEXT NOT NULL,
                     session_id TEXT NOT NULL,
                     trace_id TEXT NOT NULL,
                     approval_id TEXT NOT NULL DEFAULT '',
+                    queue_job_id TEXT NOT NULL DEFAULT '',
+                    cancel_requested INTEGER NOT NULL DEFAULT 0,
                     input_json TEXT NOT NULL,
                     result_json TEXT NOT NULL DEFAULT '{}',
                     error_message TEXT NOT NULL DEFAULT '',
@@ -52,7 +56,6 @@ class AgentTaskStore:
                 ON agent_tasks(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_agent_tasks_status
                 ON agent_tasks(status, updated_at DESC);
-
                 CREATE TABLE IF NOT EXISTS agent_task_events (
                     task_id TEXT NOT NULL,
                     sequence INTEGER NOT NULL,
@@ -63,18 +66,28 @@ class AgentTaskStore:
                 );
                 """
             )
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(agent_tasks)")}
+            for name, definition in (
+                ("user_id", "TEXT NOT NULL DEFAULT 'system'"),
+                ("tenant_id", "TEXT NOT NULL DEFAULT 'default'"),
+                ("queue_job_id", "TEXT NOT NULL DEFAULT ''"),
+                ("cancel_requested", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE agent_tasks ADD COLUMN {name} {definition}")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_agent_tasks_owner ON agent_tasks(tenant_id, user_id, created_at DESC)")
 
-    def create_task(self, *, profile: str, question: str, session_id: str, trace_id: str,
+    def create_task(self, *, user_id: str, tenant_id: str, profile: str, question: str, session_id: str, trace_id: str,
                     payload: dict[str, Any], approval_id: str = "") -> dict[str, Any]:
         task_id = "task-" + uuid.uuid4().hex[:16]
         now = utc_now()
         with self._connect() as connection:
             connection.execute(
                 """INSERT INTO agent_tasks (
-                    task_id, status, profile, question, session_id, trace_id, approval_id,
+                    task_id, user_id, tenant_id, status, profile, question, session_id, trace_id, approval_id,
                     input_json, created_at, updated_at
-                ) VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (task_id, profile, question, session_id, trace_id, approval_id,
+                ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (task_id, user_id, tenant_id, profile, question, session_id, trace_id, approval_id,
                  json.dumps(payload, ensure_ascii=False), now, now),
             )
         self.append_event(task_id, {"type": "task", "status": "queued", "at": now})
@@ -85,12 +98,43 @@ class AgentTaskStore:
             row = connection.execute("SELECT * FROM agent_tasks WHERE task_id = ?", (task_id,)).fetchone()
         return self._task_row(row) if row else None
 
-    def list_tasks(self, *, limit: int = 50) -> list[dict[str, Any]]:
+    def list_tasks(self, *, user_id: str | None = None, tenant_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if tenant_id:
+            clauses.append("tenant_id = ?")
+            params.append(tenant_id)
+        if user_id:
+            clauses.append("user_id = ?")
+            params.append(user_id)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(max(1, min(limit, 200)))
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM agent_tasks ORDER BY created_at DESC LIMIT ?", (max(1, min(limit, 200)),)
+                "SELECT * FROM agent_tasks" + where + " ORDER BY created_at DESC LIMIT ?", params
             ).fetchall()
         return [self._task_row(row) for row in rows]
+
+    def active_count(self, user_id: str, tenant_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS n FROM agent_tasks WHERE user_id = ? AND tenant_id = ? AND status IN ('queued', 'running')",
+                (user_id, tenant_id),
+            ).fetchone()
+        return int(row["n"])
+
+    def set_queue_job(self, task_id: str, job_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("UPDATE agent_tasks SET queue_job_id = ?, updated_at = ? WHERE task_id = ?", (job_id, utc_now(), task_id))
+
+    def request_cancel(self, task_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("UPDATE agent_tasks SET cancel_requested = 1, updated_at = ? WHERE task_id = ?", (utc_now(), task_id))
+        self.append_event(task_id, {"type": "task", "status": "cancel_requested", "at": utc_now()})
+
+    def is_cancel_requested(self, task_id: str) -> bool:
+        task = self.get_task(task_id)
+        return bool(task and task["cancel_requested"])
 
     def update_status(self, task_id: str, status: str, *, result: dict[str, Any] | None = None,
                       error_message: str = "") -> None:
@@ -100,7 +144,7 @@ class AgentTaskStore:
         if status == "running":
             fields.append("started_at = ?")
             values.append(now)
-        if status in {"completed", "approval_required", "failed"}:
+        if status in {"completed", "approval_required", "failed", "cancelled"}:
             fields.append("finished_at = ?")
             values.append(now)
         if result is not None:
@@ -140,9 +184,11 @@ class AgentTaskStore:
     @staticmethod
     def _task_row(row: sqlite3.Row) -> dict[str, Any]:
         return {
-            "task_id": row["task_id"], "status": row["status"], "profile": row["profile"],
+            "task_id": row["task_id"], "user_id": row["user_id"], "tenant_id": row["tenant_id"],
+            "status": row["status"], "profile": row["profile"],
             "question": row["question"], "session_id": row["session_id"], "trace_id": row["trace_id"],
-            "approval_id": row["approval_id"], "input": json.loads(row["input_json"]),
+            "approval_id": row["approval_id"], "queue_job_id": row["queue_job_id"],
+            "cancel_requested": bool(row["cancel_requested"]), "input": json.loads(row["input_json"]),
             "result": json.loads(row["result_json"]), "error_message": row["error_message"],
             "created_at": row["created_at"], "started_at": row["started_at"],
             "finished_at": row["finished_at"], "updated_at": row["updated_at"],

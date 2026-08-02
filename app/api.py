@@ -4,13 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
-import uuid
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -18,11 +15,12 @@ from pydantic import BaseModel, Field
 from app.advanced_plan import compile_advanced_analysis_plan, parse_advanced_plan
 from app.approval import normalize_approval_decision
 from app.config import get_settings
-from app.graph import graph
+from app.auth import LoginRequest, RegisterRequest, current_user, get_user_store, issue_token, require_roles
 from app.long_term_memory import get_long_term_memory_service
+from app.request_context import RequestIdentity, identity_scope
 from app.schema import set_active_profile
-from app.task_store import AgentTaskStore
-from app.trace import new_trace_id, safe_json_value, save_trace_record, trace_event_sink, utc_now_iso
+from app.task_queue import TaskDispatcher
+from app.trace import safe_json_value
 
 
 ProfileName = Literal["resin", "steel_industry"]
@@ -38,7 +36,6 @@ class QueryRequest(BaseModel):
 
 class ApprovalDecisionRequest(BaseModel):
     action: Literal["approved", "rejected", "edited_plan"]
-    actor: str = Field(min_length=1, max_length=120)
     comment: str = Field(default="", max_length=1000)
     advanced_plan: dict[str, Any] | None = None
 
@@ -73,81 +70,16 @@ def _public_result(result: dict[str, Any], elapsed_ms: float) -> dict[str, Any]:
     })
 
 
-class AgentTaskRunner:
-    def __init__(self) -> None:
-        settings = get_settings()
-        self.store = AgentTaskStore(settings.AGENT_TASK_DB_PATH)
-        self.executor = ThreadPoolExecutor(max_workers=max(1, settings.AGENT_MAX_CONCURRENT_TASKS))
-
-    def submit(self, request: QueryRequest, *, approval_id: str = "") -> dict[str, Any]:
-        trace_id = new_trace_id()
-        session_id = request.session_id or "session-" + uuid.uuid4().hex[:12]
-        payload = request.model_dump()
-        task = self.store.create_task(
-            profile=request.profile, question=request.question, session_id=session_id,
-            trace_id=trace_id, payload=payload, approval_id=approval_id,
-        )
-        self.executor.submit(self._run, task["task_id"])
-        return task
-
-    def _run(self, task_id: str) -> None:
-        task = self.store.get_task(task_id)
-        if not task:
-            return
-        payload = dict(task["input"])
-        self.store.update_status(task_id, "running")
-        started = time.perf_counter()
-        try:
-            set_active_profile(task["profile"])
-            graph_input: dict[str, Any] = {
-                "question": task["question"],
-                "requested_profile": task["profile"],
-                "session_id": task["session_id"],
-                "trace_id": task["trace_id"],
-                "trace_started_at": utc_now_iso(),
-                "trace_events": [],
-                "force_approval": bool(payload.get("force_approval", False)),
-            }
-            if payload.get("approval_mode"):
-                graph_input["approval_mode"] = payload["approval_mode"]
-            if task["approval_id"]:
-                graph_input["approval_request"] = {"approval_id": task["approval_id"]}
-                approved = get_long_term_memory_service().get_approval_request(task["approval_id"])
-                if approved:
-                    graph_input["approved_execution_plan"] = {
-                        **dict(approved.get("payload") or {}),
-                        "decision": dict(approved.get("decision") or {}),
-                    }
-
-            def event_sink(event: dict[str, Any]) -> None:
-                self.store.append_event(task_id, {"type": "node", "event": event})
-
-            with trace_event_sink(event_sink):
-                result = graph.invoke(graph_input, {"recursion_limit": 32})
-            elapsed_ms = (time.perf_counter() - started) * 1000
-            trace = save_trace_record(result, elapsed_ms)
-            public = _public_result(result, elapsed_ms)
-            public["trace"] = trace
-            status = "approval_required" if result.get("approval_required") else "completed"
-            self.store.update_status(task_id, status, result=public)
-        except Exception as exc:
-            elapsed_ms = (time.perf_counter() - started) * 1000
-            self.store.update_status(
-                task_id, "failed", result={"elapsed_ms": round(elapsed_ms, 3)},
-                error_message=f"{type(exc).__name__}: {exc}",
-            )
-
-
-runner: AgentTaskRunner | None = None
+runner: TaskDispatcher | None = None
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global runner
-    runner = AgentTaskRunner()
+    runner = TaskDispatcher()
     yield
     if runner:
-        runner.executor.shutdown(wait=False, cancel_futures=True)
+        runner.shutdown()
 
 
 app = FastAPI(title="Text2SQL Agent API", version="1.0.0", lifespan=lifespan)
@@ -160,15 +92,16 @@ app.add_middleware(
 )
 
 
-def _runner() -> AgentTaskRunner:
+def _runner() -> TaskDispatcher:
     if runner is None:
         raise RuntimeError("API lifespan has not initialized the task runner")
     return runner
 
 
-def _service(profile: str):
-    set_active_profile(profile)
-    return get_long_term_memory_service()
+def _service(profile: str, identity: RequestIdentity):
+    with identity_scope(identity):
+        set_active_profile(profile)
+        return get_long_term_memory_service()
 
 
 @app.get("/health")
@@ -176,27 +109,48 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/api/auth/login")
+def login(request: LoginRequest) -> dict[str, Any]:
+    identity = get_user_store().authenticate(request.username, request.password)
+    if not identity:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    return {"token": issue_token(identity), "user": identity.__dict__}
+
+@app.get("/api/auth/me")
+def me(identity: RequestIdentity = Depends(current_user)) -> dict[str, str]:
+    return identity.__dict__
+
 @app.post("/api/tasks", status_code=202)
-def create_task(request: QueryRequest) -> dict[str, Any]:
-    return _runner().submit(request)
+def create_task(request: QueryRequest, identity: RequestIdentity = Depends(require_roles("analyst", "admin"))) -> dict[str, Any]:
+    try:
+        return _runner().submit(user_id=identity.user_id, tenant_id=identity.tenant_id, role=identity.role, request=request)
+    except ValueError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
 
 
 @app.get("/api/tasks")
-def list_tasks(limit: int = Query(default=30, ge=1, le=200)) -> list[dict[str, Any]]:
-    return _runner().store.list_tasks(limit=limit)
+def list_tasks(limit: int = Query(default=30, ge=1, le=200), identity: RequestIdentity = Depends(current_user)) -> list[dict[str, Any]]:
+    return _runner().store.list_tasks(tenant_id=identity.tenant_id, user_id=None if identity.role == "admin" else identity.user_id, limit=limit)
 
 
 @app.get("/api/tasks/{task_id}")
-def get_task(task_id: str) -> dict[str, Any]:
+def get_task(task_id: str, identity: RequestIdentity = Depends(current_user)) -> dict[str, Any]:
     task = _runner().store.get_task(task_id)
-    if not task:
+    if not task or task["tenant_id"] != identity.tenant_id or (identity.role != "admin" and task["user_id"] != identity.user_id):
         raise HTTPException(status_code=404, detail="Task not found")
     return task
 
+@app.post("/api/tasks/{task_id}/cancel")
+def cancel_task(task_id: str, identity: RequestIdentity = Depends(current_user)) -> dict[str, Any]:
+    task = get_task(task_id, identity)
+    _runner().store.request_cancel(task_id)
+    return _runner().store.get_task(task_id) or task
+
 
 @app.get("/api/tasks/{task_id}/events")
-async def task_events(task_id: str, after: int = Query(default=0, ge=0)) -> StreamingResponse:
-    if not _runner().store.get_task(task_id):
+async def task_events(task_id: str, after: int = Query(default=0, ge=0), identity: RequestIdentity = Depends(current_user)) -> StreamingResponse:
+    owner = _runner().store.get_task(task_id)
+    if not owner or owner["tenant_id"] != identity.tenant_id or (identity.role != "admin" and owner["user_id"] != identity.user_id):
         raise HTTPException(status_code=404, detail="Task not found")
 
     async def stream():
@@ -207,7 +161,7 @@ async def task_events(task_id: str, after: int = Query(default=0, ge=0)) -> Stre
                 sequence = event["sequence"]
                 yield f"id: {sequence}\nevent: {event['payload'].get('type', 'message')}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
             task = _runner().store.get_task(task_id)
-            if task and task["status"] in {"completed", "approval_required", "failed"}:
+            if task and task["status"] in {"completed", "approval_required", "failed", "cancelled"}:
                 yield f"event: terminal\ndata: {json.dumps({'status': task['status']}, ensure_ascii=False)}\n\n"
                 return
             yield ": keepalive\n\n"
@@ -218,26 +172,30 @@ async def task_events(task_id: str, after: int = Query(default=0, ge=0)) -> Stre
 
 @app.get("/api/approvals")
 def list_approvals(profile: ProfileName = "resin", status: str | None = None,
-                   limit: int = Query(default=50, ge=1, le=200)) -> list[dict[str, Any]]:
-    return _service(profile).list_approval_requests(status=status, limit=limit)
+                   limit: int = Query(default=50, ge=1, le=200), identity: RequestIdentity = Depends(current_user)) -> list[dict[str, Any]]:
+    with identity_scope(identity):
+        service = _service(profile, identity)
+        if identity.role in {"reviewer", "admin"}:
+            return service.list_tenant_approval_requests(identity.tenant_id, status=status, limit=limit)
+        return service.list_approval_requests(status=status, limit=limit, user_id=identity.user_id, tenant_id=identity.tenant_id)
 
 
 @app.get("/api/approvals/{approval_id}")
-def get_approval(approval_id: str, profile: ProfileName = "resin") -> dict[str, Any]:
-    record = _service(profile).get_approval_request(approval_id)
-    if not record:
+def get_approval(approval_id: str, profile: ProfileName = "resin", identity: RequestIdentity = Depends(current_user)) -> dict[str, Any]:
+    with identity_scope(identity): record = _service(profile, identity).get_approval_request(approval_id)
+    if not record or record["tenant_id"] != identity.tenant_id or (identity.role == "analyst" and record["user_id"] != identity.user_id):
         raise HTTPException(status_code=404, detail="Approval request not found")
     return record
 
 
 @app.post("/api/approvals/{approval_id}/decision")
 def decide_approval(approval_id: str, request: ApprovalDecisionRequest,
-                    profile: ProfileName = "resin") -> dict[str, Any]:
-    service = _service(profile)
-    stored = service.get_approval_request(approval_id)
-    if not stored:
+                    profile: ProfileName = "resin", identity: RequestIdentity = Depends(require_roles("reviewer", "admin"))) -> dict[str, Any]:
+    with identity_scope(identity):
+        service = _service(profile, identity); stored = service.get_approval_request(approval_id)
+    if not stored or stored["tenant_id"] != identity.tenant_id:
         raise HTTPException(status_code=404, detail="Approval request not found")
-    decision = request.model_dump()
+    decision = request.model_dump(); decision["actor"] = identity.user_id
     if request.action == "edited_plan":
         if not request.advanced_plan:
             raise HTTPException(status_code=422, detail="edited_plan requires advanced_plan")
@@ -252,20 +210,19 @@ def decide_approval(approval_id: str, request: ApprovalDecisionRequest,
 
 
 @app.post("/api/approvals/{approval_id}/resume", status_code=202)
-def resume_approval(approval_id: str, profile: ProfileName = "resin") -> dict[str, Any]:
-    service = _service(profile)
-    request = service.get_approval_request(approval_id)
-    if not request:
+def resume_approval(approval_id: str, profile: ProfileName = "resin", identity: RequestIdentity = Depends(require_roles("reviewer", "admin"))) -> dict[str, Any]:
+    with identity_scope(identity):
+        service = _service(profile, identity); request = service.get_approval_request(approval_id)
+    if not request or request["tenant_id"] != identity.tenant_id:
         raise HTTPException(status_code=404, detail="Approval request not found")
     if request["status"] not in {"approved", "edited_plan"}:
         raise HTTPException(status_code=409, detail="Only approved requests can resume")
     payload = dict(request.get("payload") or {})
-    return _runner().submit(QueryRequest(
-        question=str(payload.get("question") or ""), profile=str(request["profile"]), approval_mode="risk"
-    ), approval_id=approval_id)
+    return _runner().submit(user_id=str(request["user_id"]), tenant_id=identity.tenant_id, role="analyst", request=QueryRequest(question=str(payload.get("question") or ""), profile=str(request["profile"]), approval_mode="risk"), approval_id=approval_id)
 
 
 @app.get("/api/memories")
 def list_memories(profile: ProfileName = "resin", memory_type: str | None = None,
-                  limit: int = Query(default=100, ge=1, le=200)) -> list[dict[str, Any]]:
-    return [record.to_public_dict() for record in _service(profile).list_memories(memory_type, limit)]
+                  limit: int = Query(default=100, ge=1, le=200), identity: RequestIdentity = Depends(current_user)) -> list[dict[str, Any]]:
+    with identity_scope(identity):
+        return [record.to_public_dict() for record in _service(profile, identity).list_memories(memory_type, limit)]
