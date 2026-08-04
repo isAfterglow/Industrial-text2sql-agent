@@ -18,6 +18,11 @@ _TRACE_EVENT_SINK: ContextVar[Callable[[dict[str, Any]], None] | None] = Context
     "trace_event_sink", default=None
 )
 
+# This is intentionally a small, dependency-free contract. It is shared by
+# JSONL persistence, task SSE, evaluation artifacts, and later exporters.
+AGENT_TRACE_SCHEMA_VERSION = "agent_trace.v1"
+AGENT_TRACE_PROJECT = "resin-material-agent"
+
 
 @contextmanager
 def trace_event_sink(sink: Callable[[dict[str, Any]], None]):
@@ -99,6 +104,12 @@ def new_trace_id() -> str:
     )
     suffix = uuid.uuid4().hex[:8]
     return f"{timestamp}-{suffix}"
+
+
+def new_span_id() -> str:
+    """Return a short per-node identifier linked by ``parent_span_id``."""
+
+    return uuid.uuid4().hex[:16]
 
 
 def safe_json_value(
@@ -630,6 +641,69 @@ def append_node_event(
     )
 
 
+def _event_context(
+    state: dict[str, Any],
+    output: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return stable routing/safety metadata without serializing raw state."""
+
+    output = output or {}
+    approval = dict(output.get("approval_request") or state.get("approval_request") or {})
+    model_calls = list(output.get("model_calls") or state.get("model_calls") or [])
+    return {
+        "project": AGENT_TRACE_PROJECT,
+        "profile": str(state.get("domain_profile") or state.get("requested_profile") or ""),
+        "session_id": str(state.get("session_id") or ""),
+        "route": str(output.get("query_plan_mode") or state.get("query_plan_mode") or ""),
+        "intent": str(output.get("query_intent") or state.get("query_intent") or ""),
+        "retry_count": int(output.get("retry_count", state.get("retry_count", 0)) or 0),
+        "safety_decision": str(output.get("validation_error_type") or state.get("validation_error_type") or ""),
+        "approval_id": str(approval.get("approval_id") or ""),
+        "model_roles": sorted({str(call.get("role", "")) for call in model_calls if call.get("role")}),
+    }
+
+
+def build_agent_trace_event(
+    *,
+    trace_id: str,
+    span_id: str,
+    parent_span_id: str,
+    node_name: str,
+    status: str,
+    started_at: str,
+    elapsed_ms: float,
+    state: dict[str, Any],
+    input_summary: dict[str, Any],
+    output_summary: dict[str, Any],
+    exception: str = "",
+) -> dict[str, Any]:
+    """Build the versioned event consumed by logs, SSE and evaluations."""
+
+    event = {
+        "schema_version": AGENT_TRACE_SCHEMA_VERSION,
+        "trace_id": trace_id,
+        "span_id": span_id,
+        "parent_span_id": parent_span_id,
+        "node": node_name,
+        "event_type": f"node.{status}",
+        "status": status,
+        "started_at": started_at,
+        "finished_at": utc_now_iso(),
+        "elapsed_ms": round(elapsed_ms, 3),
+        **_event_context(state, output_summary),
+        # Existing clients consume input/output. v1 callers should use the
+        # explicit summaries; their values are bounded by safe_json_value.
+        "input_summary": safe_json_value(input_summary, max_string_length=2000),
+        "output_summary": safe_json_value(output_summary, max_string_length=4000),
+    }
+    event["input"] = event["input_summary"]
+    event["output"] = event["output_summary"]
+    if exception:
+        event["error_code"] = exception.split(":", 1)[0]
+        event["exception"] = exception[:2000]
+    return event
+
+
 def _console_value(
     value: Any,
     max_length: int = 900,
@@ -813,6 +887,8 @@ def traced_node(
         trace_started_at = state.get(
             "trace_started_at"
         ) or utc_now_iso()
+        parent_span_id = state.get("current_span_id", "")
+        span_id = new_span_id()
         started_at = utc_now_iso()
         started = time.perf_counter()
         node_input = summarize_node_input(
@@ -825,29 +901,18 @@ def traced_node(
             elapsed_ms = (
                 time.perf_counter() - started
             ) * 1000
-            event = {
-                "trace_id": trace_id,
-                "node": node_name,
-                "status": infer_event_status(
-                    node_name,
-                    output,
-                ),
-                "started_at": started_at,
-                "finished_at": utc_now_iso(),
-                "elapsed_ms": round(
-                    elapsed_ms,
-                    3,
-                ),
-                "input": safe_json_value(
-                    node_input
-                ),
-                "output": safe_json_value(
-                    summarize_node_output(
-                        node_name,
-                        output,
-                    )
-                ),
-            }
+            event = build_agent_trace_event(
+                trace_id=trace_id,
+                span_id=span_id,
+                parent_span_id=parent_span_id,
+                node_name=node_name,
+                status=infer_event_status(node_name, output),
+                started_at=started_at,
+                elapsed_ms=elapsed_ms,
+                state=state,
+                input_summary=node_input,
+                output_summary=summarize_node_output(node_name, output),
+            )
             append_node_event(event)
             publish_trace_event(event)
             print_node_event(event)
@@ -858,30 +923,26 @@ def traced_node(
                 "trace_started_at": (
                     trace_started_at
                 ),
+                "current_span_id": span_id,
                 "trace_events": [event],
             }
         except Exception as exc:
             elapsed_ms = (
                 time.perf_counter() - started
             ) * 1000
-            event = {
-                "trace_id": trace_id,
-                "node": node_name,
-                "status": "failed",
-                "started_at": started_at,
-                "finished_at": utc_now_iso(),
-                "elapsed_ms": round(
-                    elapsed_ms,
-                    3,
-                ),
-                "input": safe_json_value(
-                    node_input
-                ),
-                "output": {},
-                "exception": (
-                    f"{type(exc).__name__}: {exc}"
-                ),
-            }
+            event = build_agent_trace_event(
+                trace_id=trace_id,
+                span_id=span_id,
+                parent_span_id=parent_span_id,
+                node_name=node_name,
+                status="failed",
+                started_at=started_at,
+                elapsed_ms=elapsed_ms,
+                state=state,
+                input_summary=node_input,
+                output_summary={},
+                exception=f"{type(exc).__name__}: {exc}",
+            )
             append_node_event(event)
             publish_trace_event(event)
             print_node_event(event)
@@ -921,7 +982,10 @@ def build_trace_record(
     result: dict[str, Any],
     total_elapsed_ms: float,
 ) -> dict[str, Any]:
+    events = result.get("trace_events", [])
     return {
+        "schema_version": AGENT_TRACE_SCHEMA_VERSION,
+        "project": AGENT_TRACE_PROJECT,
         "trace_id": (
             result.get("trace_id")
             or new_trace_id()
@@ -1043,11 +1107,39 @@ def build_trace_record(
         "rows_preview": _row_preview(
             result.get("rows", [])
         ),
-        "events": result.get(
-            "trace_events",
-            [],
-        ),
+        "events": events,
+        "trace_summary": trace_summary(events),
     }
+
+
+def trace_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Small replay-safe summary used by APIs and evaluation failure links."""
+
+    return {
+        "node_path": [str(event.get("node", "")) for event in events],
+        "node_count": len(events),
+        "failed_nodes": [str(event.get("node", "")) for event in events if event.get("status") == "failed"],
+        "rejected_nodes": [str(event.get("node", "")) for event in events if event.get("status") == "rejected"],
+        "total_node_elapsed_ms": round(sum(float(event.get("elapsed_ms", 0.0)) for event in events), 3),
+    }
+
+
+def load_trace_timeline(trace_id: str, log_dir: Path | None = None) -> list[dict[str, Any]]:
+    """Load one durable trace from JSONL without requiring a separate service."""
+
+    path = (log_dir or trace_log_dir()) / "node_events.jsonl"
+    if not path.exists():
+        return []
+    events: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("trace_id") == trace_id:
+                events.append(event)
+    return sorted(events, key=lambda event: (str(event.get("started_at", "")), str(event.get("span_id", ""))))
 
 
 def save_trace_record(

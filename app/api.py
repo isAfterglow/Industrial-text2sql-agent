@@ -20,7 +20,7 @@ from app.long_term_memory import get_long_term_memory_service
 from app.request_context import RequestIdentity, identity_scope
 from app.schema import set_active_profile
 from app.task_queue import TaskDispatcher
-from app.trace import safe_json_value
+from app.trace import safe_json_value, trace_summary
 
 
 ProfileName = Literal["resin", "steel_industry"]
@@ -139,6 +139,21 @@ def get_task(task_id: str, identity: RequestIdentity = Depends(current_user)) ->
     if not task or task["tenant_id"] != identity.tenant_id or (identity.role != "admin" and task["user_id"] != identity.user_id):
         raise HTTPException(status_code=404, detail="Task not found")
     return task
+
+
+@app.get("/api/tasks/{task_id}/trace")
+def get_task_trace(task_id: str, identity: RequestIdentity = Depends(current_user)) -> dict[str, Any]:
+    """Return the persisted request trace already authorized by task ownership."""
+
+    task = get_task(task_id, identity)
+    record = dict(task.get("result", {}).get("trace") or {})
+    events = list(record.get("events") or [])
+    return safe_json_value({
+        "trace_id": task.get("trace_id", ""),
+        "schema_version": record.get("schema_version", "agent_trace.v1"),
+        "summary": record.get("trace_summary") or trace_summary(events),
+        "events": events,
+    })
 
 @app.post("/api/tasks/{task_id}/cancel")
 def cancel_task(task_id: str, identity: RequestIdentity = Depends(current_user)) -> dict[str, Any]:

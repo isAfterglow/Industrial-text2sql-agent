@@ -5,7 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from eval.harness import SUITES, metrics_from_results
+from eval.harness import SUITES, metrics_from_results, regression_gate
 
 
 class EvaluationHarnessTests(unittest.TestCase):
@@ -36,6 +36,18 @@ class EvaluationHarnessTests(unittest.TestCase):
         self.assertEqual(metrics["repair_success_rate"], 1.0)
         self.assertEqual(metrics["safety_pass_rate"], 1.0)
         self.assertEqual(metrics["few_shot_hits"], 1)
+
+    def test_regression_gate_blocks_safety_and_basic_strict_regressions(self) -> None:
+        baseline = {"label": "base", "suites": {key: {
+            "acceptable_pass": 2, "safety_pass": 1, "timeouts": 0, "worker_errors": 0,
+            "segments": {"basic": {"strict_pass": 1}},
+        } for key in SUITES}}
+        candidate = json.loads(json.dumps(baseline))
+        candidate["suites"]["resin_80"]["safety_pass"] = 0
+        candidate["suites"]["steel_core_60"]["segments"]["basic"]["strict_pass"] = 0
+        outcome = regression_gate(baseline, candidate)
+        self.assertFalse(outcome["passed"])
+        self.assertEqual(len(outcome["failures"]), 2)
 
 
 if __name__ == "__main__":

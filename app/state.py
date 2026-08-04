@@ -171,6 +171,7 @@ class Text2SQLState(TypedDict, total=False):
     # Trace
     trace_id: str
     trace_started_at: str
+    current_span_id: str
     trace_events: Annotated[
         list[dict[str, Any]],
         operator.add,

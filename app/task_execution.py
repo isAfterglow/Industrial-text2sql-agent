@@ -37,6 +37,7 @@ def run_agent_task(task_id: str, store_path: str | None = None) -> None:
                 "question": task["question"], "requested_profile": task["profile"],
                 "session_id": f"{identity.tenant_id}:{identity.user_id}:{task['session_id']}",
                 "trace_id": task["trace_id"], "trace_started_at": utc_now_iso(), "trace_events": [],
+                "current_span_id": "",
                 "force_approval": bool(payload.get("force_approval", False)),
             }
             if payload.get("approval_mode"):

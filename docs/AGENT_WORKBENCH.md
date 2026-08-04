@@ -36,6 +36,7 @@ Open `http://127.0.0.1:5173`. FastAPI documentation is at
 | --- | --- | --- |
 | `POST` | `/api/tasks` | Start an asynchronous Agent task. |
 | `GET` | `/api/tasks/{id}` | Retrieve result, SQL, rows, diagnostics and Trace. |
+| `GET` | `/api/tasks/{id}/trace` | Retrieve the durable AgentTrace timeline and summary. |
 | `GET` | `/api/tasks/{id}/events` | Receive node and task events through SSE. |
 | `GET` | `/api/approvals` | Read the approval queue. |
 | `POST` | `/api/approvals/{id}/decision` | Approve, reject, or submit an edited `AdvancedPlan`. |

@@ -11,10 +11,12 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app.api import app
+from app.auth import issue_token
 from app.long_term_memory.config import get_long_term_memory_settings
 from app.long_term_memory.service import LongTermMemoryService
 from app.nodes import approval_gate
 from app.schema import set_active_profile
+from app.request_context import RequestIdentity
 
 
 class ApiApprovalEndToEndTests(unittest.TestCase):
@@ -24,7 +26,10 @@ class ApiApprovalEndToEndTests(unittest.TestCase):
             service = LongTermMemoryService(replace(
                 get_long_term_memory_settings(), enabled=False, db_path=root / "memory.sqlite3"
             ))
-            settings = SimpleNamespace(AGENT_TASK_DB_PATH=str(root / "tasks.sqlite3"), AGENT_MAX_CONCURRENT_TASKS=1)
+            settings = SimpleNamespace(
+                AGENT_TASK_DB_PATH=str(root / "tasks.sqlite3"), AGENT_MAX_CONCURRENT_TASKS=1,
+                USER_MAX_ACTIVE_TASKS=3, USER_TASKS_PER_MINUTE=20, TASK_QUEUE_MODE="local",
+            )
             approval_settings = SimpleNamespace(APPROVAL_MODE="risk")
 
             def fake_invoke(state, _config):
@@ -44,18 +49,22 @@ class ApiApprovalEndToEndTests(unittest.TestCase):
                 return {**state, **gate, "final_status": "first_pass_success", "final_answer": "Executed", "validated_sql": "SELECT 1", "columns": ["value"], "rows": [[1]], "row_count": 1, "trace_events": []}
 
             with patch("app.api.get_settings", return_value=settings), patch(
+                "app.task_queue.get_settings", return_value=settings
+            ), patch("app.task_execution.get_settings", return_value=settings), patch(
                 "app.api.get_long_term_memory_service", return_value=service
-            ), patch("app.api.graph.invoke", side_effect=fake_invoke), patch(
+            ), patch("app.task_execution.graph.invoke", side_effect=fake_invoke), patch(
                 "app.nodes.get_long_term_memory_service", return_value=service
             ), patch("app.nodes.get_settings", return_value=approval_settings):
                 with TestClient(app) as client:
+                    analyst_headers = {"Authorization": "Bearer " + issue_token(RequestIdentity("unit-analyst", "unit-tenant", "analyst"))}
+                    reviewer_headers = {"Authorization": "Bearer " + issue_token(RequestIdentity("unit-reviewer", "unit-tenant", "reviewer"))}
                     response = client.post("/api/tasks", json={
                         "question": "approval test", "profile": "resin", "force_approval": True,
-                    })
+                    }, headers=analyst_headers)
                     task_id = response.json()["task_id"]
                     task = {}
                     for _ in range(30):
-                        task = client.get(f"/api/tasks/{task_id}").json()
+                        task = client.get(f"/api/tasks/{task_id}", headers=analyst_headers).json()
                         if task["status"] == "approval_required":
                             break
                         time.sleep(0.05)
@@ -63,9 +72,9 @@ class ApiApprovalEndToEndTests(unittest.TestCase):
                     approval_id = task["result"]["approval_request"]["approval_id"]
                     decision = client.post(f"/api/approvals/{approval_id}/decision?profile=resin", json={
                         "action": "approved", "actor": "reviewer", "comment": "verified",
-                    })
+                    }, headers=reviewer_headers)
                     self.assertEqual(decision.json()["status"], "approved")
-                    resumed = client.post(f"/api/approvals/{approval_id}/resume?profile=resin")
+                    resumed = client.post(f"/api/approvals/{approval_id}/resume?profile=resin", headers=reviewer_headers)
                     self.assertEqual(resumed.status_code, 202)
 
 

@@ -10,7 +10,11 @@
       "repair_attempts": 2, "repair_successes": 2, "repair_success_rate": 1.0,
       "mean_turn_ms": 860.0, "p95_turn_ms": 4848.53,
       "safety_cases": 8, "safety_pass": 8, "safety_pass_rate": 1.0,
-      "few_shot_hits": 0, "few_shot_hit_rate": 0.0
+      "few_shot_hits": 0, "few_shot_hit_rate": 0.0,
+      "segments": {
+        "basic": {"cases": 36, "acceptable_pass": 36, "strict_pass": 29, "acceptable_rate": 1.0, "strict_rate": 0.8056},
+        "complex": {"cases": 32, "acceptable_pass": 32, "strict_pass": 25, "acceptable_rate": 1.0, "strict_rate": 0.7813}
+      }
     },
     "steel_core_60": {
       "suite": "steel_core_60", "cases": 60, "acceptable_pass": 60, "strict_pass": 60,
@@ -19,7 +23,10 @@
       "repair_attempts": 0, "repair_successes": 0, "repair_success_rate": null,
       "mean_turn_ms": 262.71, "p95_turn_ms": 316.96,
       "safety_cases": 4, "safety_pass": 4, "safety_pass_rate": 1.0,
-      "few_shot_hits": 0, "few_shot_hit_rate": 0.0
+      "few_shot_hits": 0, "few_shot_hit_rate": 0.0,
+      "segments": {
+        "basic": {"cases": 56, "acceptable_pass": 56, "strict_pass": 56, "acceptable_rate": 1.0, "strict_rate": 1.0}
+      }
     },
     "steel_complex_10": {
       "suite": "steel_complex_10", "cases": 10, "acceptable_pass": 10, "strict_pass": 9,
@@ -28,7 +35,10 @@
       "repair_attempts": 1, "repair_successes": 1, "repair_success_rate": 1.0,
       "mean_turn_ms": 3569.85, "p95_turn_ms": 7018.19,
       "safety_cases": 0, "safety_pass": 0, "safety_pass_rate": null,
-      "few_shot_hits": 0, "few_shot_hit_rate": 0.0
+      "few_shot_hits": 0, "few_shot_hit_rate": 0.0,
+      "segments": {
+        "complex": {"cases": 10, "acceptable_pass": 10, "strict_pass": 9, "acceptable_rate": 1.0, "strict_rate": 0.9}
+      }
     }
   }
 }

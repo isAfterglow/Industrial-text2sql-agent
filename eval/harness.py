@@ -33,6 +33,17 @@ SUITES = {
     },
 }
 
+# These labels describe evaluation intent, rather than implementation route.
+# They keep deterministic Profile coverage distinct from planning/memory flows.
+_SEGMENTS = {
+    "resin_80": {
+        "basic": {"single_table", "cross_table", "temporal"},
+        "complex": {"cross_temporal", "derived_metric", "full_table", "long_term_memory", "multi_turn", "repair_regression", "robustness"},
+    },
+    "steel_core_60": {"basic": set()},
+    "steel_complex_10": {"complex": set()},
+}
+
 
 def _read_json(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as handle:
@@ -41,6 +52,29 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _rate(numerator: int, denominator: int) -> float | None:
     return round(numerator / denominator, 4) if denominator else None
+
+
+def _segment_metrics(summary: dict[str, Any], suite_key: str) -> dict[str, dict[str, Any]]:
+    categories = dict(summary.get("by_category") or {})
+    configured = _SEGMENTS.get(suite_key, {})
+    if suite_key == "steel_core_60":
+        configured = {"basic": {name for name in categories if name != "safety"}}
+    elif suite_key == "steel_complex_10":
+        configured = {"complex": set(categories)}
+    segments: dict[str, dict[str, Any]] = {}
+    for label, names in configured.items():
+        values = [dict(categories[name]) for name in names if name in categories]
+        cases = sum(int(value.get("cases", 0)) for value in values)
+        acceptable = sum(int(value.get("acceptable_pass", 0)) for value in values)
+        strict = sum(int(value.get("strict_pass", 0)) for value in values)
+        segments[label] = {
+            "cases": cases,
+            "acceptable_pass": acceptable,
+            "strict_pass": strict,
+            "acceptable_rate": _rate(acceptable, cases),
+            "strict_rate": _rate(strict, cases),
+        }
+    return segments
 
 
 def metrics_from_results(path: Path, suite_key: str) -> dict[str, Any]:
@@ -82,6 +116,7 @@ def metrics_from_results(path: Path, suite_key: str) -> dict[str, Any]:
         "safety_pass_rate": _rate(int(safety.get("acceptable_pass", 0)), int(safety.get("cases", 0))),
         "few_shot_hits": few_shot_hits,
         "few_shot_hit_rate": _rate(few_shot_hits, len(turns)),
+        "segments": _segment_metrics(summary, suite_key),
     }
 
 
@@ -99,6 +134,7 @@ def collect(args: argparse.Namespace) -> int:
     if missing:
         raise ValueError("Missing suite artifacts: " + ", ".join(missing))
     payload = {
+        "evaluation_summary_version": 1,
         "version": 1,
         "label": args.label,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -140,6 +176,47 @@ def compare(args: argparse.Namespace) -> int:
     return 2 if regressions and args.fail_on_regression else 0
 
 
+def regression_gate(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate stable PR gates while allowing LLM-path strict variance.
+
+    Safety and acceptable semantics must never regress. Exact projection is a
+    hard gate only for deterministic basic segments; complex strict variance is
+    surfaced in the report but deliberately does not block a pull request.
+    """
+
+    failures: list[dict[str, Any]] = []
+    notices: list[dict[str, Any]] = []
+    for suite in SUITES:
+        old = dict(baseline["suites"][suite])
+        new = dict(candidate["suites"][suite])
+        for metric in ("acceptable_pass", "safety_pass"):
+            if int(new.get(metric, 0)) < int(old.get(metric, 0)):
+                failures.append({"suite": suite, "metric": metric, "baseline": old.get(metric), "candidate": new.get(metric)})
+        for metric in ("timeouts", "worker_errors"):
+            if int(new.get(metric, 0)) > 0:
+                failures.append({"suite": suite, "metric": metric, "baseline": 0, "candidate": new.get(metric)})
+        for segment, old_values in dict(old.get("segments") or {}).items():
+            new_values = dict(new.get("segments", {}).get(segment) or {})
+            if not new_values:
+                failures.append({"suite": suite, "metric": f"segment.{segment}.missing", "baseline": old_values, "candidate": None})
+                continue
+            if segment == "basic" and int(new_values.get("strict_pass", 0)) < int(old_values.get("strict_pass", 0)):
+                failures.append({"suite": suite, "metric": "basic.strict_pass", "baseline": old_values.get("strict_pass"), "candidate": new_values.get("strict_pass")})
+            if segment == "complex" and int(new_values.get("strict_pass", 0)) < int(old_values.get("strict_pass", 0)):
+                notices.append({"suite": suite, "metric": "complex.strict_pass", "baseline": old_values.get("strict_pass"), "candidate": new_values.get("strict_pass")})
+    return {"version": 1, "baseline": baseline.get("label", ""), "candidate": candidate.get("label", ""), "passed": not failures, "failures": failures, "notices": notices}
+
+
+def gate(args: argparse.Namespace) -> int:
+    outcome = regression_gate(_read_json(Path(args.baseline)), _read_json(Path(args.candidate)))
+    text = json.dumps(outcome, ensure_ascii=False, indent=2) + "\n"
+    if args.output:
+        write_json(Path(args.output), outcome)
+        print(f"Regression gate: {args.output}")
+    print(text)
+    return 0 if outcome["passed"] else 2
+
+
 def run(args: argparse.Namespace) -> int:
     root = Path(args.output_root).resolve() / args.label
     artifacts: list[str] = []
@@ -176,6 +253,11 @@ def build_parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("--output", default="")
     compare_parser.add_argument("--fail-on-regression", action="store_true")
     compare_parser.set_defaults(handler=compare)
+    gate_parser = commands.add_parser("gate", help="Apply deterministic/safety regression policy to two metric artifacts")
+    gate_parser.add_argument("--baseline", required=True)
+    gate_parser.add_argument("--candidate", required=True)
+    gate_parser.add_argument("--output", default="")
+    gate_parser.set_defaults(handler=gate)
     return parser
 
 

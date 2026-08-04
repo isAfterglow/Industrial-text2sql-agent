@@ -1,0 +1,51 @@
+name: Agent Full Regression
+
+on:
+  workflow_dispatch:
+    inputs:
+      memory_mode:
+        description: "Evaluation memory mode"
+        required: true
+        default: "production"
+        type: choice
+        options: [production, isolated]
+  schedule:
+    - cron: "0 18 * * 0"
+
+# This deliberately runs on the machine that hosts the seeded MySQL database,
+# Ollama, and optional API credentials. Hosted GitHub runners execute only the
+# deterministic contract gate in ci.yml.
+jobs:
+  full-evaluation:
+    runs-on: [self-hosted, agent-eval]
+    timeout-minutes: 45
+    env:
+      RUN_LABEL: ci-${{ github.run_id }}-${{ github.run_attempt }}
+      MEMORY_MODE: ${{ inputs.memory_mode || 'production' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run versioned material and steel benchmarks
+        run: >-
+          conda run -n scitime-agent python -m eval.harness run
+          --label "$RUN_LABEL"
+          --memory-mode "$MEMORY_MODE"
+      - name: Apply regression policy
+        run: >-
+          conda run -n scitime-agent python -m eval.harness gate
+          --baseline eval/baselines/v5.2-production-fewshot.json
+          --candidate "eval/harness_runs/$RUN_LABEL/metrics.json"
+          --output "eval/harness_runs/$RUN_LABEL/regression_gate.json"
+      - name: Render comparison
+        if: always()
+        run: >-
+          conda run -n scitime-agent python -m eval.harness compare
+          --baseline eval/baselines/v5.2-production-fewshot.json
+          --candidate "eval/harness_runs/$RUN_LABEL/metrics.json"
+          --output "eval/harness_runs/$RUN_LABEL/comparison.md"
+      - name: Upload reports and traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-evaluation-${{ github.run_id }}
+          path: eval/harness_runs/${{ env.RUN_LABEL }}/
+          if-no-files-found: warn
