@@ -31,4 +31,11 @@ data/appendonly.aof
 web/node_modules/
 web/dist/
 eval/harness_runs/
+eval/runs/
+eval/memory_ab/
+eval/memory_regression/
 logs/
+
+# Local smoke/runtime databases (the governed long-term-memory fixture is tracked separately)
+data/*_smoke.sqlite3
+data/result_anchors.sqlite3

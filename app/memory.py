@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
+import hashlib
 import re
 import uuid
 from typing import Any
@@ -18,6 +19,7 @@ from app.schema import (
     infer_requested_output_columns,
     match_question_semantic_columns,
     normalize_question_sample_ids,
+    active_profile_name,
 )
 
 
@@ -133,6 +135,15 @@ def new_session_id() -> str:
 
 def _empty_scope() -> dict[str, Any]:
     return {
+        "anchor_id": "",
+        "entity_type": "sample",
+        "entity_key": "sample_id",
+        "profile": "",
+        "schema_hash": "",
+        "parent_anchor_id": "",
+        "status": "empty",
+        "created_at": "",
+        "expires_at": "",
         "sample_ids": [],
         "ordered_sample_ids": [],
         "selection_order_by": None,
@@ -521,14 +532,33 @@ def _make_scope(
     row_count: int | None = None,
     truncated: bool = False,
     source_question: str = "",
+    parent_anchor_id: str = "",
 ) -> dict[str, Any]:
     ordered = list(dict.fromkeys(sample_ids))[:MAX_RESULT_SAMPLE_IDS]
+    is_truncated = bool(truncated or len(sample_ids) > MAX_RESULT_SAMPLE_IDS)
+    anchor_id = "anchor-" + uuid.uuid4().hex[:16] if ordered else ""
     return {
+        "anchor_id": anchor_id,
+        "entity_type": "sample",
+        "entity_key": "sample_id",
+        "profile": active_profile_name(),
+        "schema_hash": hashlib.sha256(json.dumps(get_schema_catalog(), ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16],
+        "parent_anchor_id": parent_anchor_id,
+        "status": "truncated" if is_truncated else ("active" if ordered else "empty"),
+        # Small result sets can be safely carried as bounded IDs. Large sets
+        # retain only a lookup handle and must be materialized by a future
+        # result-set store before they can be used in a follow-up query.
+        "storage_mode": "deferred_result_set" if is_truncated else ("inline_ids" if ordered else "empty"),
+        "lookup_key": anchor_id,
+        "entity_count": int(row_count if row_count is not None else len(sample_ids)),
+        "resolution_required": bool(is_truncated),
+        "created_at": _utc_now_iso(),
+        "expires_at": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(timespec="seconds") if ordered else "",
         "sample_ids": ordered,
         "ordered_sample_ids": ordered,
         "selection_order_by": deepcopy(selection_order_by),
         "row_count": int(len(ordered) if row_count is None else row_count),
-        "truncated": bool(truncated or len(sample_ids) > MAX_RESULT_SAMPLE_IDS),
+        "truncated": is_truncated,
         "source_question": source_question,
     }
 
@@ -1846,6 +1876,7 @@ def update_short_term_memory(
                 selection_order_by=updated.get("last_successful_query_state", {}).get("order_by"),
                 row_count=len(source_ids),
                 source_question=updated.get("last_resolved_question", ""),
+                parent_anchor_id=str(previous_last_scope.get("anchor_id", "")),
             )
         elif previous_parent_members and previous_parent_members != result_members:
             updated["parent_result_scope"] = previous_parent_scope
@@ -1863,6 +1894,7 @@ def update_short_term_memory(
         row_count=int(row_count),
         truncated=bool(truncated or sample_ids_truncated),
         source_question=resolved_question,
+        parent_anchor_id=str(previous_last_scope.get("anchor_id", "")) if delta.get("dependency") == "previous_result_set" else "",
     )
     updated["last_result_scope"] = current_scope
 

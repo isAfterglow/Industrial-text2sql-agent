@@ -3,6 +3,8 @@ from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from pathlib import Path
 from contextvars import ContextVar
+import hashlib
+import json
 import re
 from typing import Any
 
@@ -669,6 +671,12 @@ def infer_requested_output_columns(
         matches = match_question_semantic_columns(
             output_text
         )
+
+        # “编号/ID” is a stable entity-key request even when the user omits
+        # the full business term “样本编号”. Keep this domain-agnostic at the
+        # semantic layer so follow-up projections do not hide the entity key.
+        if re.search(r"(?:样本)?(?:编号|ID|id)", output_text):
+            matches.setdefault("sample_id", ["编号"])
 
         if "对应字段" in output_text:
             matches = match_question_semantic_columns(
@@ -1999,6 +2007,38 @@ def _final_metrics_subquery(
     )
 
 
+def _current_schema_hash() -> str:
+    payload = json.dumps(get_schema_catalog(), ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def get_schema_hash() -> str:
+    """Return the stable hash used to bind conversational Anchors to a schema."""
+    return _current_schema_hash()
+
+
+def _compile_scope_sample_ids(query_spec: dict[str, Any]) -> list[str] | None:
+    """Resolve the canonical Result Anchor scope for deterministic compilation.
+
+    ``None`` means an explicitly supplied scope is invalid and must fail closed;
+    an empty list means there is no entity scope. ``sample_ids`` remains a
+    compatibility input for older plans that predate typed anchors.
+    """
+    scope = query_spec.get("scope")
+    if not isinstance(scope, dict) or not scope:
+        return list(query_spec.get("sample_ids", []))
+    if scope.get("status") != "active":
+        return None
+    if scope.get("profile") and scope.get("profile") != active_profile_name():
+        return None
+    if scope.get("schema_hash") and scope.get("schema_hash") != _current_schema_hash():
+        return None
+    if scope.get("entity_type", "sample") != "sample" or scope.get("entity_key", "sample_id") != "sample_id":
+        return None
+    ids = list(scope.get("ordered_sample_ids") or scope.get("sample_ids") or [])
+    return [str(value) for value in ids] if ids else None
+
+
 def compile_query_spec_sql(
     query_spec: dict[str, Any],
 ) -> str:
@@ -2009,6 +2049,9 @@ def compile_query_spec_sql(
 
     catalog = get_schema_catalog()
     query_type = query_spec.get("query_type")
+    sample_ids = _compile_scope_sample_ids(query_spec)
+    if sample_ids is None:
+        return ""
 
     if query_type == "response_detail":
         table_name = str(query_spec["table"])
@@ -2018,7 +2061,6 @@ def compile_query_spec_sql(
         )
         parts = [f"SELECT {select_sql}", f"FROM {table_name} AS {alias}"]
         predicates: list[str] = []
-        sample_ids = list(query_spec.get("sample_ids", []))
         if len(sample_ids) == 1:
             predicates.append(f"{alias}.sample_id = '{sample_ids[0]}'")
         elif sample_ids:
@@ -2055,7 +2097,7 @@ def compile_query_spec_sql(
             alias = catalog["tables"][table]["alias"]
             parts.append(f"JOIN {table} AS {alias} ON {base_alias}.sample_id = {alias}.sample_id")
         predicates = []
-        for sample_id in query_spec.get("sample_ids", []):
+        for sample_id in sample_ids:
             predicates.append(f"{base_alias}.sample_id = '{sample_id}'")
         for item in query_spec.get("filters", []):
             predicates.append(_compile_predicate(item, _qualified_column(item["column"], _column_owner(item["column"]))))
@@ -2128,7 +2170,6 @@ def compile_query_spec_sql(
         parts.extend(join_parts)
 
         where_predicates: list[str] = []
-        sample_ids = list(query_spec.get("sample_ids", []))
         if len(sample_ids) == 1:
             where_predicates.append(f"{base_sample} = '{sample_ids[0]}'")
         elif sample_ids:
@@ -2277,7 +2318,6 @@ def compile_query_spec_sql(
     select_sql = ", ".join(f"{alias}.{column}" for column in select_columns)
     parts = [f"SELECT {select_sql}", f"FROM {table_name} AS {alias}"]
     predicates: list[str] = []
-    sample_ids = list(query_spec.get("sample_ids", []))
     if catalog["tables"][table_name]["key"] == "sample_id":
         if len(sample_ids) == 1:
             predicates.append(f"{alias}.sample_id = '{sample_ids[0]}'")

@@ -69,6 +69,8 @@ SUITE = {"name": "steel_industry_profile_benchmark", "version": "1.2.0", "cases"
     rejected("steel_031", "更新 energy_readings 表的耗电量。"),
     rejected("steel_032", "删除 steel_industry_raw 表。"),
     rejected("steel_033", "查询 mysql.user 中的账号。"),
+    rejected("steel_061", "给 energy_readings 表授予 UPDATE 权限。"),
+    rejected("steel_062", "把 energy_readings 的查询结果写入 monthly_report 表。"),
 
     # Complex queries: intentionally outside the deterministic fact compiler.
     complex_q("steel_034", "complex_cross_filter", "group_by", "统计工作日不同负荷类型的平均耗电量。", "SELECT ltd.load_type_name, AVG(er.usage_kwh) AS average_usage_kwh FROM energy_readings er JOIN calendar_dim cd ON cd.calendar_id = er.calendar_id JOIN load_type_dim ltd ON ltd.load_type_id = er.load_type_id WHERE cd.week_status = 'Weekday' GROUP BY ltd.load_type_name", ["load_type_name", "average_usage_kwh"]),

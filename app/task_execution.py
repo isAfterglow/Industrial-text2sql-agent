@@ -15,6 +15,11 @@ from app.request_context import RequestIdentity, identity_scope
 from app.schema import set_active_profile
 from app.task_store import AgentTaskStore
 from app.trace import save_trace_record, trace_event_sink, utc_now_iso
+from app.metrics import observe_model_calls, observe_task
+try:
+    from langgraph.errors import GraphRecursionError
+except ImportError:  # pragma: no cover - older LangGraph compatibility
+    GraphRecursionError = RuntimeError
 
 
 def run_agent_task(task_id: str, store_path: str | None = None) -> None:
@@ -52,13 +57,27 @@ def run_agent_task(task_id: str, store_path: str | None = None) -> None:
                 store.append_event(task_id, {"type": "node", "event": event})
 
             with trace_event_sink(event_sink):
-                result = graph.invoke(graph_input, {"recursion_limit": 32})
+                result = graph.invoke(graph_input, {"recursion_limit": getattr(get_settings(), "AGENT_MAX_GRAPH_STEPS", 32)})
         elapsed_ms = (time.perf_counter() - started) * 1000
         if store.is_cancel_requested(task_id):
             store.update_status(task_id, "cancelled", result={"elapsed_ms": round(elapsed_ms, 3)})
+            observe_task("cancelled", task["profile"], elapsed_ms)
             return
         public = public_result(result, elapsed_ms)
+        observe_model_calls(list(result.get("model_calls", [])))
         public["trace"] = save_trace_record(result, elapsed_ms)
-        store.update_status(task_id, "approval_required" if result.get("approval_required") else "completed", result=public)
+        terminal_status = "approval_required" if result.get("approval_required") else "completed"
+        store.update_status(task_id, terminal_status, result=public)
+        observe_task(terminal_status, task["profile"], elapsed_ms)
+    except GraphRecursionError as exc:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        store.update_status(task_id, "failed", result={
+            "elapsed_ms": round(elapsed_ms, 3),
+            "final_status": "agent_budget_exhausted",
+            "failure_events": [{"stage": "orchestration", "category": "non_convergent_plan", "error_type": "graph_recursion_limit", "repairable": False, "message": str(exc)[:500]}],
+        }, error_message=f"agent_budget_exhausted: {exc}")
+        observe_task("failed", task["profile"], elapsed_ms)
     except Exception as exc:
-        store.update_status(task_id, "failed", result={"elapsed_ms": round((time.perf_counter() - started) * 1000, 3)}, error_message=f"{type(exc).__name__}: {exc}")
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        store.update_status(task_id, "failed", result={"elapsed_ms": round(elapsed_ms, 3)}, error_message=f"{type(exc).__name__}: {exc}")
+        observe_task("failed", task["profile"], elapsed_ms)

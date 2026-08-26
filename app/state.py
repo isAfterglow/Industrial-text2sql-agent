@@ -27,6 +27,13 @@ class Text2SQLState(TypedDict, total=False):
     turn_type: str
     memory_used: bool
     context_resolution: dict[str, Any]
+    memory_conflicts: list[str]
+    resolved_references: list[dict[str, Any]]
+    reference_candidates: list[dict[str, Any]]
+    reference_confidence: float
+    reference_resolution_reason: str
+    display_columns: list[str]
+    internal_anchor_columns: list[str]
     context_resolution_valid: bool
     clarification_required: bool
     clarification_cancelled: bool
@@ -56,6 +63,7 @@ class Text2SQLState(TypedDict, total=False):
     procedural_memory_matches: list[dict[str, Any]]
     procedural_memory_context: str
     long_term_memory_retrieval_summary: dict[str, Any]
+    memory_quality_metrics: dict[str, Any]
     long_term_memory_write_summary: dict[str, Any]
 
     # 基础Schema与字段提示

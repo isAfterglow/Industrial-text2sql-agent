@@ -27,7 +27,7 @@ jobs:
         with: { python-version: "3.10" }
       - run: pip install -r requirements.txt
       - run: python -m compileall -q app eval tests tools
-      - run: python -m unittest tests.test_approval_workflow tests.test_api_workbench tests.test_api_approval_e2e tests.test_evaluation_harness tests.test_trace_contract -v
+      - run: PYTHONPATH=. pytest -q
 
   evaluation-contract:
     runs-on: ubuntu-latest
@@ -39,8 +39,8 @@ jobs:
       # This PR gate is deliberately offline: it validates the Trace v1 and
       # regression-policy contracts without pretending a hosted runner has the
       # seeded MySQL database or local Ollama models.
-      - run: python -m unittest tests.test_trace_contract tests.test_evaluation_harness -v
-      - run: python -m eval.harness gate --baseline eval/baselines/v5.2-production-fewshot.json --candidate eval/baselines/v5.2-production-fewshot.json --output /tmp/regression_gate.json
+      - run: PYTHONPATH=. pytest -q tests/test_trace_contract.py tests/test_evaluation_harness.py tests/test_memory_regression_contract.py tests/test_scope_compiler.py tests/test_result_anchor.py
+      - run: python -m eval.harness gate --baseline eval/baselines/v5.2-normalized-production.json --candidate eval/baselines/v5.2-normalized-production.json --output /tmp/regression_gate.json
 
   frontend-build:
     runs-on: ubuntu-latest

@@ -73,6 +73,8 @@ class ApprovalWorkflowTests(unittest.TestCase):
             )
             self.assertEqual(first["status"], "approved")
             self.assertEqual(second["status"], "approved")
+            audit = self.service.list_approval_audit(approval_id, tenant_id="default")
+            self.assertEqual([item["action"] for item in audit], ["created", "approved"])
 
             resumed_state = self._state()
             self.settings.APPROVAL_MODE = "off"

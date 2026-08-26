@@ -1,0 +1,10 @@
+{
+  "title": "Industrial Text2SQL Agent",
+  "schemaVersion": 39,
+  "panels": [
+    {"type":"timeseries","title":"Task rate","gridPos":{"h":8,"w":12,"x":0,"y":0},"targets":[{"expr":"rate(text2sql_tasks_total[5m])","legendFormat":"{{status}} / {{profile}}"}]},
+    {"type":"timeseries","title":"Task P95 latency","gridPos":{"h":8,"w":12,"x":12,"y":0},"targets":[{"expr":"histogram_quantile(0.95, sum(rate(text2sql_task_latency_seconds_bucket[5m])) by (le, profile))","legendFormat":"{{profile}}"}]},
+    {"type":"timeseries","title":"Queue depth","gridPos":{"h":8,"w":12,"x":0,"y":8},"targets":[{"expr":"text2sql_task_queue_depth"}]},
+    {"type":"timeseries","title":"Node P95 latency","gridPos":{"h":8,"w":12,"x":12,"y":8},"targets":[{"expr":"histogram_quantile(0.95, sum(rate(text2sql_trace_node_latency_seconds_bucket[5m])) by (le, node))","legendFormat":"{{node}}"}]}
+  ]
+}

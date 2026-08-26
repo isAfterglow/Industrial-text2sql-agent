@@ -1,0 +1,14 @@
+{
+  "version": "1.0",
+  "policy": "approved for structural reuse; parameter values and sample scopes are never copied",
+  "examples": [
+    {"memory_id": "mem-80ea8116796d4299", "domain": "steel_industry", "family": "group_topk", "structure": "dimension group + per-group Top-K window"},
+    {"memory_id": "mem-2619bd111d654908", "domain": "steel_industry", "family": "group_topk", "structure": "two dimensions + per-group Top-K window"},
+    {"memory_id": "mem-5b65ceb816054b35", "domain": "steel_industry", "family": "group_threshold", "structure": "fact value above group average threshold"},
+    {"memory_id": "mem-cbb7d4ef092148b7", "domain": "steel_industry", "family": "cumulative_share", "structure": "ordered cumulative contribution threshold"},
+    {"memory_id": "mem-14b8b368db114296", "domain": "steel_industry", "family": "correlation", "structure": "grouped Pearson correlation"},
+    {"memory_id": "mem-c1e47523a2964e3a", "domain": "steel_industry", "family": "conditional_comparison", "structure": "conditional weekday/weekend comparison"},
+    {"memory_id": "mem-3aa31202a23c4313", "domain": "resin", "family": "temporal", "structure": "final/initial point lookup with static projection"},
+    {"memory_id": "mem-697e894c1ebb487c", "domain": "resin", "family": "scalar_multi_table", "structure": "one-to-one cross-table Top-K projection"}
+  ]
+}

@@ -40,7 +40,10 @@ def publish_trace_event(event: dict[str, Any]) -> None:
     if sink is None:
         return
     try:
-        sink(safe_json_value(event))
+        normalized = safe_json_value(event)
+        sink(normalized)
+        from app.metrics import observe_trace_event
+        observe_trace_event(normalized)
     except Exception:
         # Observability must never interrupt query execution.
         return
@@ -217,6 +220,15 @@ def summarize_node_input(
             "query_delta": state.get("query_delta", {}),
         }
 
+    if node_name in {"retrieve_semantic_memory", "retrieve_few_shot_memory"}:
+        return {
+            **common,
+            "memory_quality_metrics": state.get("memory_quality_metrics", {}),
+            "long_term_memory_retrieval_summary": state.get(
+                "long_term_memory_retrieval_summary", {}
+            ),
+        }
+
     if node_name in {
         "build_query_plan",
         "generate_simple_sql",
@@ -355,6 +367,17 @@ def summarize_node_output(
             "inherited_fields": output.get("inherited_fields", []),
             "overridden_fields": output.get("overridden_fields", []),
             "resolved_query_spec": output.get("resolved_query_spec", {}),
+        }
+
+    if node_name in {"retrieve_semantic_memory", "retrieve_few_shot_memory"}:
+        return {
+            "memory_quality_metrics": output.get("memory_quality_metrics", {}),
+            "long_term_memory_retrieval_summary": output.get(
+                "long_term_memory_retrieval_summary", {}
+            ),
+            "few_shot_retrieval_diagnostics": output.get(
+                "few_shot_retrieval_diagnostics", {}
+            ),
         }
 
     if node_name == "build_query_plan":

@@ -1,5 +1,6 @@
 import re
 import json
+import time
 from typing import Any, Literal
 
 import sqlglot
@@ -53,6 +54,7 @@ from app.memory import (
     update_short_term_memory,
 )
 from app.session_store import get_session_memory_store
+from app.result_store import get_result_anchor_store
 from app.schema import (
     build_compact_sql_context,
     build_query_spec,
@@ -63,6 +65,7 @@ from app.schema import (
     extract_requested_sample_ids,
     extract_sql_schema_elements,
     get_schema_catalog,
+    get_schema_hash,
     get_column_owner_map,
     infer_requested_output_columns,
     match_question_semantic_columns,
@@ -179,6 +182,27 @@ def failure_event(
         "repairable": repairable,
         "message": error[:500],
     }
+
+
+def _enforce_agent_budget(state: Text2SQLState) -> bool:
+    """Stop non-convergent repair loops before another model call."""
+    settings = get_settings()
+    events = [item for item in state.get("failure_events", []) if isinstance(item, dict)]
+    categories = [str(item.get("category", "")) for item in events]
+    repeated = max((categories.count(value) for value in set(categories) if value), default=0)
+    model_ms = sum(float(item.get("elapsed_ms", 0) or 0) for item in model_call_log())
+    reason = ""
+    if repeated >= getattr(settings, "AGENT_MAX_SAME_ERROR_REPEATS", 2):
+        reason = "same_error_repeated"
+    elif model_ms >= getattr(settings, "AGENT_MAX_TOTAL_MODEL_TIME_SECONDS", 90) * 1000:
+        reason = "model_time_budget_exhausted"
+    if not reason:
+        return False
+    state["validation_error"] = f"Agent Budget已耗尽：{reason}"
+    state["validation_error_type"] = "agent_budget"
+    state["validation_repairable"] = False
+    state["failure_events"] = events + [failure_event("orchestration", state["validation_error"], reason, False)]
+    return True
 
 
 def parse_review_line(
@@ -316,6 +340,7 @@ def load_schema(
         "procedural_memory_matches": [],
         "procedural_memory_context": "",
         "long_term_memory_retrieval_summary": {},
+        "memory_quality_metrics": {},
         "long_term_memory_write_summary": {},
         "resolved_question": "",
         "resolved_query_spec": {},
@@ -668,6 +693,26 @@ def resolve_conversation_context(
         }
 
     query_delta = state.get("query_delta", {})
+    memory_conflicts: list[str] = []
+    if query_delta.get("explicit_reference") and query_delta.get("independent_complete"):
+        memory_conflicts.append("当前轮同时包含显式历史指代和完整独立查询条件，已优先保留当前轮字段并记录冲突。")
+    references: list[dict[str, Any]] = []
+    reference_candidates: list[dict[str, Any]] = []
+    if query_delta.get("explicit_reference"):
+        memory = state.get("conversation_memory", {})
+        kind = "single" if query_delta.get("same_sample") else "multi"
+        scope_key = "last_single_sample_scope" if kind == "single" else "last_multi_sample_scope"
+        scope = dict(memory.get(scope_key) or {})
+        if scope.get("anchor_id"):
+            references.append({
+                "reference_type": "result_anchor",
+                "anchor_id": scope["anchor_id"],
+                "entity_type": scope.get("entity_type", "sample"),
+                "entity_key": scope.get("entity_key", "sample_id"),
+                "resolution_method": "typed_scope",
+                "confidence": 0.95,
+            })
+            reference_candidates.append({"anchor_id": scope["anchor_id"], "score": 0.95, "source": scope_key})
 
     # The existing deterministic resolver encodes resin-specific field and
     # sample conventions. Applying its "unknown field" clarification to a
@@ -855,6 +900,69 @@ def resolve_conversation_context(
         # do not apply to normalized fact/dimension Profiles.
         resolved_spec = build_query_spec(resolved_question)
 
+    if references:
+        scope = dict(memory.get(
+            "last_single_sample_scope" if query_delta.get("same_sample") else "last_multi_sample_scope",
+            {},
+        ))
+        now_scope = scope.get("expires_at", "")
+        from datetime import datetime, timezone
+        expired = bool(now_scope and now_scope <= datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        profile_mismatch = bool(scope.get("profile") and scope.get("profile") != state.get("domain_profile"))
+        schema_mismatch = bool(scope.get("schema_hash") and scope.get("schema_hash") != get_schema_hash())
+        if expired or profile_mismatch or schema_mismatch or scope.get("status") == "truncated":
+            reason = (
+                "结果锚点已过期" if expired else
+                "结果锚点跨领域不可用" if profile_mismatch else
+                "结果锚点对应的Schema已变化" if schema_mismatch else
+                "结果锚点结果已截断，不能作为完整集合"
+            )
+            return {
+                "resolved_question": original_question,
+                "resolved_query_spec": {},
+                "turn_type": "clarification_required",
+                "memory_used": False,
+                "context_resolution": {"reason": reason},
+                "context_resolution_valid": False,
+                "clarification_required": True,
+                "clarification_question": reason + "，请重新查询或明确范围。",
+                "pending_clarification": {"reason": "invalid_result_anchor"},
+                "inherited_fields": [], "overridden_fields": [],
+                "resolved_references": [], "reference_candidates": [],
+                "reference_confidence": 0.0,
+                "reference_resolution_reason": "invalid_result_anchor",
+            }
+        # Keep the complete typed Anchor in QuerySpec. The reference metadata
+        # explains how it was resolved, while status/profile/schema/IDs are
+        # required by the compiler's fail-closed validation.
+        resolved_spec["scope"] = {**scope, **references[0]}
+        # Compatibility for current compilers; the canonical reference is the
+        # anchor, while IDs remain a bounded execution fallback.
+        resolved_spec["sample_ids"] = list(scope.get("sample_ids", []))
+
+    # Once a deterministic compiler has produced an explicit output_columns
+    # contract (including derived aliases), it is authoritative. Re-running
+    # lexical inference here can drop aliases such as AVG(...) AS metric_name.
+    strict_output_columns = (
+        resolved_spec.get("output_columns")
+        or infer_requested_output_columns(original_question)
+        or resolved_spec.get("select_columns", [])
+    )
+    display_columns = list(
+        strict_output_columns
+        if resolved_spec.get("strict_projection")
+        else (
+            resolved_spec.get("output_columns")
+            or resolved_spec.get("select_columns", [])
+            or infer_requested_output_columns(original_question)
+        )
+    )
+    if not resolved_spec.get("strict_projection"):
+        order_by = resolved_spec.get("order_by") or {}
+        order_column = str(order_by.get("column") or order_by.get("alias") or "")
+        if order_column and order_column not in display_columns:
+            display_columns.append(order_column)
+
     return {
         "conversation_memory": memory,
         "resolved_question": resolved_question,
@@ -862,6 +970,13 @@ def resolve_conversation_context(
         "turn_type": resolved.get("turn_type", "new_query"),
         "memory_used": bool(resolved.get("memory_used", False)),
         "context_resolution": resolved.get("context_resolution", {}),
+        "memory_conflicts": memory_conflicts,
+        "resolved_references": references,
+        "reference_candidates": reference_candidates,
+        "reference_confidence": float(references[0]["confidence"]) if references else 0.0,
+        "reference_resolution_reason": "typed_result_anchor" if references else "no_explicit_result_anchor",
+        "display_columns": display_columns,
+        "internal_anchor_columns": [str(references[0].get("entity_key", "sample_id"))] if references else [],
         "context_resolution_valid": bool(
             resolved.get("context_resolution_valid", True)
         ),
@@ -877,6 +992,8 @@ def resolve_conversation_context(
 
 
 def route_after_context_resolution(state: Text2SQLState) -> Literal["clarify", "continue"]:
+    if state.get("memory_conflicts") and state.get("query_delta", {}).get("explicit_reference"):
+        return "clarify"
     return "clarify" if state.get("clarification_required") else "continue"
 
 
@@ -898,6 +1015,7 @@ def retrieve_few_shot_memory(
 ) -> dict[str, Any]:
     """BGE-M3粗召回后使用QuerySignature硬过滤、结构重排和MMR选例。"""
 
+    started = time.perf_counter()
     try:
         service = get_long_term_memory_service()
         question = effective_question(state)
@@ -938,6 +1056,7 @@ def retrieve_few_shot_memory(
             question,
             query_spec,
         )
+        retrieval_ms = round((time.perf_counter() - started) * 1000, 3)
         context = service.build_few_shot_context(memories)
         summary = dict(state.get("long_term_memory_retrieval_summary", {}))
         summary.update(
@@ -947,6 +1066,8 @@ def retrieve_few_shot_memory(
                 "few_shot_skip_reason": diagnostics.get("skip_reason", ""),
                 "episodic_candidate_count": diagnostics.get("candidate_count", 0),
                 "episodic_structural_count": diagnostics.get("hard_compatible_count", 0),
+                "episodic_rejected_count": sum((diagnostics.get("rejected_reasons") or {}).values()),
+                "episodic_retrieval_ms": retrieval_ms,
             }
         )
         return {
@@ -954,6 +1075,14 @@ def retrieve_few_shot_memory(
             "few_shot_context": context,
             "few_shot_retrieval_diagnostics": diagnostics,
             "query_signature": diagnostics.get("query_signature", {}),
+            "memory_quality_metrics": {
+                "retrieval_latency_ms": retrieval_ms,
+                "candidate_count": diagnostics.get("candidate_count", 0),
+                "compatible_count": diagnostics.get("hard_compatible_count", 0),
+                "selected_count": diagnostics.get("selected_count", 0),
+                "rejected_count": sum((diagnostics.get("rejected_reasons") or {}).values()),
+                "useful_candidate": bool(memories),
+            },
             "long_term_memory_retrieval_summary": summary,
         }
     except Exception as exc:
@@ -2646,7 +2775,11 @@ def persist_session_memory(state: Text2SQLState) -> dict[str, Any]:
     if not memory:
         return {"session_store_summary": {"saved": False, "reason": "empty_memory"}}
     try:
-        return {"session_store_summary": get_session_memory_store().save(memory, state.get("domain_profile", ""))}
+        summary = get_session_memory_store().save(memory, state.get("domain_profile", ""))
+        scope = memory.get("last_result_scope") or {}
+        if scope.get("storage_mode") == "deferred_result_set":
+            summary["result_anchor"] = get_result_anchor_store().save(scope)
+        return {"session_store_summary": summary}
     except Exception as exc:
         # Session persistence is an availability enhancement, not a query blocker.
         return {"session_store_summary": {"saved": False, "error": f"{type(exc).__name__}: {exc}"}}
@@ -2660,10 +2793,25 @@ def update_long_term_memory(
     try:
         service = get_long_term_memory_service()
         summary = service.auto_save_from_state(dict(state))
+        matched_ids = list(state.get("semantic_memory_applied_ids", []))
+        matched_ids.extend(
+            str(item.get("memory_id", ""))
+            for item in state.get("episodic_memory_matches", [])
+            if isinstance(item, dict)
+        )
+        if matched_ids:
+            service.record_memory_retrieval_outcome(
+                [item for item in matched_ids if item], success=True
+            )
+            summary["retrieval_outcome"] = {
+                "memory_ids": [item for item in matched_ids if item],
+                "success": True,
+            }
         used_examples = state.get("advanced_plan_memory_matches", [])
         example_ids = [item.get("memory_id", "") for item in used_examples if isinstance(item, dict)]
         if example_ids:
             service.record_advanced_plan_usage(example_ids, success=True)
+            service.record_memory_retrieval_outcome(example_ids, success=True)
             summary["advanced_plan_memory_usage"] = {"used": example_ids, "success": True}
         return {"long_term_memory_write_summary": summary}
     except Exception as exc:
@@ -2695,6 +2843,11 @@ def format_result(
 ) -> dict[str, Any]:
     rows = state.get("rows", [])
     columns = state.get("columns", [])
+    display_columns = list(state.get("display_columns") or columns)
+    display_indexes = [columns.index(column) for column in display_columns if column in columns]
+    if display_indexes and len(display_indexes) < len(columns):
+        columns = [columns[index] for index in display_indexes]
+        rows = [[row[index] for index in display_indexes] for row in rows]
 
     if rows:
         result_text = tabulate(
@@ -2772,6 +2925,10 @@ def format_result(
 """.strip()
         ,
         "model_calls": model_call_log(),
+        "columns": columns,
+        "rows": rows,
+        "display_columns": columns,
+        "internal_anchor_columns": list(state.get("internal_anchor_columns", [])),
     }
 
 
@@ -2838,6 +2995,7 @@ def format_error(
     if example_ids:
         try:
             get_long_term_memory_service().record_advanced_plan_usage(example_ids, success=False)
+            get_long_term_memory_service().record_memory_retrieval_outcome(example_ids, success=False)
         except Exception:
             # Memory telemetry must never hide the primary query error.
             pass
@@ -2873,6 +3031,8 @@ def format_error(
 def route_after_validation(
     state: Text2SQLState,
 ) -> Literal["review", "repair", "error"]:
+    if _enforce_agent_budget(state):
+        return "error"
     if not state.get("validation_error"):
         return "review"
 
@@ -2894,6 +3054,8 @@ def route_after_validation(
 def route_after_review(
     state: Text2SQLState,
 ) -> Literal["execute", "repair", "error"]:
+    if _enforce_agent_budget(state):
+        return "error"
     if state.get("review_passed", False):
         return "execute"
 
@@ -2915,6 +3077,8 @@ def route_after_review(
 def route_after_execution(
     state: Text2SQLState,
 ) -> Literal["success", "repair", "error"]:
+    if _enforce_agent_budget(state):
+        return "error"
     if not state.get("execution_error"):
         return "success"
 
@@ -2935,6 +3099,8 @@ def route_after_execution(
 def route_after_result_assertions(
     state: Text2SQLState,
 ) -> Literal["success", "repair", "error"]:
+    if _enforce_agent_budget(state):
+        return "error"
     if state.get("result_assertion_passed", True):
         return "success"
     if state.get("retry_count", 0) < get_settings().SQL_MAX_REPAIR_ATTEMPTS:

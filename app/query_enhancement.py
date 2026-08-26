@@ -13,6 +13,7 @@ from sqlglot.errors import ParseError
 from app.schema import (
     canonical_metric_alias,
     get_schema_catalog,
+    _compile_scope_sample_ids,
     infer_requested_output_columns,
     match_question_semantic_columns,
 )
@@ -726,7 +727,10 @@ def compile_extended_query_sql(spec: dict[str, Any]) -> str:
         select_items = ["ms.sample_id"]
 
     where_parts: list[str] = []
-    sample_ids = [str(value) for value in spec.get("sample_ids", []) if str(value)]
+    scoped_ids = _compile_scope_sample_ids(spec)
+    if scoped_ids is None:
+        return ""
+    sample_ids = [str(value) for value in scoped_ids if str(value)]
     if len(sample_ids) == 1:
         where_parts.append(f"ms.sample_id = '{sample_ids[0]}'")
     elif sample_ids:

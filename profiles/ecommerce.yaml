@@ -1,0 +1,42 @@
+name: ecommerce
+database_name: EcommerceDemo
+database_type: MySQL
+description: 用于验证跨领域 Profile 接入的最小电商订单示例，不代表已接入真实业务库。
+routing_terms: [订单, 商品, 客户, 电商]
+tables:
+  orders:
+    alias: o
+    grain: one_row_per_order
+    key: order_id
+    description: 电商订单事实表。
+    columns: {order_id: 订单编号, customer_id: 客户编号, product_id: 商品编号, order_amount: 订单金额, created_at: 下单时间}
+  customers:
+    alias: c
+    grain: one_row_per_customer
+    key: customer_id
+    description: 客户维度表。
+    columns: {customer_id: 客户编号, customer_name: 客户名称, email: 客户邮箱}
+  products:
+    alias: p
+    grain: one_row_per_product
+    key: product_id
+    description: 商品维度表。
+    columns: {product_id: 商品编号, product_name: 商品名称, category: 商品类别}
+relationships:
+  - {left: orders.customer_id, right: customers.customer_id, cardinality: many_to_one}
+  - {left: orders.product_id, right: products.product_id, cardinality: many_to_one}
+semantic_terms:
+  order_id: [订单编号, 订单ID]
+  customer_id: [客户编号, 客户ID]
+  customer_name: [客户名称]
+  product_name: [商品名称]
+  category: [商品类别, 类别]
+  order_amount: [订单金额, 销售额, 金额]
+  created_at: [下单时间, 创建时间]
+aggregations: {order_amount: [SUM, AVG, MAX, MIN]}
+derived_metrics: {customer_total_amount: {formula: 'SUM(order_amount)', dependencies: [order_amount]}}
+temporal_semantics: {}
+policy:
+  allowed_tables: [orders, customers, products]
+  sensitive_columns: [email]
+  forbidden_operations: [INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, SLEEP, GRANT, REVOKE]

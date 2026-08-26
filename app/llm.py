@@ -52,6 +52,19 @@ def _append_call(record: dict[str, object]) -> None:
         _model_call_logs.setdefault(_MODEL_LOG_SCOPE.get(), []).append(record)
 
 
+def _usage_fields(response: object, messages: list[BaseMessage], text: str) -> dict[str, int | bool]:
+    """Normalize provider usage; local Ollama often omits it, so estimate."""
+    metadata = getattr(response, "response_metadata", None) or {}
+    usage = getattr(response, "usage_metadata", None) or (metadata.get("token_usage", {}) if isinstance(metadata, dict) else {})
+    prompt = usage.get("input_tokens", usage.get("prompt_tokens")) if isinstance(usage, dict) else None
+    completion = usage.get("output_tokens", usage.get("completion_tokens")) if isinstance(usage, dict) else None
+    estimated = prompt is None or completion is None
+    prompt_tokens = int(prompt or sum(len(str(m.content)) for m in messages) / 4)
+    completion_tokens = int(completion or len(text) / 4)
+    return {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens, "tokens_estimated": estimated}
+
+
 @contextmanager
 def model_call_scope(scope: str):
     token = _MODEL_LOG_SCOPE.set(scope)
@@ -200,6 +213,7 @@ def invoke_model(
             "fallback_used": len(attempted_roles) > 1,
             "elapsed_ms": round((perf_counter() - started) * 1000, 3),
             "queue_wait_ms": queue_wait_ms,
+            **_usage_fields(response, messages, text),
         })
         return text
     except Exception as exc:
@@ -237,6 +251,7 @@ def invoke_model(
                     "fallback_used": True,
                     "elapsed_ms": round((perf_counter() - retry_started) * 1000, 3),
                     "queue_wait_ms": queue_wait_ms,
+                    **_usage_fields(response, messages, text),
                 })
                 return text
             except Exception as fallback_exc:

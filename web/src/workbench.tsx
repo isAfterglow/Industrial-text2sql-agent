@@ -7,7 +7,7 @@ import {
   CheckCircleOutlined, ClockCircleOutlined, DatabaseOutlined, PlayCircleOutlined,
   SafetyCertificateOutlined, SendOutlined, ThunderboltOutlined,
 } from "@ant-design/icons";
-import { api, type Approval, type Profile, type Task } from "./api";
+import { api, type Approval, type ApprovalAudit, type Profile, type Task } from "./api";
 
 const { Header, Sider, Content } = Layout;
 const { TextArea } = Input;
@@ -105,7 +105,12 @@ function ApprovalDrawer({ approval, profile, onClose, onResumed }: {
   const [comment, setComment] = useState("");
   const [plan, setPlan] = useState("");
   const [busy, setBusy] = useState(false);
+  const [audit, setAudit] = useState<ApprovalAudit[]>([]);
   useEffect(() => setPlan(JSON.stringify(approval?.payload.advanced_plan || {}, null, 2)), [approval]);
+  useEffect(() => {
+    if (!approval) { setAudit([]); return; }
+    void api.approvalAudit(approval.approval_id, profile).then(setAudit).catch(() => setAudit([]));
+  }, [approval, profile]);
 
   async function decide(action: "approved" | "rejected" | "edited_plan") {
     if (!approval) return;
@@ -130,9 +135,15 @@ function ApprovalDrawer({ approval, profile, onClose, onResumed }: {
       <Alert type="warning" showIcon message={String((approval.payload.risk as Record<string, unknown> | undefined)?.reasons?.toString() || "Execution risk requires review")} />
       <div><Text type="secondary">QUESTION</Text><p>{String(approval.payload.question || "")}</p></div>
       <div><Text type="secondary">COMPILED SQL</Text><pre className="sql-block">{String(approval.payload.compiled_sql || "")}</pre></div>
+      <div><Text type="secondary">EVIDENCE</Text><JsonBlock value={approval.payload.evidence || {}} /></div>
+      <div><Text type="secondary">PLAN SNAPSHOT / FINGERPRINT</Text><p><Text code>{String(approval.payload.plan_fingerprint || "")}</Text></p><JsonBlock value={approval.payload.advanced_plan || approval.payload.query_spec || {}} /></div>
       <div><Text type="secondary">REVIEWER</Text><Input value={actor} onChange={(event) => setActor(event.target.value)} /></div>
       <div><Text type="secondary">COMMENT</Text><TextArea value={comment} onChange={(event) => setComment(event.target.value)} rows={2} /></div>
-      <div><Text type="secondary">ADVANCED PLAN (only for an edited plan)</Text><TextArea className="plan-editor" value={plan} onChange={(event) => setPlan(event.target.value)} rows={10} /></div>
+      <div><Text type="secondary">EDITED PLAN (server revalidates and requires a new fingerprint)</Text><TextArea className="plan-editor" value={plan} onChange={(event) => setPlan(event.target.value)} rows={10} /></div>
+      <div><Text type="secondary">AUDIT TRAIL</Text><Timeline items={audit.map((item) => ({
+        color: item.action === "rejected" ? "red" : "green",
+        children: <div><b>{item.action}</b> by {item.actor_id}<br /><Text type="secondary">{item.created_at}</Text>{item.comment && <p>{item.comment}</p>}</div>,
+      }))} /></div>
       <Space wrap>
         <Button type="primary" icon={<CheckCircleOutlined />} loading={busy} onClick={() => decide("approved")}>Approve and run</Button>
         <Button icon={<SafetyCertificateOutlined />} loading={busy} onClick={() => decide("edited_plan")}>Save edited plan</Button>

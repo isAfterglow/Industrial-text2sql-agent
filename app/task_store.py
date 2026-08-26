@@ -91,6 +91,7 @@ class AgentTaskStore:
                  json.dumps(payload, ensure_ascii=False), now, now),
             )
         self.append_event(task_id, {"type": "task", "status": "queued", "at": now})
+        self._refresh_queue_depth()
         return self.get_task(task_id) or {}
 
     def get_task(self, task_id: str) -> dict[str, Any] | None:
@@ -157,10 +158,15 @@ class AgentTaskStore:
         with self._connect() as connection:
             connection.execute(f"UPDATE agent_tasks SET {', '.join(fields)} WHERE task_id = ?", values)
         self.append_event(task_id, {"type": "task", "status": status, "at": now, "error": error_message})
+        self._refresh_queue_depth()
 
     def append_event(self, task_id: str, payload: dict[str, Any]) -> None:
         now = utc_now()
+        # Serialize the read-then-insert sequence allocation across API and
+        # worker processes. Without this, concurrent node events can collide
+        # on the same (task_id, sequence) primary key.
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             sequence = connection.execute(
                 "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM agent_task_events WHERE task_id = ?",
                 (task_id,),
@@ -169,6 +175,17 @@ class AgentTaskStore:
                 "INSERT INTO agent_task_events (task_id, sequence, payload_json, created_at) VALUES (?, ?, ?, ?)",
                 (task_id, sequence, json.dumps(payload, ensure_ascii=False, default=str), now),
             )
+
+    def _refresh_queue_depth(self) -> None:
+        try:
+            from app.metrics import TASK_QUEUE_DEPTH
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS n FROM agent_tasks WHERE status IN ('queued', 'running')"
+                ).fetchone()
+            TASK_QUEUE_DEPTH.set(int(row["n"]))
+        except Exception:
+            return
 
     def events_after(self, task_id: str, sequence: int = 0) -> list[dict[str, Any]]:
         with self._connect() as connection:

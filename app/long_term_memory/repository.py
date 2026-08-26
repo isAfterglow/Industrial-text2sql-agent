@@ -86,6 +86,20 @@ class SQLiteMemoryRepository:
                 );
                 CREATE INDEX IF NOT EXISTS idx_approval_status
                 ON approval_requests(namespace, status, created_at);
+
+                CREATE TABLE IF NOT EXISTS approval_audit_events (
+                    audit_id TEXT PRIMARY KEY,
+                    approval_id TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    comment TEXT NOT NULL DEFAULT '',
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_approval_audit
+                ON approval_audit_events(approval_id, created_at);
                 """
             )
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(approval_requests)")}
@@ -224,16 +238,22 @@ class SQLiteMemoryRepository:
         if not types:
             return []
         placeholders = ",".join("?" for _ in types)
+        # Accept the pre-tenant namespace during the one-way compatibility
+        # window. Existing approved memories were created before identity
+        # isolation was introduced; without this fallback they silently look
+        # like zero retrievals after the migration.
+        namespace_clause = "(namespace = ? OR namespace = ?)"
         sql = f"""
             SELECT * FROM long_term_memories
-            WHERE namespace = ?
+            WHERE {namespace_clause}
               AND memory_type IN ({placeholders})
               AND is_active = 1
               AND (schema_hash = '' OR schema_hash = ?)
             ORDER BY updated_at DESC
             LIMIT ?
         """
-        params: list[object] = [namespace, *types, schema_hash, int(limit)]
+        legacy_namespace = namespace.split(":tenant:", 1)[0] if ":tenant:" in namespace else namespace
+        params: list[object] = [namespace, legacy_namespace, *types, schema_hash, int(limit)]
         with self._connect() as connection:
             rows = connection.execute(sql, params).fetchall()
         return [self._row_to_record(row) for row in rows]
@@ -285,12 +305,14 @@ class SQLiteMemoryRepository:
                 "INSERT INTO approval_requests(approval_id, namespace, profile, user_id, tenant_id, status, payload_json, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
                 (approval_id, namespace, profile, user_id, tenant_id, json.dumps(payload, ensure_ascii=False, sort_keys=True), now),
             )
+        self.append_approval_audit(approval_id, namespace, tenant_id, user_id, "created", "", payload)
         return {"approval_id": approval_id, "status": "pending", "created_at": now, "payload": payload}
 
     def decide_approval_request(
         self, approval_id: str, decision: dict[str, object]
     ) -> dict[str, object] | None:
         now = _utc_now_iso()
+        audit: tuple[str, str, str, str, dict[str, object]] | None = None
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM approval_requests WHERE approval_id = ?", (approval_id,)).fetchone()
             if row is None:
@@ -305,7 +327,37 @@ class SQLiteMemoryRepository:
                 (status, json.dumps(decision, ensure_ascii=False, sort_keys=True), now, approval_id),
             )
             row = connection.execute("SELECT * FROM approval_requests WHERE approval_id = ?", (approval_id,)).fetchone()
+            if row is not None:
+                audit = (str(row["namespace"]), str(row["tenant_id"]), str(decision.get("actor", "system")), status, decision)
+        if audit is not None:
+            namespace, tenant_id, actor, status, payload = audit
+            self.append_approval_audit(approval_id, namespace, tenant_id, actor, status, str(payload.get("comment", "")), payload)
         return self._approval_row(row) if row else None
+
+    def append_approval_audit(
+        self, approval_id: str, namespace: str, tenant_id: str, actor_id: str,
+        action: str, comment: str = "", payload: dict[str, object] | None = None,
+    ) -> None:
+        now = _utc_now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO approval_audit_events(audit_id, approval_id, namespace, tenant_id, actor_id, action, comment, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("audit-" + uuid.uuid4().hex[:16], approval_id, namespace, tenant_id,
+                 actor_id, action, comment, json.dumps(payload or {}, ensure_ascii=False, sort_keys=True), now),
+            )
+
+    def list_approval_audit(self, approval_id: str, *, tenant_id: str, limit: int = 100) -> list[dict[str, object]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM approval_audit_events WHERE approval_id = ? AND tenant_id = ? ORDER BY created_at ASC LIMIT ?",
+                (approval_id, tenant_id, int(limit)),
+            ).fetchall()
+        return [{
+            "audit_id": row["audit_id"], "approval_id": row["approval_id"],
+            "actor_id": row["actor_id"], "action": row["action"],
+            "comment": row["comment"], "payload": json.loads(row["payload_json"] or "{}"),
+            "created_at": row["created_at"],
+        } for row in rows]
 
     def get_approval_request(self, approval_id: str) -> dict[str, object] | None:
         with self._connect() as connection:
@@ -343,6 +395,13 @@ class SQLiteMemoryRepository:
             connection.execute(
                 "UPDATE long_term_memories SET metadata_json = ?, updated_at = ? WHERE memory_id = ?",
                 (json.dumps(metadata, ensure_ascii=False, sort_keys=True), _utc_now_iso(), memory_id),
+            )
+
+    def set_memory_active(self, memory_id: str, active: bool) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE long_term_memories SET is_active = ?, updated_at = ? WHERE memory_id = ?",
+                (1 if active else 0, _utc_now_iso(), memory_id),
             )
 
     @staticmethod

@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,6 +17,10 @@ class Settings(BaseSettings):
         extra="ignore",
         case_sensitive=False,
     )
+
+    ENVIRONMENT: str = "development"
+    CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
+    PROMETHEUS_MULTIPROC_DIR: str = ""
 
     # ==================================================
     # LLM
@@ -70,6 +75,11 @@ class Settings(BaseSettings):
 
     # SQL校验或执行失败后，最多允许LLM修复多少次
     SQL_MAX_REPAIR_ATTEMPTS: int = 3
+    # Agent-loop circuit breakers. These are separate from LangGraph's
+    # recursion limit so repeated plan/repair cycles become a typed failure.
+    AGENT_MAX_GRAPH_STEPS: int = 32
+    AGENT_MAX_SAME_ERROR_REPEATS: int = 2
+    AGENT_MAX_TOTAL_MODEL_TIME_SECONDS: int = 90
 
     # ==================================================
     # Session memory (Redis preferred, SQLite fallback)
@@ -96,6 +106,17 @@ class Settings(BaseSettings):
     MODEL_PRIMARY_3B_CONCURRENCY: int = 1
     MODEL_FALLBACK_7B_CONCURRENCY: int = 1
     MODEL_DEEPSEEK_CONCURRENCY: int = 3
+
+    @model_validator(mode="after")
+    def validate_production_secrets(self) -> "Settings":
+        if self.ENVIRONMENT.lower() in {"production", "prod"}:
+            if self.JWT_SECRET == "change-this-in-production" or len(self.JWT_SECRET) < 32:
+                raise ValueError("JWT_SECRET must be a non-default secret of at least 32 characters in production")
+            if self.AUTH_BOOTSTRAP_DEMO_USERS:
+                raise ValueError("AUTH_BOOTSTRAP_DEMO_USERS must be false in production")
+            if not self.CORS_ORIGINS.strip():
+                raise ValueError("CORS_ORIGINS must be configured in production")
+        return self
 
     @property
     def allowed_tables(self) -> tuple[str, ...]:

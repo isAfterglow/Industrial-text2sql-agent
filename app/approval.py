@@ -111,6 +111,13 @@ def build_approval_snapshot(state: dict[str, Any]) -> dict[str, Any]:
         "failure_events": list(state.get("failure_events", [])),
         "model_calls": list(state.get("model_calls", [])),
         "risk": risk,
+        "evidence": {
+            "selected_columns": sorted(_selected_columns(state)),
+            "tables": sorted(str(item) for item in state.get("intent_related_tables", [])),
+            "validated": bool(state.get("validated_sql")),
+            "result_assertion": dict(state.get("result_assertion") or {}),
+            "failure_categories": sorted({str(item.get("category", "unknown")) for item in state.get("failure_events", []) if isinstance(item, dict)}),
+        },
     }
     snapshot["plan_fingerprint"] = plan_fingerprint(snapshot)
     return snapshot

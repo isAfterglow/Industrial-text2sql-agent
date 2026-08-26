@@ -11,7 +11,7 @@
 - **记忆与多轮对话**：短期会话状态支持“这些样本”“它”等指代；长期记忆区分语义、情景和程序性记忆，候选 few-shot 需经过独立验证和审批后才能提升。
 - **安全与人工审批**：只读 SQL Guard、表/字段白名单、危险函数拦截、行数限制；高风险计划在执行前进入不可变审批快照，审批者只能修改结构化计划而不能直接改 SQL。
 - **可观测性**：`AgentTrace v1` 为每个节点记录 Trace/Span、路由、模型角色、安全与审批决策、耗时和失败码；JSONL、SSE、任务存储使用同一 `trace_id`。
-- **工程化评测**：材料 80 题、钢铁标准 60 题、钢铁高级分析 10 题；严格/可接受通过率、安全、修复、LLM 调用和延迟均版本化记录，并可用于 CI 回归门禁。
+- **工程化评测**：当前 release benchmark 为材料 82 题、钢铁 Profile 62 题、钢铁高级分析 10 题；其中安全边界独立统计，总计 154 题。历史 80/60/10 结果保留在 legacy baseline，不与当前 release 混用。
 
 ## Architecture
 
@@ -34,17 +34,17 @@ flowchart LR
     G -. events .-> T[AgentTrace v1: JSONL + SSE]
 ```
 
-## Evaluation Snapshot
+## Evaluation Snapshot (historical comparison)
 
-冻结基线：`v5.2-production-fewshot`。`可接受通过`允许不改变查询语义的额外投影；`严格通过`还要求返回列严格匹配。
+当前 release 基线：`eval/baselines/v5.2-normalized-production.json`。`可接受通过`允许不改变查询语义的额外投影；`严格通过`还要求返回列严格匹配。历史 few-shot 版本 `v5.2-production-fewshot` 仅用于版本对比。
 
 | Domain / suite | Cases | Acceptable pass | Strict pass | Safety pass |
 |---|---:|---:|---:|---:|
-| Resin engineering benchmark | 80 | 80/80 (100%) | 65/80 (81.3%) | 8/8 (100%) |
-| Steel Profile benchmark | 60 | 60/60 (100%) | 60/60 (100%) | 4/4 (100%) |
-| Steel advanced Agent challenge | 10 | 10/10 (100%) | 9/10 (90.0%) | N/A |
+| Resin engineering benchmark (legacy) | 80 | 80/80 (100%) | 65/80 (81.3%) | 8/8 (100%) |
+| Steel Profile benchmark (legacy) | 60 | 60/60 (100%) | 60/60 (100%) | 4/4 (100%) |
+| Steel advanced Agent challenge (legacy) | 10 | 10/10 (100%) | 9/10 (90.0%) | N/A |
 
-材料查询中，基础 QuerySpec 覆盖 36 题：可接受 `36/36`、严格 `29/36`；复杂的跨时序/派生指标/多轮/记忆/鲁棒表达覆盖 32 题：可接受 `32/32`、严格 `25/32`。完整对比与耗时见 [few-shot 版本报告](eval/FEWSHOT_VERSION_COMPARISON.md)。
+当前 release 的 154 题 normalized 结果以 `eval/harness_runs/<run-label>/metrics.json` 为准；完整对比与耗时见 [评测布局](eval/EVALUATION_LAYOUT_V2.md) 和 [few-shot 版本报告](eval/FEWSHOT_VERSION_COMPARISON.md)。
 
 ## Two Reproducible Cases
 

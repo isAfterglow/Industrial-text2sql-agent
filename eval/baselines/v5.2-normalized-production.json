@@ -1,0 +1,209 @@
+{
+  "evaluation_summary_version": 1,
+  "version": 1,
+  "label": "production-p0-p4-20260825",
+  "created_at": "2026-08-25T13:47:10+00:00",
+  "suites": {
+    "resin_basic": {
+      "suite": "resin_basic",
+      "source_results": "/home/ai4mater/005-mat4ai_agent/1-graph-agent/resin-material-agent/eval/harness_runs/production-p0-p4-20260825/resin_basic/results.json",
+      "cases": 45,
+      "acceptable_pass": 44,
+      "strict_pass": 34,
+      "acceptable_rate": 0.9778,
+      "strict_rate": 0.7556,
+      "timeouts": 0,
+      "worker_errors": 0,
+      "model_role_calls": {
+        "primary_3b": 14
+      },
+      "model_calls": 14,
+      "repair_attempts": 0,
+      "repair_successes": 0,
+      "repair_success_rate": null,
+      "mean_turn_ms": 1058.211,
+      "p95_turn_ms": 7849.945,
+      "safety_cases": 0,
+      "safety_pass": 0,
+      "safety_pass_rate": null,
+      "few_shot_hits": 0,
+      "few_shot_hit_rate": 0.0,
+      "segments": {
+        "basic": {
+          "cases": 45,
+          "acceptable_pass": 44,
+          "strict_pass": 34,
+          "acceptable_rate": 0.9778,
+          "strict_rate": 0.7556
+        }
+      }
+    },
+    "resin_complex": {
+      "suite": "resin_complex",
+      "source_results": "/home/ai4mater/005-mat4ai_agent/1-graph-agent/resin-material-agent/eval/harness_runs/production-p0-p4-20260825/resin_complex/results.json",
+      "cases": 27,
+      "acceptable_pass": 22,
+      "strict_pass": 17,
+      "acceptable_rate": 0.8148,
+      "strict_rate": 0.6296,
+      "timeouts": 0,
+      "worker_errors": 0,
+      "model_role_calls": {
+        "primary_3b": 15,
+        "deepseek_api": 3,
+        "fallback_7b": 3
+      },
+      "model_calls": 21,
+      "repair_attempts": 3,
+      "repair_successes": 0,
+      "repair_success_rate": 0.0,
+      "mean_turn_ms": 3013.777,
+      "p95_turn_ms": 28001.918,
+      "safety_cases": 0,
+      "safety_pass": 0,
+      "safety_pass_rate": null,
+      "few_shot_hits": 0,
+      "few_shot_hit_rate": 0.0,
+      "segments": {
+        "complex": {
+          "cases": 27,
+          "acceptable_pass": 22,
+          "strict_pass": 17,
+          "acceptable_rate": 0.8148,
+          "strict_rate": 0.6296
+        }
+      }
+    },
+    "resin_safety": {
+      "suite": "resin_safety",
+      "source_results": "/home/ai4mater/005-mat4ai_agent/1-graph-agent/resin-material-agent/eval/harness_runs/production-p0-p4-20260825/resin_safety/results.json",
+      "cases": 8,
+      "acceptable_pass": 8,
+      "strict_pass": 7,
+      "acceptable_rate": 1.0,
+      "strict_rate": 0.875,
+      "timeouts": 0,
+      "worker_errors": 0,
+      "model_role_calls": {},
+      "model_calls": 0,
+      "repair_attempts": 0,
+      "repair_successes": 0,
+      "repair_success_rate": null,
+      "mean_turn_ms": 53.786,
+      "p95_turn_ms": 235.659,
+      "safety_cases": 8,
+      "safety_pass": 8,
+      "safety_pass_rate": 1.0,
+      "few_shot_hits": 0,
+      "few_shot_hit_rate": 0.0,
+      "segments": {
+        "safety": {
+          "cases": 8,
+          "acceptable_pass": 8,
+          "strict_pass": 7,
+          "acceptable_rate": 1.0,
+          "strict_rate": 0.875
+        }
+      }
+    },
+    "steel_basic": {
+      "suite": "steel_basic",
+      "source_results": "/home/ai4mater/005-mat4ai_agent/1-graph-agent/resin-material-agent/eval/harness_runs/production-p0-p4-20260825/steel_basic/results.json",
+      "cases": 29,
+      "acceptable_pass": 29,
+      "strict_pass": 29,
+      "acceptable_rate": 1.0,
+      "strict_rate": 1.0,
+      "timeouts": 0,
+      "worker_errors": 0,
+      "model_role_calls": {},
+      "model_calls": 0,
+      "repair_attempts": 0,
+      "repair_successes": 0,
+      "repair_success_rate": null,
+      "mean_turn_ms": 269.893,
+      "p95_turn_ms": 429.247,
+      "safety_cases": 0,
+      "safety_pass": 0,
+      "safety_pass_rate": null,
+      "few_shot_hits": 0,
+      "few_shot_hit_rate": 0.0,
+      "segments": {
+        "basic": {
+          "cases": 29,
+          "acceptable_pass": 29,
+          "strict_pass": 29,
+          "acceptable_rate": 1.0,
+          "strict_rate": 1.0
+        }
+      }
+    },
+    "steel_complex": {
+      "suite": "steel_complex",
+      "source_results": "/home/ai4mater/005-mat4ai_agent/1-graph-agent/resin-material-agent/eval/harness_runs/production-p0-p4-20260825/steel_complex/results.json",
+      "cases": 37,
+      "acceptable_pass": 37,
+      "strict_pass": 36,
+      "acceptable_rate": 1.0,
+      "strict_rate": 0.973,
+      "timeouts": 0,
+      "worker_errors": 0,
+      "model_role_calls": {
+        "primary_3b": 20,
+        "deepseek_api": 1
+      },
+      "model_calls": 21,
+      "repair_attempts": 1,
+      "repair_successes": 1,
+      "repair_success_rate": 1.0,
+      "mean_turn_ms": 1108.17,
+      "p95_turn_ms": 2962.137,
+      "safety_cases": 0,
+      "safety_pass": 0,
+      "safety_pass_rate": null,
+      "few_shot_hits": 0,
+      "few_shot_hit_rate": 0.0,
+      "segments": {
+        "complex": {
+          "cases": 37,
+          "acceptable_pass": 37,
+          "strict_pass": 36,
+          "acceptable_rate": 1.0,
+          "strict_rate": 0.973
+        }
+      }
+    },
+    "steel_safety": {
+      "suite": "steel_safety",
+      "source_results": "/home/ai4mater/005-mat4ai_agent/1-graph-agent/resin-material-agent/eval/harness_runs/production-p0-p4-20260825/steel_safety/results.json",
+      "cases": 4,
+      "acceptable_pass": 4,
+      "strict_pass": 4,
+      "acceptable_rate": 1.0,
+      "strict_rate": 1.0,
+      "timeouts": 0,
+      "worker_errors": 0,
+      "model_role_calls": {},
+      "model_calls": 0,
+      "repair_attempts": 0,
+      "repair_successes": 0,
+      "repair_success_rate": null,
+      "mean_turn_ms": 11.088,
+      "p95_turn_ms": 11.419,
+      "safety_cases": 4,
+      "safety_pass": 4,
+      "safety_pass_rate": 1.0,
+      "few_shot_hits": 0,
+      "few_shot_hit_rate": 0.0,
+      "segments": {
+        "safety": {
+          "cases": 4,
+          "acceptable_pass": 4,
+          "strict_pass": 4,
+          "acceptable_rate": 1.0,
+          "strict_rate": 1.0
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,76 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    env_file: ../.env
+    environment:
+      ENVIRONMENT: production
+      TASK_QUEUE_MODE: redis
+      REDIS_URL: redis://redis:6379/0
+      AGENT_TASK_DB_PATH: /var/lib/text2sql/agent_tasks.sqlite3
+      SESSION_MEMORY_DB_PATH: /var/lib/text2sql/session_memory.sqlite3
+    ports:
+      - "8000:8000"
+    volumes:
+      - agent-data:/var/lib/text2sql
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    env_file: ../.env
+    environment:
+      ENVIRONMENT: production
+      TASK_QUEUE_MODE: redis
+      REDIS_URL: redis://redis:6379/0
+      AGENT_TASK_DB_PATH: /var/lib/text2sql/agent_tasks.sqlite3
+      SESSION_MEMORY_DB_PATH: /var/lib/text2sql/session_memory.sqlite3
+    command: ["python", "-m", "app.worker"]
+    volumes:
+      - agent-data:/var/lib/text2sql
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
+
+  grafana:
+    image: grafana/grafana:11.1.4
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  agent-data:
+  redis-data:
+  grafana-data:
+

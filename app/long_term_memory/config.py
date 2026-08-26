@@ -59,6 +59,7 @@ class LongTermMemorySettings:
 
     auto_save: bool
     max_prompt_chars: int
+    backend: str = "sqlite"
 
 
 def get_long_term_memory_settings() -> LongTermMemorySettings:
@@ -74,6 +75,7 @@ def get_long_term_memory_settings() -> LongTermMemorySettings:
         enabled=_env_bool("LTM_ENABLED", True),
         namespace=os.getenv("LTM_NAMESPACE", "resin_text2sql"),
         db_path=db_path,
+        backend=os.getenv("LTM_BACKEND", "sqlite").lower(),
         embedding_model=os.getenv(
             "LTM_EMBEDDING_MODEL",
             str(project_root / "models" / "bge-m3"),

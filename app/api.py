@@ -10,6 +10,7 @@ from typing import Any, Literal
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from app.advanced_plan import compile_advanced_analysis_plan, parse_advanced_plan
@@ -21,6 +22,7 @@ from app.request_context import RequestIdentity, identity_scope
 from app.schema import set_active_profile
 from app.task_queue import TaskDispatcher
 from app.trace import safe_json_value, trace_summary
+from app.metrics import metrics_payload
 
 
 ProfileName = Literal["resin", "steel_industry"]
@@ -83,9 +85,10 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Text2SQL Agent API", version="1.0.0", lifespan=lifespan)
+_settings = get_settings()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[item.strip() for item in _settings.CORS_ORIGINS.split(",") if item.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -107,6 +110,13 @@ def _service(profile: str, identity: RequestIdentity):
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics() -> Response:
+    """Prometheus scrape endpoint; deploy behind the internal network."""
+    payload, content_type = metrics_payload()
+    return Response(content=payload, media_type=content_type)
 
 
 @app.post("/api/auth/login")
@@ -182,7 +192,15 @@ async def task_events(task_id: str, after: int = Query(default=0, ge=0), identit
             yield ": keepalive\n\n"
             await asyncio.sleep(0.7)
 
-    return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/api/approvals")
@@ -201,6 +219,16 @@ def get_approval(approval_id: str, profile: ProfileName = "resin", identity: Req
     if not record or record["tenant_id"] != identity.tenant_id or (identity.role == "analyst" and record["user_id"] != identity.user_id):
         raise HTTPException(status_code=404, detail="Approval request not found")
     return record
+
+
+@app.get("/api/approvals/{approval_id}/audit")
+def approval_audit(approval_id: str, profile: ProfileName = "resin", identity: RequestIdentity = Depends(current_user)) -> list[dict[str, Any]]:
+    with identity_scope(identity):
+        service = _service(profile, identity)
+        record = service.get_approval_request(approval_id)
+        if not record or record["tenant_id"] != identity.tenant_id or (identity.role == "analyst" and record["user_id"] != identity.user_id):
+            raise HTTPException(status_code=404, detail="Approval request not found")
+        return service.list_approval_audit(approval_id, tenant_id=identity.tenant_id)
 
 
 @app.post("/api/approvals/{approval_id}/decision")

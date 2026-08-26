@@ -6,10 +6,11 @@ context, strict and acceptable result pass, safety pass, timeouts, worker
 errors, repair recovery, LLM usage and latency. It also separates basic Profile
 queries from complex planning/memory queries.
 
-The frozen production baseline is
-`eval/baselines/v5.2-production-fewshot.json`. Do not overwrite it after a
-normal run: add a new reviewed baseline only when intentionally releasing a
-new version.
+The frozen legacy baseline is `eval/baselines/v5.2-production-fewshot.json`.
+The CI/self-hosted default uses the same six-suite normalized layout as the
+current harness: `eval/baselines/v5.2-normalized-production.json`. Do not
+overwrite either after a normal run; add a new reviewed baseline only when
+intentionally releasing a new version.
 
 ## Commands
 

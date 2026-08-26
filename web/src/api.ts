@@ -24,6 +24,15 @@ export type Approval = {
   created_at: string;
 };
 
+export type ApprovalAudit = {
+  audit_id: string;
+  actor_id: string;
+  action: string;
+  comment: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+};
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, { headers: { "Content-Type": "application/json" }, ...init });
   if (!response.ok) throw new Error((await response.json().catch(() => ({}))).detail || `Request failed: ${response.status}`);
@@ -40,5 +49,7 @@ export const api = {
     request<Approval>(`/api/approvals/${id}/decision?profile=${profile}`, { method: "POST", body: JSON.stringify(body) }),
   resumeApproval: (id: string, profile: Profile) =>
     request<Task>(`/api/approvals/${id}/resume?profile=${profile}`, { method: "POST" }),
+  approvalAudit: (id: string, profile: Profile) =>
+    request<ApprovalAudit[]>(`/api/approvals/${id}/audit?profile=${profile}`),
   listMemories: (profile: Profile) => request<Record<string, unknown>[]>(`/api/memories?profile=${profile}`),
 };

@@ -21,6 +21,7 @@ from app.query_enhancement import (
 from .config import LongTermMemorySettings, get_long_term_memory_settings
 from .embeddings import EmbeddingProvider
 from .models import MemoryRecord, MemoryWriteResult
+from .interfaces import MemoryRepository
 from .repository import SQLiteMemoryRepository
 
 
@@ -193,7 +194,13 @@ def _memory_search_text(record: MemoryRecord) -> str:
 class LongTermMemoryService:
     def __init__(self, settings: LongTermMemorySettings | None = None) -> None:
         self.settings = settings or get_long_term_memory_settings()
-        self.repository = SQLiteMemoryRepository(self.settings.db_path)
+        if self.settings.backend != "sqlite":
+            raise RuntimeError(
+                "LTM_BACKEND=postgres requires the production repository adapter; "
+                "run deploy/postgres_memory.sql and configure the adapter before enabling it."
+            )
+        repository: MemoryRepository = SQLiteMemoryRepository(self.settings.db_path)
+        self.repository = repository
         self.embedding = EmbeddingProvider(self.settings)
     @property
     def namespace(self) -> str:
@@ -335,7 +342,9 @@ class LongTermMemoryService:
             "query_signature": build_query_signature(query_spec, resolved_question or question),
             "sql": sql, "sql_template": _parameterize_sql(sql),
             "approval_id": approval_id, "approval_reason": approval_reason,
-            "promotion_status": "candidate", "validation": "guard_execution_result_contract",
+            "promotion_status": "candidate", "lifecycle": "pending_review",
+            "validation": "guard_execution_result_contract",
+            "quality": {"retrieval_count": 0, "success_count": 0, "failure_count": 0},
         }
         return self._upsert(
             memory_type="candidate_episodic", title=f"候选案例：{query_type}",
@@ -373,6 +382,7 @@ class LongTermMemoryService:
             })
         metadata.update({
             "promotion_status": "promoted",
+            "lifecycle": "active",
             "promotion_evidence": evidence,
             "candidate_memory_id": memory_id,
             "promotion_review": {
@@ -398,6 +408,9 @@ class LongTermMemoryService:
 
     def get_approval_request(self, approval_id: str) -> dict[str, object] | None:
         return self.repository.get_approval_request(approval_id)
+
+    def list_approval_audit(self, approval_id: str, *, tenant_id: str) -> list[dict[str, object]]:
+        return self.repository.list_approval_audit(approval_id, tenant_id=tenant_id)
 
     def list_approval_requests(self, status: str | None = None, limit: int = 50, *, user_id: str | None = None, tenant_id: str | None = None) -> list[dict[str, object]]:
         return self.repository.list_approval_requests(
@@ -502,6 +515,26 @@ class LongTermMemoryService:
             quality["retrieval_count"] = int(quality.get("retrieval_count", 0)) + 1
             quality["success_count"] = int(quality.get("success_count", 0)) + int(success)
             quality["failure_count"] = int(quality.get("failure_count", 0)) + int(not success)
+            metadata["quality"] = quality
+            if quality["failure_count"] >= 2 and quality["failure_count"] > quality["success_count"]:
+                metadata["lifecycle"] = "suspended"
+                self.repository.set_memory_active(memory_id, False)
+            self.repository.update_memory_metadata(memory_id, metadata)
+
+    def record_memory_retrieval_outcome(self, memory_ids: list[str], *, success: bool) -> None:
+        """Update bounded quality counters for every injected memory example."""
+        for memory_id in memory_ids:
+            record = self.repository.get(memory_id)
+            if record is None or record.memory_type not in {"episodic", "procedural", "semantic"}:
+                continue
+            metadata = dict(record.metadata or {})
+            quality = dict(metadata.get("quality") or {})
+            quality["retrieval_count"] = int(quality.get("retrieval_count", 0)) + 1
+            quality["success_count"] = int(quality.get("success_count", 0)) + int(success)
+            quality["failure_count"] = int(quality.get("failure_count", 0)) + int(not success)
+            quality["success_rate"] = round(
+                quality["success_count"] / max(1, quality["retrieval_count"]), 4
+            )
             metadata["quality"] = quality
             self.repository.update_memory_metadata(memory_id, metadata)
 
@@ -861,6 +894,12 @@ class LongTermMemoryService:
                 continue
 
             semantic_score = float(record.score)
+            quality = metadata.get("quality") if isinstance(metadata.get("quality"), dict) else {}
+            retrieval_count = int(quality.get("retrieval_count", 0))
+            quality_score = (
+                float(quality.get("success_count", 0)) / max(1, retrieval_count)
+                if retrieval_count else 0.5
+            )
             current_tables = set(current_signature.get("tables", []))
             candidate_tables = set(candidate_signature.get("tables", []))
             schema_score = (
@@ -870,9 +909,10 @@ class LongTermMemoryService:
                 else 1.0
             )
             final_score = (
-                0.35 * semantic_score
-                + 0.50 * structural_score
+                0.30 * semantic_score
+                + 0.45 * structural_score
                 + 0.15 * schema_score
+                + 0.10 * quality_score
             )
             if final_score < self.settings.episodic_final_min_score:
                 rejected_reasons["low_final_score"] = (
@@ -885,6 +925,7 @@ class LongTermMemoryService:
                 "semantic": round(semantic_score, 4),
                 "structural": round(structural_score, 4),
                 "schema": round(schema_score, 4),
+                "quality": round(quality_score, 4),
                 "final": round(final_score, 4),
             }
             record.metadata["query_signature"] = candidate_signature

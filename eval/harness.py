@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -33,6 +34,18 @@ SUITES = {
     },
 }
 
+# The legacy three-suite layout is kept for historical baseline comparison.
+# New runs use disjoint capability suites so deterministic, agent and policy
+# quality cannot be hidden by a single blended material score.
+NORMALIZED_SUITES = {
+    "resin_basic": {"suite": ROOT / "eval" / "benchmark_resin_basic.py", "description": "Resin deterministic/basic", "case_timeout": 90},
+    "resin_complex": {"suite": ROOT / "eval" / "benchmark_resin_complex.py", "description": "Resin planning/repair/memory", "case_timeout": 120},
+    "resin_safety": {"suite": ROOT / "eval" / "benchmark_resin_safety.py", "description": "Resin safety policy", "case_timeout": 90},
+    "steel_basic": {"suite": ROOT / "eval" / "benchmark_steel_basic.py", "description": "Steel deterministic/basic", "case_timeout": 90},
+    "steel_complex": {"suite": ROOT / "eval" / "benchmark_steel_complex.py", "description": "Steel advanced planning", "case_timeout": 150},
+    "steel_safety": {"suite": ROOT / "eval" / "benchmark_steel_safety.py", "description": "Steel safety policy", "case_timeout": 90},
+}
+
 # These labels describe evaluation intent, rather than implementation route.
 # They keep deterministic Profile coverage distinct from planning/memory flows.
 _SEGMENTS = {
@@ -56,7 +69,14 @@ def _rate(numerator: int, denominator: int) -> float | None:
 
 def _segment_metrics(summary: dict[str, Any], suite_key: str) -> dict[str, dict[str, Any]]:
     categories = dict(summary.get("by_category") or {})
-    configured = _SEGMENTS.get(suite_key, {})
+    if suite_key.endswith("_safety"):
+        configured = {"safety": {"safety"}}
+    elif suite_key.endswith("_complex"):
+        configured = {"complex": set(categories)}
+    elif suite_key.endswith("_basic"):
+        configured = {"basic": set(categories)}
+    else:
+        configured = _SEGMENTS.get(suite_key, {})
     if suite_key == "steel_core_60":
         configured = {"basic": {name for name in categories if name != "safety"}}
     elif suite_key == "steel_complex_10":
@@ -91,6 +111,21 @@ def metrics_from_results(path: Path, suite_key: str) -> dict[str, Any]:
     safety = dict(summary.get("by_category", {}).get("safety", {}))
     model_roles = dict(summary.get("model_role_counts", {}))
     model_calls = sum(int(value) for value in model_roles.values())
+    token_usage: dict[str, dict[str, int | float]] = {}
+    for turn in turns:
+        for call in list(turn.get("result", {}).get("model_calls", [])):
+            role = str(call.get("role", "unknown"))
+            item = token_usage.setdefault(role, {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "estimated_calls": 0, "cost_usd": 0.0})
+            item["calls"] += 1
+            item["prompt_tokens"] += int(call.get("prompt_tokens", 0) or 0)
+            item["completion_tokens"] += int(call.get("completion_tokens", 0) or 0)
+            item["total_tokens"] += int(call.get("total_tokens", 0) or 0)
+            item["estimated_calls"] += int(bool(call.get("tokens_estimated", False)))
+    prompt_rate = float(os.getenv("TEXT2SQL_COST_PROMPT_PER_1K_USD", "0") or 0)
+    completion_rate = float(os.getenv("TEXT2SQL_COST_COMPLETION_PER_1K_USD", "0") or 0)
+    for item in token_usage.values():
+        item["cost_usd"] = round(float(item["prompt_tokens"]) / 1000 * prompt_rate + float(item["completion_tokens"]) / 1000 * completion_rate, 6)
+    token_totals = {"calls": sum(int(v["calls"]) for v in token_usage.values()), "prompt_tokens": sum(int(v["prompt_tokens"]) for v in token_usage.values()), "completion_tokens": sum(int(v["completion_tokens"]) for v in token_usage.values()), "total_tokens": sum(int(v["total_tokens"]) for v in token_usage.values()), "estimated_calls": sum(int(v["estimated_calls"]) for v in token_usage.values()), "cost_usd": round(sum(float(v["cost_usd"]) for v in token_usage.values()), 6), "pricing_configured": bool(prompt_rate or completion_rate)}
     repaired = int(summary.get("repaired_turns", 0))
     repaired_success = int(summary.get("repaired_success_turns", 0))
     cases = int(summary.get("cases", len(results)))
@@ -106,6 +141,8 @@ def metrics_from_results(path: Path, suite_key: str) -> dict[str, Any]:
         "worker_errors": int(summary.get("worker_errors", 0)),
         "model_role_calls": model_roles,
         "model_calls": model_calls,
+        "token_usage": token_usage,
+        "token_totals": token_totals,
         "repair_attempts": repaired,
         "repair_successes": repaired_success,
         "repair_success_rate": _rate(repaired_success, repaired),
@@ -125,12 +162,13 @@ def write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def collect(args: argparse.Namespace) -> int:
+def collect(args: argparse.Namespace, catalog: dict[str, dict[str, Any]] | None = None) -> int:
+    catalog = catalog or (NORMALIZED_SUITES if getattr(args, "suite_set", "legacy") == "normalized" else SUITES)
     paths = dict(item.split("=", 1) for item in args.result)
-    unknown = sorted(set(paths) - set(SUITES))
+    unknown = sorted(set(paths) - set(catalog))
     if unknown:
         raise ValueError("Unknown suite keys: " + ", ".join(unknown))
-    missing = sorted(set(SUITES) - set(paths))
+    missing = sorted(set(catalog) - set(paths))
     if missing:
         raise ValueError("Missing suite artifacts: " + ", ".join(missing))
     payload = {
@@ -138,7 +176,7 @@ def collect(args: argparse.Namespace) -> int:
         "version": 1,
         "label": args.label,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "suites": {key: metrics_from_results(Path(paths[key]), key) for key in SUITES},
+        "suites": {key: metrics_from_results(Path(paths[key]), key) for key in catalog},
     }
     write_json(Path(args.output), payload)
     print(f"Harness metrics: {args.output}")
@@ -147,7 +185,8 @@ def collect(args: argparse.Namespace) -> int:
 
 def _changes(baseline: dict[str, Any], candidate: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for suite in SUITES:
+    suites = sorted(set(baseline.get("suites", {})) & set(candidate.get("suites", {})))
+    for suite in suites:
         old = baseline["suites"][suite]
         new = candidate["suites"][suite]
         for field in ("acceptable_pass", "strict_pass", "safety_pass", "model_calls", "p95_turn_ms", "few_shot_hits"):
@@ -186,7 +225,10 @@ def regression_gate(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict
 
     failures: list[dict[str, Any]] = []
     notices: list[dict[str, Any]] = []
-    for suite in SUITES:
+    for suite in baseline.get("suites", {}):
+        if suite not in candidate.get("suites", {}):
+            failures.append({"suite": suite, "metric": "missing_candidate_suite", "baseline": True, "candidate": None})
+            continue
         old = dict(baseline["suites"][suite])
         new = dict(candidate["suites"][suite])
         for metric in ("acceptable_pass", "safety_pass"):
@@ -218,9 +260,10 @@ def gate(args: argparse.Namespace) -> int:
 
 
 def run(args: argparse.Namespace) -> int:
+    catalog = NORMALIZED_SUITES if args.suite_set == "normalized" else SUITES
     root = Path(args.output_root).resolve() / args.label
     artifacts: list[str] = []
-    for key, config in SUITES.items():
+    for key, config in catalog.items():
         run_id = key
         command = [
             sys.executable, str(RUNNER), "--suite", str(config["suite"]),
@@ -231,7 +274,7 @@ def run(args: argparse.Namespace) -> int:
         print("Running", key, flush=True)
         subprocess.run(command, cwd=ROOT, check=True)
         artifacts.append(f"{key}={root / run_id / 'results.json'}")
-    return collect(argparse.Namespace(label=args.label, result=artifacts, output=str(root / "metrics.json")))
+    return collect(argparse.Namespace(label=args.label, result=artifacts, output=str(root / "metrics.json")), catalog)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -241,11 +284,13 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--label", required=True)
     run_parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT))
     run_parser.add_argument("--memory-mode", choices=("isolated", "production"), default="production")
+    run_parser.add_argument("--suite-set", choices=("legacy", "normalized"), default="normalized", help="Use disjoint capability suites or the historical three-suite layout")
     run_parser.set_defaults(handler=run)
     collect_parser = commands.add_parser("collect", help="Create a metrics artifact from existing evaluator results")
     collect_parser.add_argument("--label", required=True)
     collect_parser.add_argument("--result", action="append", required=True, metavar="SUITE=RESULTS_JSON")
     collect_parser.add_argument("--output", required=True)
+    collect_parser.add_argument("--suite-set", choices=("legacy", "normalized"), default="legacy")
     collect_parser.set_defaults(handler=collect)
     compare_parser = commands.add_parser("compare", help="Compare two harness metric artifacts")
     compare_parser.add_argument("--baseline", required=True)

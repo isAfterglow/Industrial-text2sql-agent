@@ -362,6 +362,7 @@ def run_worker(case: dict[str, Any]) -> dict[str, Any]:
     for turn_index, turn in enumerate(case.get("turns", []), start=1):
         question = str(turn["question"])
         started = time.perf_counter()
+        from app.config import get_settings
         result = graph.invoke(
             {
                 "question": question,
@@ -371,7 +372,7 @@ def run_worker(case: dict[str, Any]) -> dict[str, Any]:
                 "trace_started_at": utc_now_iso(),
                 "trace_events": [],
             },
-            {"recursion_limit": 32},
+            {"recursion_limit": getattr(get_settings(), "AGENT_MAX_GRAPH_STEPS", 32)},
         )
         graph_elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
         updated_memory = result.get("conversation_memory")
@@ -454,13 +455,16 @@ def worker_main(args: argparse.Namespace) -> int:
     try:
         payload = run_worker(case)
     except BaseException as exc:
+        error_type = type(exc).__name__
+        category = "non_convergent_plan" if error_type == "GraphRecursionError" else "worker_crash"
         payload = {
             "id": case["id"],
             "category": case.get("category", "uncategorized"),
             "tags": case.get("tags", []),
             "status": "worker_error",
             "strict_pass": False,
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": f"{error_type}: {exc}",
+            "failure_category": category,
             "turns": [],
         }
     write_json(Path(args.result_file), payload)

@@ -32,14 +32,14 @@ jobs:
       - name: Apply regression policy
         run: >-
           conda run -n scitime-agent python -m eval.harness gate
-          --baseline eval/baselines/v5.2-production-fewshot.json
+          --baseline eval/baselines/v5.2-normalized-production.json
           --candidate "eval/harness_runs/$RUN_LABEL/metrics.json"
           --output "eval/harness_runs/$RUN_LABEL/regression_gate.json"
       - name: Render comparison
         if: always()
         run: >-
           conda run -n scitime-agent python -m eval.harness compare
-          --baseline eval/baselines/v5.2-production-fewshot.json
+          --baseline eval/baselines/v5.2-normalized-production.json
           --candidate "eval/harness_runs/$RUN_LABEL/metrics.json"
           --output "eval/harness_runs/$RUN_LABEL/comparison.md"
       - name: Upload reports and traces
